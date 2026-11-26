@@ -19,6 +19,7 @@ from .commands import COMMANDS, is_blocked, is_destructive, normalize_keys
 from .errors import BryceError, ConfirmationRequired, UnexpectedScreen
 
 FILE_DIALOG_CLASS = "#32770"
+RENDER_MODES = {"button": None, "resume": "render", "clear": "clear_and_render"}
 Vector = Sequence[float]
 
 
@@ -190,9 +191,21 @@ class BryceController:
         self.backend.sleep(2.0)
 
     # -- rendering --------------------------------------------------------------
-    def render(self, timeout: float = 600, settle: float = 6, poll: float = 1.5) -> dict:
-        """Start a render and wait until the viewport stops changing."""
-        self.backend.click(*layout.RENDER_BUTTON)
+    def start_render(self, mode: str = "button") -> None:
+        """button: the large render sphere. resume: Render (Ctrl+R).
+        clear: Clear and Render (Ctrl+Alt+R)."""
+        if mode not in RENDER_MODES:
+            raise BryceError(f"render mode must be one of {', '.join(RENDER_MODES)}")
+        if self.attributes_open() or self.materials_open() or self.library_open():
+            raise UnexpectedScreen("a dialog is open; close it before rendering")
+        if mode == "button":
+            self.backend.click(*layout.RENDER_BUTTON)
+        else:
+            self.backend.key(COMMANDS[RENDER_MODES[mode]].keys)
+
+    def wait_for_still_picture(self, timeout: float = 600, settle: float = 6,
+                               poll: float = 1.5) -> dict:
+        """Wait until the viewport stops changing for `settle` seconds."""
         elapsed, still = 0.0, 0.0
         previous = None
         while elapsed < timeout:
@@ -205,6 +218,15 @@ class BryceController:
             if still >= settle:
                 return {"finished": True, "seconds": round(elapsed - still, 1)}
         return {"finished": False, "seconds": round(elapsed, 1)}
+
+    def render(self, timeout: float = 600, settle: float = 6, poll: float = 1.5,
+               mode: str = "button") -> dict:
+        self.start_render(mode)
+        return self.wait_for_still_picture(timeout, settle, poll)
+
+    def render_picture(self) -> Image.Image:
+        """The viewport as it is on screen now."""
+        return self.backend.grab(layout.VIEWPORT_BOX)
 
     # -- files ------------------------------------------------------------------
     def fill_file_dialog(self, path: str) -> None:
@@ -227,19 +249,29 @@ class BryceController:
         self.backend.key("ctrl+o")
         self.fill_file_dialog(os.path.abspath(path))
 
-    def save_scene_as(self, path: str, overwrite: bool = False) -> str:
-        target = os.path.abspath(path)
-        if not os.path.splitext(target)[1]:
-            target += ".br3"
-        if os.path.exists(target) and not overwrite:
-            raise ConfirmationRequired(f"{target} exists; pass overwrite=true once the user has agreed")
-        if not os.path.isdir(os.path.dirname(target)):
-            raise BryceError(f"folder does not exist: {os.path.dirname(target)}")
-        self.backend.key("ctrl+shift+s")
+    def save_scene(self, path: str | None = None, confirm: bool = False) -> str | None:
+        """Press Save (Ctrl+S). Bryce 3D has no shortcut for Save As: a scene that
+        already has a file is saved over it, and only an unnamed one asks for a path."""
+        if not confirm:
+            raise ConfirmationRequired("Save writes over the scene's current file, if it has one; "
+                                       "pass confirm=true once the user has agreed")
+        target = None
+        if path is not None:
+            target = os.path.abspath(path)
+            if not os.path.splitext(target)[1]:
+                target += ".br3"
+            if os.path.exists(target):
+                raise BryceError(f"{target} already exists; choose a new name")
+            if not os.path.isdir(os.path.dirname(target)):
+                raise BryceError(f"folder does not exist: {os.path.dirname(target)}")
+        self.backend.key("ctrl+s")
+        self.backend.sleep(1.5)
+        if self.backend.foreground_class() != FILE_DIALOG_CLASS:
+            return None  # saved in place, without asking for a name
+        if target is None:
+            raise UnexpectedScreen("Bryce is asking for a file name; call submit_file_dialog "
+                                   "with a new path")
         self.fill_file_dialog(target)
-        if overwrite and self.backend.foreground_class() == FILE_DIALOG_CLASS:
-            self.backend.key("alt+y")  # "Yes" in the replace-file prompt
-            self.backend.sleep(1.0)
         return target
 
     # -- native menus --------------------------------------------------------------

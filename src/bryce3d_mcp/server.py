@@ -7,6 +7,7 @@ import io
 import json
 import os
 import re
+import struct
 import threading
 from typing import Any, Callable, Literal
 
@@ -18,7 +19,8 @@ except ImportError:  # mcp 1.x
     from mcp.server.fastmcp import Image
     from mcp.server.fastmcp.exceptions import ToolError
 
-from . import layout, meshes, scene
+from . import heightfield, layout, meshes, scene, terrain
+from .ccmf import CompositeFile
 from .commands import COMMANDS
 from .controller import BryceController
 from .errors import BryceError
@@ -32,6 +34,8 @@ Bryce has no scripting API, so look before and after acting:
   is 20.48 on each side and rests on the ground at y=10.24.
 - For anything without a dedicated tool, use hover (Bryce names the control in its
   bottom-left status text), then click, drag, press_keys or list_menus.
+- Terrain: use terrain_edit. It edits exact heights inside Bryce's own file format,
+  which is far more precise than painting in the Terrain Editor.
 - Tools marked UNVERIFIED have not been observed working on Bryce 3D: check the result.
 - Coordinates are UI pixels from the top-left of the 640x480 interface. A screenshot
   starts at y=-20, so UI y = image y - 20 and UI x = image x.
@@ -75,7 +79,7 @@ def tool(fn):
     def wrapper(*args, **kwargs):
         try:
             return fn(*args, **kwargs)
-        except (BryceError, ValueError, OSError) as exc:
+        except (BryceError, ValueError, OSError, struct.error) as exc:
             raise ToolError(str(exc)) from exc
 
     mcp.tool(structured_output=False)(wrapper)
@@ -118,7 +122,8 @@ def list_catalog() -> str:
 
 @tool
 def list_commands() -> str:
-    """Named keyboard commands, each flagged verified and destructive."""
+    """Named keyboard commands, with where each shortcut comes from and whether it
+    can discard work."""
     return json.dumps({name: vars(command) for name, command in COMMANDS.items()})
 
 
@@ -193,20 +198,138 @@ def run_command(command: str, confirm: bool = False) -> list:
 
 
 @tool
-def render(timeout_seconds: float = 600, dismiss_report: bool = False) -> list:
-    """Render and wait until the viewport stops changing, then return the picture.
-    dismiss_report clicks the Render Report's check mark afterwards; use it only
-    after a screenshot shows the report."""
+def render(mode: Literal["button", "resume", "clear"] = "button", wait: bool = True,
+           timeout_seconds: float = 600, settle_seconds: float = 6,
+           dismiss_report: bool = False) -> list:
+    """Start a render. mode: button (the render sphere, tested by hand), resume
+    (Ctrl+R) or clear (Ctrl+Alt+R, restarts from nothing); the shortcuts come from
+    Bryce's menu table. With wait=true this returns once the picture has not changed
+    for settle_seconds; raise that for heavy scenes. For long renders use wait=false,
+    then render_status. dismiss_report clicks the Render Report's check mark; use it
+    only after a screenshot shows the report."""
     if not 10 <= timeout_seconds <= 3600:
         raise BryceError("timeout_seconds must be 10-3600")
+    if not 3 <= settle_seconds <= 120:
+        raise BryceError("settle_seconds must be 3-120")
 
     def run(c: BryceController):
-        result = c.render(timeout_seconds)
+        if wait:
+            result = c.render(timeout_seconds, settle_seconds, mode=mode)
+        else:
+            c.start_render(mode)
+            c.backend.sleep(1.0)
+            result = {"started": True}
         shot = Image(data=c.screenshot_png(), format="png")
-        if dismiss_report and result["finished"]:
+        if dismiss_report and result.get("finished"):
             c.backend.click(*layout.RENDER_REPORT_OK)
         return [json.dumps(result), shot]
     return _ui(run)
+
+
+@tool
+def render_status(watch_seconds: float = 15) -> list:
+    """Watch the picture for up to watch_seconds. finished=true means it stopped
+    changing, which a very slow render can also look like."""
+    if not 6 <= watch_seconds <= 50:
+        raise BryceError("watch_seconds must be 6-50")
+    return _with_shot(lambda c: c.wait_for_still_picture(watch_seconds, settle=5))
+
+
+@tool
+def save_render_image(name: str) -> list:
+    """Save what the viewport shows now as a PNG. This is a screen capture, so its
+    resolution is the on-screen size."""
+    picture = _ui(lambda c: c.render_picture())
+    path = _output_path(name, "png")
+    picture.save(path)
+    return [json.dumps({"path": path, "size": picture.size}), _png(picture)]
+
+
+# -- terrain files ---------------------------------------------------------------
+def _png(picture) -> Image:
+    out = io.BytesIO()
+    picture.save(out, "PNG")
+    return Image(data=out.getvalue(), format="png")
+
+
+def _enlarged(picture, height: int = 384):
+    if picture.height >= height:
+        return picture
+    return picture.resize((picture.width * height // picture.height, height))
+
+
+@tool
+def terrain_list(path: str, first: int = 0, count: int = 36) -> list:
+    """List the terrains stored in a Bryce file (an .obp object library such as
+    Bryce's Presets/Mountains.obp, or a saved .br3 scene), with thumbnails.
+    The terrain tools work on files and do not touch the running program."""
+    if first < 0 or not 1 <= count <= 72:
+        raise BryceError("first must be 0 or more and count 1-72")
+    found = terrain.terrains(CompositeFile.load(path))
+    shown = found[first:first + count]
+    rows = [{"index": t.index, "name": t.name, "supported": heightfield.is_supported(t.payload)}
+            for t in shown]
+    summary = json.dumps({"total": len(found), "terrains": rows})
+    return [summary, _png(terrain.contact_sheet(shown))] if shown else [summary]
+
+
+@tool
+def terrain_preview(path: str, index: int = 0) -> list:
+    """Show one terrain from a file: height as gray (left) and lit relief (right)."""
+    chosen = terrain.pick(CompositeFile.load(path), index)
+    size, grid = terrain.read_grid(chosen)
+    info = {"name": chosen.name, "grid": size, "lowest": round(min(grid), 4),
+            "highest": round(max(grid), 4)}
+    return [json.dumps(info), _png(_enlarged(terrain.preview(size, grid)))]
+
+
+@tool
+def terrain_export(path: str, name: str, index: int = 0) -> list:
+    """Save a terrain's exact heights as a 16-bit grayscale PNG."""
+    size, grid = terrain.read_grid(terrain.pick(CompositeFile.load(path), index))
+    target = _output_path(name, "png")
+    terrain.to_image16(size, grid).save(target)
+    return [json.dumps({"path": target, "grid": size})]
+
+
+@tool
+def terrain_operations() -> str:
+    """The editing operations terrain_edit accepts, with defaults and limits."""
+    return json.dumps(terrain.describe_operations())
+
+
+@tool
+def terrain_edit(source_path: str, output_name: str, operations: list[dict] | None = None,
+                 index: int = 0, heightmap_path: str | None = None,
+                 terrain_name: str | None = None, description: str | None = None) -> list:
+    """Edit a terrain exactly, writing a NEW copy of a Bryce file; the source is not
+    changed. Optionally start from heightmap_path (any picture, white is high; 16-bit
+    PNG keeps precision), then apply operations in order, e.g.
+    [{"op":"generate","shape":"mountain","seed":3},{"op":"hydraulic_erosion"}].
+    See terrain_operations. The grid size stays that of terrain number `index`, so
+    pick one with the detail you want (terrain_preview shows it). source_path can be
+    one of Bryce's Presets/*.obp libraries or a saved .br3 scene.
+    NOT YET CONFIRMED: loading the written file into a running Bryce."""
+    extension = os.path.splitext(source_path)[1].lower()
+    if extension not in (".obp", ".br3"):
+        raise BryceError("source_path must be an .obp library or a .br3 scene")
+    target = _output_path(output_name, extension.lstrip("."))  # a name not yet in use
+    document = CompositeFile.load(source_path)
+    chosen = terrain.pick(document, index)
+    size, grid = terrain.read_grid(chosen)
+    if heightmap_path is not None:
+        from PIL import Image as Picture
+        with Picture.open(heightmap_path) as picture:
+            grid = terrain.grid_from_image(picture, size)
+    grid = terrain.apply(size, grid, operations or [])
+    terrain.write_grid(document, chosen, grid, terrain_name, description)
+    with open(target, "xb") as handle:
+        handle.write(document.data)
+    next_step = ("In Bryce: open the object library (the arrow beside Create), choose Import, "
+                 "pick this file, then select the terrain and accept." if extension == ".obp"
+                 else "Open it in Bryce with open_scene (this discards unsaved work).")
+    result = {"path": target, "index": index, "grid": size, "next": next_step}
+    return [json.dumps(result), _png(_enlarged(terrain.preview(size, grid)))]
 
 
 # -- raw interaction: reaches everything else ------------------------------------
@@ -279,10 +402,13 @@ def open_scene(path: str, confirm: bool = False) -> list:
 
 
 @tool
-def save_scene_as(path: str, overwrite: bool = False) -> list:
-    """Save the scene to a new path (Ctrl+Shift+S). UNVERIFIED: check file_exists."""
+def save_scene(path: str | None = None, confirm: bool = False) -> list:
+    """Press Save (Ctrl+S). A scene that already has a file is saved over it. An
+    unnamed scene asks for a name, and `path` is typed there. UNVERIFIED."""
     def run(c):
-        target = c.save_scene_as(path, overwrite)
+        target = c.save_scene(path, confirm)
+        if target is None:
+            return {"saved": "in place (Bryce did not ask for a name)"}
         return {"requested_path": target, "file_exists": os.path.isfile(target)}
     return _with_shot(run)
 

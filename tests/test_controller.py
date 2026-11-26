@@ -110,11 +110,11 @@ def test_key_normalization():
 
 def test_path_only_typed_into_a_real_file_dialog(bryce, tmp_path):
     controller, backend = bryce
-    with pytest.raises(UnexpectedScreen):
-        controller.save_scene_as(str(tmp_path / "a"))
+    # No dialog: Bryce saved in place, and nothing may be typed.
+    assert controller.save_scene(str(tmp_path / "a"), confirm=True) is None
     assert backend.typed() == []
     backend.window_class = "#32770"
-    assert controller.save_scene_as(str(tmp_path / "a")).endswith("a.br3")
+    assert controller.save_scene(str(tmp_path / "a"), confirm=True).endswith("a.br3")
 
 
 def test_save_and_open_guards(bryce, tmp_path):
@@ -122,9 +122,28 @@ def test_save_and_open_guards(bryce, tmp_path):
     existing = tmp_path / "a.br3"
     existing.write_text("x")
     with pytest.raises(ConfirmationRequired):
-        controller.save_scene_as(str(existing))
+        controller.save_scene(str(tmp_path / "b"))
+    with pytest.raises(BryceError, match="already exists"):
+        controller.save_scene(str(existing), confirm=True)
     with pytest.raises(ConfirmationRequired):
         controller.open_scene(str(existing))
+    assert backend.log == []
+
+
+@pytest.mark.parametrize("mode, event", [("resume", ("key", "ctrl+r")),
+                                         ("clear", ("key", "ctrl+alt+r")),
+                                         ("button", ("click", layout.RENDER_BUTTON, 1))])
+def test_render_modes(bryce, mode, event):
+    controller, backend = bryce
+    controller.start_render(mode)
+    assert backend.log == [event]
+
+
+def test_render_refuses_while_a_dialog_is_open(bryce):
+    controller, backend = bryce
+    backend.attributes = True
+    with pytest.raises(UnexpectedScreen):
+        controller.start_render("resume")
     assert backend.log == []
 
 

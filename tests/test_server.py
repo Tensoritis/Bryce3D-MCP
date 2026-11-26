@@ -19,8 +19,9 @@ def backend(monkeypatch, tmp_path):
 def test_tool_list(backend):
     names = {t.name for t in asyncio.run(server.mcp.list_tools())}
     assert {"screenshot", "build_scene", "create_object", "render", "hover", "click",
-            "drag", "press_keys", "generate_mesh", "generate_heightmap"} <= names
-    assert len(names) == 25
+            "drag", "press_keys", "generate_mesh", "generate_heightmap",
+            "terrain_list", "terrain_edit", "render_status", "save_render_image"} <= names
+    assert len(names) == 32
 
 
 def test_build_through_tool_function(backend):

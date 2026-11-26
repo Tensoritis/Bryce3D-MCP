@@ -1,8 +1,10 @@
 """Keyboard commands, with how well each one is known.
 
-verified=True  : pressed on a real copy of Bryce 3D and the effect observed.
-verified=False : taken from published Bryce shortcut lists for later versions
-                 (see docs/UI_MAP.md). Check the screenshot after using one.
+source="tested"     : pressed on a real copy of Bryce 3D and the effect observed.
+source="menu_table" : read from the menu definitions in Bryce's Data/menus.dat,
+                      which give each item's label, shortcut and command code.
+source="unverified" : taken from shortcut lists for later versions of Bryce.
+See docs/REVERSE_ENGINEERING.md.
 """
 
 from __future__ import annotations
@@ -14,38 +16,53 @@ from dataclasses import dataclass
 class Command:
     keys: str
     description: str
-    verified: bool = False
+    source: str = "menu_table"
     destructive: bool = False
 
 
 COMMANDS: dict[str, Command] = {
-    "object_attributes": Command("ctrl+alt+e", "Open Object Attributes", True),
-    "materials_lab": Command("ctrl+m", "Open the Materials Lab", True),
-    "duplicate": Command("ctrl+d", "Duplicate the selection in place", True),
-    "select_all": Command("ctrl+a", "Select all objects", True),
-    "undo": Command("ctrl+z", "Undo the last action", True),
-    "delete": Command("delete", "Delete the selection", True, True),
-    "group": Command("ctrl+g", "Group the selection"),
-    "ungroup": Command("ctrl+u", "Ungroup the selection"),
-    "edit_object": Command("ctrl+e", "Open the object's editor (Terrain Editor)"),
-    "render": Command("ctrl+r", "Render or resume rendering"),
-    "clear_and_render": Command("ctrl+alt+r", "Clear and render"),
-    "sky_lab": Command("ctrl+k", "Open the Sky Lab"),
-    "next_object": Command("tab", "Select the next object"),
-    "view_camera": Command("1", "Camera view"),
-    "view_top": Command("2", "Top view"),
-    "view_right": Command("3", "Right view"),
-    "view_front": Command("4", "Front view"),
-    "zoom_in": Command("plus", "Zoom in"),
-    "zoom_out": Command("minus", "Zoom out"),
+    "object_attributes": Command("ctrl+alt+e", "Open Object Attributes", "tested"),
+    "materials_lab": Command("ctrl+m", "Edit Material (Materials Lab)", "tested"),
+    "duplicate": Command("ctrl+d", "Duplicate the selection in place", "tested"),
+    "select_all": Command("ctrl+a", "Select all objects", "tested"),
+    "undo": Command("ctrl+z", "Undo the last action", "tested"),
+    "delete": Command("delete", "Delete the selection", "tested", True),
+    "invert_selection": Command("ctrl+shift+a", "Invert Selection"),
+    "group": Command("ctrl+g", "Group Objects"),
+    "ungroup": Command("ctrl+u", "UnGroup Objects"),
+    "edit_object": Command("ctrl+e", "Edit Object (Terrain Editor for a terrain)"),
+    "show_as_box": Command("ctrl+b", "Show Object As Box"),
+    "show_as_lattice": Command("ctrl+l", "Show Object As Lattice"),
+    "replicate": Command("alt+d", "Replicate"),
+    "multi_replicate": Command("alt+shift+d", "Multi-Replicate"),
+    "create_path": Command("alt+p", "Create Path"),
+    "edit_2d_pictures": Command("ctrl+alt+m", "Edit 2d Pictures"),
+    "edit_3d_textures": Command("alt+m", "Edit 3d Textures"),
+    "copy_material": Command("ctrl+alt+c", "Copy Material"),
+    "paste_material": Command("ctrl+alt+v", "Paste Material"),
+    "copy_matrix": Command("alt+c", "Copy Matrix (size, rotation, position)"),
+    "paste_matrix": Command("alt+v", "Paste Matrix"),
     "copy": Command("ctrl+c", "Copy"),
     "paste": Command("ctrl+v", "Paste"),
     "cut": Command("ctrl+x", "Cut", destructive=True),
+    "render": Command("ctrl+r", "Render"),
+    "clear_and_render": Command("ctrl+alt+r", "Clear and Render"),
+    "render_animation": Command("ctrl+shift+r", "Render Animation"),
+    "flyaround": Command("ctrl+y", "Flyaround"),
+    "motion_lab": Command("ctrl+t", "Motion Lab"),
     "document_setup": Command("ctrl+alt+n", "Document Setup"),
-    "new_document": Command("ctrl+n", "New document", destructive=True),
-    "revert": Command("ctrl+alt+s", "Revert to saved", destructive=True),
+    "animation_setup": Command("ctrl+shift+n", "Animation Setup"),
+    "new_document": Command("ctrl+n", "New Document", destructive=True),
+    "print": Command("ctrl+p", "Print"),
+    "sky_lab": Command("ctrl+k", "Open the Sky Lab", "unverified"),
+    "next_object": Command("tab", "Select the next object", "unverified"),
+    "view_camera": Command("1", "Camera view", "unverified"),
+    "view_top": Command("2", "Top view", "unverified"),
+    "view_right": Command("3", "Right view", "unverified"),
+    "view_front": Command("4", "Front view", "unverified"),
+    "zoom_in": Command("plus", "Zoom in", "unverified"),
+    "zoom_out": Command("minus", "Zoom out", "unverified"),
 }
-
 # Combinations that could leave Bryce or close it.
 BLOCKED_KEYS = {"alt+f4", "alt+tab", "ctrl+escape", "ctrl+shift+escape", "ctrl+alt+delete"}
 # Raw key presses that need confirm=True.
