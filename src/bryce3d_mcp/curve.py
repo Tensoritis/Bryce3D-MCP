@@ -1,7 +1,7 @@
 """Bryce's time-mapping curve: how it shapes the motion between keys.
 
-A track blends its keys in straight lines. What bends the motion is a curve
-that Bryce can attach to any track. It maps time to progress: both run from 0
+How a track gets from key to key depends on what it holds (see keyframes.py).
+Separately, Bryce can attach a curve to any track to bend its timing. It maps time to progress: both run from 0
 (the track's first key) to 1 (its last), and Bryce looks the current time up in
 the curve before it picks the keys to blend. A point is (time, progress, flags);
 bit 2 of the flags makes the stretch that starts at the point a curve.

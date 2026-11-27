@@ -348,6 +348,10 @@ def euler_from_quaternion(q) -> tuple[float, float, float]:
     return tuple(math.degrees(a) for a in (rx, ry, rz))
 
 
+_SAVED_ON_MAC = ("this model was saved on a Mac, with its bytes in the "
+                 "other order; reading those is not supported yet")
+
+
 class Br3(settings_anim.SettingAnimation, motion.PathObjects):
     UNIT = UNIT
 
@@ -431,8 +435,7 @@ class Br3(settings_anim.SettingAnimation, motion.PathObjects):
         """(tag, record, raw 16 bytes) for each entry of an object list."""
         payload = self._payload(ref)
         if _mac_list(payload):
-            raise BryceError("this model was saved on a Mac, with its bytes in the "
-                             "other order; reading those is not supported yet")
+            raise BryceError(_SAVED_ON_MAC)
         count = struct.unpack_from("<I", payload, 8)[0]
         if 12 + 16 * count > len(payload):
             raise BryceError("corrupt scene: object list is too short")
@@ -575,7 +578,8 @@ class Br3(settings_anim.SettingAnimation, motion.PathObjects):
                 moment = self.timeline()["time"]
             except BryceError:                   # a preset library has no timeline
                 moment = 0.0
-            value = keyframes.at(entries, moment, points=keyframes.time_curve(payload))
+            value = keyframes.at(entries, moment, keyframes.blend_of(track[0]),
+                                 keyframes.time_curve(payload))
         else:
             value = struct.unpack_from(f"<{number}{code}", payload, offset)
         return offset, form, value if number == 3 else value[0]
@@ -1075,7 +1079,7 @@ class Br3(settings_anim.SettingAnimation, motion.PathObjects):
         for (class_name, number), otherwise in zip(_POSE_TRACKS, fallback):
             entries = self._track_values(ref, class_name, number)
             parts.append(tuple(otherwise) if entries is None else
-                         keyframes.at(entries, time, class_name == "Obj_eOrient",
+                         keyframes.at(entries, time, keyframes.blend_of(class_name),
                                       self._track_curve(ref, class_name)))
         position, origin, scale, rotation = parts
         return world_centre(position, origin, scale, rotation), list(scale), rotation
@@ -1084,7 +1088,8 @@ class Br3(settings_anim.SettingAnimation, motion.PathObjects):
         """What the local origin adds to the stored position at `time`."""
         entries = self._track_values(ref, "Obj_eOrigin", 3)
         origin = ((0.0, 0.0, 0.0) if entries is None else keyframes.at(
-            entries, time, points=self._track_curve(ref, "Obj_eOrigin")))
+            entries, time, keyframes.blend_of("Obj_eOrigin"),
+            self._track_curve(ref, "Obj_eOrigin")))
         return world_centre((0.0, 0.0, 0.0), origin, scale, rotation)
 
     def animation(self, ref: Ref) -> dict:
@@ -1455,8 +1460,8 @@ class Br3(settings_anim.SettingAnimation, motion.PathObjects):
                 if "position" in item:
                     eye = _triple(item["position"], "position")
                 elif entries.get("position"):
-                    eye = [v * UNIT for v in
-                           keyframes.at(entries["position"], frame / fps)]
+                    eye = [v * UNIT for v in keyframes.at(
+                        entries["position"], frame / fps, keyframes.SPLINE)]
                 elif self._is_animated(channels["position"]):
                     eye = [v * UNIT for v in
                            self._channel_value(channels["position"], frame / fps)]
@@ -2540,6 +2545,9 @@ class Br3(settings_anim.SettingAnimation, motion.PathObjects):
         (offset) turned by the matrix, plus a translation."""
         key = self._camera_key(view) or self._first(_CAMERA)
         payload = self._payload(key)
+        root = self._first(_ROOT)
+        if root is not None and _mac_list(self._payload(root)):
+            raise BryceError(_SAVED_ON_MAC)
         offset = struct.unpack_from("<3d", payload, _CAMERA_OFFSET)
         flat = struct.unpack_from("<9d", payload, _CAMERA_MATRIX)
         translation = struct.unpack_from("<3d", payload, _CAMERA_TRANSLATION)

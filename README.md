@@ -136,11 +136,25 @@ change and render in Bryce:
 A scene saved by Bryce already holds these records with one key each, so use a scene or
 template that came from your Bryce.
 
+### How Bryce moves between keys
+
+The preview and `time_marker` work this out as follows (how well each rule is checked is
+under Status):
+
+| What is keyed | Between two keys |
+| --- | --- |
+| Position | **A smooth curve through all the keys**, so three or more keys swing wide at a turn. With only two keys the line is straight, but the motion starts and ends at 1.5 times its average speed and drops to 0.75 times in the middle. The camera's position works the same way |
+| Rotation of an object | A smooth turn at an even rate (quaternion blend). Not every Bryce scene agrees; see Status |
+| Direction of the sun | A straight blend, kept at length 1 |
+| Size, camera angles and field of view, colors, material, sky and lamp numbers | Straight lines |
+
+To keep an object on straight legs, put an extra key close to each side of a corner.
+
 ### The shape of Bryce's curves
 
 `curve` shapes the **timing** of a channel: how far along its keys it has got at each
-moment, from its first key to its last. This is the curve Bryce stores on a track; the
-values still blend from key to key in order.
+moment, from its first key to its last. This is the curve Bryce stores on a track. It
+changes when things happen, and the table above still decides the route.
 
 ```json
 [
@@ -169,6 +183,9 @@ values still blend from key to key in order.
   {"op": "path", "name": "Track", "closed": true,
    "points": [[60, 15, 0], [0, 25, 60], [-60, 15, 0], [0, 8, -60]]},
   {"op": "follow_path", "name": "Ball", "path": "Track", "end": 90, "face": true},
+  {"op": "path", "name": "Bounce", "smooth": false,
+   "points": [[0, 48, 0], {"at": [18, 6, 0], "tension": 0.9}, [32, 34, 0],
+              {"at": [46, 6, 0], "tension": 0.9}, [56, 22, 0], [66, 6, 0]]},
   {"op": "follow_path", "target": "camera", "preset": "Horse Shoe", "centre": [0, 40, 0],
    "scale": 1.5, "end": 90, "look_at": [0, 10, 0], "curve": "ease"}
 ]
@@ -176,13 +193,23 @@ values still blend from key to key in order.
 
 - `path` makes a real Bryce path object. Bryce's 30 ready-made ones can be added with
   `insert_preset` and `"library": "Paths"`. A path can be moved, but not resized or turned.
+- With `smooth` true (the default), many points are saved along an even curve through
+  yours, which never loops back on itself.
+- With `smooth` false, exactly your points are saved and Bryce draws **its own curve**
+  through them. Each point may be `{"at": [x, y, z], "tension": t, "continuity": c,
+  "bias": b}`, each from -1 to 1. Tension tightens the curve (1 on every inner point gives
+  straight lines), continuity breaks it into a corner and bias leans it to one side of the
+  point. Widely uneven spacing can make Bryce's curve loop.
 - `follow_path` writes ordinary position keys along the route at a steady speed (a `curve`
-  changes the speed). `face` turns the follower the way it travels; `look_at` keeps the
-  camera on one spot; `centre`, `scale` and `turn` refit the route.
+  changes the speed), one for every frame by default. On a sharp bounce that stayed
+  within 0.01% of the route's size and 1% of an even speed; about a third as many keys
+  drifted 0.4% and varied in speed from 64% to 123%. `keys` sets the number. `face` turns
+  the follower the way it travels; `look_at` keeps the camera on one spot; `centre`,
+  `scale` and `turn` refit the route.
+- A path object or preset is followed along the curve Bryce draws for it.
 - **It is not Bryce's own path link.** How Bryce ties a follower to a path is not decoded,
-  so editing the path in Bryce afterwards will not move the follower. The route between
-  points is a centripetal Catmull-Rom spline. Bryce's path points also hold tension,
-  continuity, bias and twist, which are read past and written as zero.
+  so editing the path in Bryce afterwards will not move the follower. A point's twist is
+  not used.
 
 **One scene per frame** works for everything, including the camera and sky. `br3_animate` takes keyframes and paths and writes **one ordinary scene per frame**, with a
 preview GIF. `br3_render_animation` renders the frames in Bryce a few at a time (it can be
@@ -272,7 +299,7 @@ half the stated height, plus a missing boolean part. All three are fixed in 0.6.
 
 ## Status - read this first
 
-Version 0.13.0. The Python code has automated tests, run on Linux. The bridge DLL is tested
+Version 0.14.0. The Python code has automated tests, run on Linux. The bridge DLL is tested
 in a harness that loads your real `Bryce 3D.exe` and `Axiom.dll` on Linux with stand-ins for
 Windows. **Parts of it have not run on Windows yet; see the table.**
 
@@ -297,9 +324,10 @@ Windows. **Parts of it have not run on Windows yet; see the table.**
 | Booleans | In the first render the carved cube was missing. 0.6.0 writes the extra flags Bryce's own boolean parts have. **Not rendered since** |
 | Preset models, plain groups, lights, disk, lattice | Layouts read from Bryce's own files; all 154 bundled presets load with every link intact. **Not opened in Bryce yet** |
 | Position, rotation and scale keyframes | **Confirmed moving in Bryce** with a test scene that animates one object each way. Rebuilding two-key position records that Bryce saved matches them **byte for byte** |
-| Time curves | New in 0.13.0. Layout and handle rules read from Bryce's code, and the rules match its own curve routine. That Bryce blends values evenly between keys was read for some kinds of track, not traced for the ordinary object ones. **Not played in Bryce** |
-| Camera, sun, sky, material and lamp keys | New in 0.13.0. Written into the records Bryce itself keeps for them (lamp records are built here). **Not played in Bryce** |
-| Path objects and `follow_path` | New in 0.13.0. The record was read from Bryce's 30 path presets, which all load and can be followed. **A path made here has not been opened in Bryce**, and that its drawn line lines up with the follower is unconfirmed |
+| Time curves | Layout and handle rules read from Bryce's code, and the rules match its own curve routine. Positions worked out through a curve match what Bryce saved in a CD scene. **A curve made here has not been played in Bryce** |
+| Movement between keys | **Changed in 0.14.0:** earlier versions moved positions in straight lines, which Bryce does not. Checked against the values Bryce saved at its time marker in the animated scenes on the Bryce CD: all of more than 400 in-between positions agree to within a millionth of a file unit. Straight blending agrees for the field of view, a lamp's brightness, a material color, the sky and sun colors and numbers tested (in one or a few cases each) and 4 of 5 camera angles (the fifth lies outside both of its keys). The sun's direction agrees in both cases. **Object rotation is only partly settled:** it agrees exactly in 3 poses from 2 scenes, but differs by 0.2 to 85 degrees in 3 other scenes, and why is not known. Lamp color and the local origin had no in-between case; the origin uses the position rule because its records are laid out the same way |
+| Camera, sun, sky, material and lamp keys | Written into the records Bryce itself keeps for them (lamp records are built here; where the CD's scenes attach lamp records agrees in all 40 cases). **Keys made here have not been played in Bryce** |
+| Path objects and `follow_path` | The record was read from Bryce's 30 path presets, which all load and can be followed. **Changed in 0.14.0:** the curve between path points was read from Bryce's code. In two CD scenes, objects on Bryce's own path link sit within 0.00002 file units of that curve; the bounding boxes Bryce saved agree with it, including the effect of tension (one box is about 0.003 off on one side). How far along the path Bryce puts a follower agrees to about 0.03% of its length. Continuity and bias were read from code only, with no saved case. **A path made here has not been opened in Bryce** |
 | Frame-by-frame animation | Frames and previews tested here. Rendering a series is tested against a stand-in only |
 | Saving and loading | Save-box detection works on real pictures. The Save As and load steps are **not tried live** |
 | The bridge | **Loaded on Windows.** Opening scenes, starting renders from the menu, noticing when each finished and capturing the picture worked for all five gallery scenes |
@@ -550,10 +578,22 @@ is its length: a 44-byte header (1, 1, point count) and 28 bytes per point, of w
 first 12 are used: time and progress as fractions (floats) and a flag whose bit `0x2`
 curves the stretch that starts there. See `src/bryce3d_mcp/curve.py`.
 
-**Paths (`C3dPath`).** At 640: 1, 2, the point count; at 652 the bounding box; from 700,
-100 bytes a point: position (doubles), then tension, continuity, bias and twist (floats).
-Points are saved already resized and turned, measured from the object's center. See
-`src/bryce3d_mcp/motion.py`.
+**Paths (`C3dPath`).** At 640: 1, 2, the point count; at 652 the bounding box of the drawn
+curve; from 700, 100 bytes a point: position (doubles), then tension, continuity, bias and
+twist (floats). Points are saved already resized and turned. See
+`src/bryce3d_mcp/motion.py`. A follower on Bryce's own link has a track of 48-byte keys
+whose value is a float from 0 to the number of points less one, a share of the path's
+length; how the follower is tied to one path is not known.
+
+**Bryce's spline.** Each stretch is a cubic Bezier. Its handles are those of a
+tension-continuity-bias (Kochanek-Bartels) spline with a factor of **0.19 between position
+keys** and **0.25 along path objects** instead of the textbook 0.5. At the ends of an open
+curve the end handle is `end + (tension + factor) * (lean - end)`, where `lean` is the
+handle at the other end of the stretch (moved by continuity), and two points get both
+handles halfway. The handles ignore the time between keys. See `src/bryce3d_mcp/spline.py`.
+
+**Mac scenes.** 36 of the 54 scenes on the Bryce CD were saved on a Mac, with their
+records in the other byte order. This server says so and does not open their objects.
 
 **Meshes (`C3dTriMeshType2`).** After the 640-byte object header: `2, points, normals,
 triangles, 0`; at 660 a bounding box padded by 1% per side; from 860 the points and then
@@ -637,13 +677,14 @@ Nothing here uses your mouse or keyboard. Keep a saved copy of any scene you car
 Not everything in Bryce 3D is covered by the file tools:
 
 - Not every Bryce 3D feature can be driven from files. Known gaps: Bryce's own link from
-  a follower to a path, and path tension, continuity, bias and twist; keys on sky switches,
+  a follower to a path, and the twist of path points; keys on sky switches,
   texture settings and light settings other than color and intensity; linking one object
   to another, tracking, and Object Attributes options such as locking, hiding and families;
   adding new 2D faces and slabs; light gels; the 360 panorama render type. Some of these
   can be reached by clicking through the bridge, which is untried in the Labs. This list
   may not be complete.
-- Object presets saved on a Mac (all 31 in `Rocks&Trees.obp`) cannot be inserted yet.
+- Object presets saved on a Mac (all 31 in `Rocks&Trees.obp`) cannot be inserted yet, and
+  scenes saved on a Mac cannot be read.
 - A procedural texture's noise types, filters and the way its parts are combined cannot
   be edited.
 - Inside the Labs, the agent works by looking and clicking; there are no per-control tools.
@@ -665,5 +706,6 @@ pytest
 
 Tests need no Windows or Bryce: they build small synthetic scene files and simulate the
 screen. The bridge harness tests run on Linux with `clang` when `BRYCE3D_INSTALL` is set.
-A few extra tests use your own copy if you set `BRYCE3D_INSTALL` (the Bryce folder)
-or `BRYCE3D_SAMPLE_SCENE` (a `.br3` saved by Bryce).
+A few extra tests use your own copy if you set `BRYCE3D_INSTALL` (the Bryce folder),
+`BRYCE3D_SAMPLE_SCENE` (a `.br3` saved by Bryce) or `BRYCE3D_CD_SCENES` (a folder holding
+the scenes from the Bryce CD, against which the movement between keys is checked).

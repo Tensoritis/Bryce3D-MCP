@@ -52,8 +52,9 @@ def test_a_path_object_is_described_with_its_real_size():
     assert seen["kind"] == "path"
     assert seen["size"] == pytest.approx([2 * UNIT, 0, UNIT], abs=0.01)
     assert seen["path"] == {"points": 3, "closed": False}
-    route, closed = scene.path_route(scene.find("Old Path")[1])
+    route, closed, shaping = scene.path_route(scene.find("Old Path")[1])
     assert not closed
+    assert shaping[1] == (0.5, 0.25, -0.5)
     assert route[1] == pytest.approx([0, 2 * UNIT, UNIT])
 
 
@@ -62,11 +63,11 @@ def test_a_new_path_goes_through_the_points_asked_for():
                                         "closed": True, "smooth": False})
     assert results[0]["path"] == {"points": 5, "closed": True}
     assert results[0]["position"] == pytest.approx([0, 10, 0])
-    route, closed = scene.path_route(scene.find("Loop")[1])
-    assert closed
+    route, closed, _ = scene.path_route(scene.find("Loop")[1])
+    assert closed and len(route) == 5
     for got, wanted in zip(route, SQUARE):
         assert got == pytest.approx(wanted, abs=1e-6)
-    old, _ = scene.path_route(scene.find("Old Path")[1])
+    old, _, _ = scene.path_route(scene.find("Old Path")[1])
     assert len(old) == 3                                   # the donor is untouched
 
 
@@ -206,8 +207,9 @@ def test_all_of_bryces_paths_can_be_read_and_followed():
         tag, ref, _ = [i for i in shelf._list_items(("C3dRootObjList", preset.key))
                        if i[0] != "basecamr"][0]
         assert tag == "path3dob"
-        route, closed = shelf.path_route(ref)
-        assert len(motion.travel(route, closed, 0, 60, 31)) == 31
+        route, closed, shaping = shelf.path_route(ref)
+        assert len(motion.travel(route, closed, 0, 60, 31, shape="bryce",
+                                 shaping=shaping)) == 31
         points = motion.read_points(shelf._payload(ref))
         box = struct.unpack_from("<6d", shelf._payload(ref), 652)
         # Bryce's own bounding box covers the stored points.
@@ -229,7 +231,7 @@ def test_a_path_can_be_built_and_a_preset_followed_in_a_real_scene():
          "centre": [0, 30, 0], "end": 60, "look_at": [0, 5, 0]},
         install=install)
     assert len(scene.objects()) == count + 1
-    route, closed = scene.path_route(scene.find("My Path")[1])
+    route, closed, _ = scene.path_route(scene.find("My Path")[1])
     assert closed and route[0] == pytest.approx(SQUARE[0], abs=1e-3)
     assert results[1]["followed"]["frames"] == [0, 60]
 

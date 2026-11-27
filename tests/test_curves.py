@@ -108,7 +108,9 @@ def test_a_curve_is_stored_after_the_keys_and_counted_in_the_header():
 
 def test_a_curve_changes_the_pose_between_keys_but_not_on_them():
     straight, eased = slide(), slide(curve="ease_in")
-    assert where(straight, 10)[0] == pytest.approx(10, abs=0.01)
+    # With two keys Bryce starts fast, slows in the middle and speeds up again.
+    assert where(straight, 10)[0] == pytest.approx(11.875, abs=0.01)
+    assert where(straight, 20)[0] == pytest.approx(20, abs=0.01)
     assert where(eased, 10)[0] < 5
     assert where(eased, 0)[0] == 0 and where(eased, 40)[0] == pytest.approx(40, abs=0.01)
     assert eased.describe(*eased.find("Cube 1"))["curves"] == {"position": "ease_in"}

@@ -14,8 +14,17 @@ A record with one key is a plain setting. The layout was read from a scene in wh
 Bryce itself had saved two position keys on five objects, and from the code that
 loads and saves all the other kinds of track.
 
-Between two keys Bryce blends in straight lines; the time curve, which spans the
-whole track from its first key to its last, shapes the timing.
+How Bryce gets from one key to the next depends on what is keyed:
+
+* positions (and the local origin) follow a smooth curve through all the keys
+  (spline.py);
+* turns are blended as quaternions;
+* the direction of the sun is blended in a straight line and made a unit vector;
+* everything else (size, camera angles, colours, numbers) goes in straight lines.
+
+The time curve, which spans the whole track from its first key to its last, shapes
+the timing before any of that. Each rule was checked against the values Bryce
+saved, at its time marker, in the animated scenes on the Bryce CD.
 """
 
 from __future__ import annotations
@@ -23,7 +32,7 @@ from __future__ import annotations
 import math
 import struct
 
-from . import curve
+from . import curve, spline
 from .errors import BryceError
 
 HEAD = 148
@@ -31,6 +40,14 @@ VALUE = 44                           # offset of the value inside a key
 _COUNT, _EXTRA = 8, 16
 _SHORTEST_KEY = 48
 MAX_KEYS = 1000
+STRAIGHT, SPLINE, DIRECTION, TURN = "straight", "spline", "direction", "turn"
+_BLENDS = {"Obj_ePosition": SPLINE, "Obj_eOrigin": SPLINE, "Obj_eOrient": TURN,
+           "SunL_eSunVctr": DIRECTION}
+
+
+def blend_of(class_name: str) -> str:
+    """How Bryce moves between the keys of this kind of track."""
+    return _BLENDS.get(class_name, STRAIGHT)
 
 
 def _extra(record: bytes) -> int:
@@ -134,25 +151,31 @@ def _slerp(a, b, t: float):
     return tuple(v / length for v in mixed)
 
 
-def at(entries, time: float, rotation: bool = False, points=None):
+def at(entries, time: float, blend: str = STRAIGHT, points=None):
     """The value at `time`, the way Bryce works it out: the time is looked up in
-    the track's curve (`points`), then the two keys around the result are blended
-    in a straight line (turns are blended as quaternions)."""
+    the track's curve (`points`), then the keys around the result are blended
+    the way `blend` says (see blend_of)."""
     first, last = entries[0][0], entries[-1][0]
+    if points and last > first:
+        # The curve has the say even at the ends: some stop short of the last key.
+        share = min(1.0, max(0.0, (time - first) / (last - first)))
+        time = first + curve.progress(points, share) * (last - first)
     if time <= first + 1e-6:
         return tuple(entries[0][1])
     if time >= last - 1e-6:
         return tuple(entries[-1][1])
-    if points:
-        time = first + curve.progress(points, (time - first) / (last - first)) * (last - first)
-        if time <= first + 1e-6:
-            return tuple(entries[0][1])
-    for (t0, v0), (t1, v1) in zip(entries, entries[1:]):
+    for i, ((t0, v0), (t1, v1)) in enumerate(zip(entries, entries[1:])):
         if time < t1 - 1e-6:
             share = (time - t0) / (t1 - t0)
-            if rotation:
+            if blend == TURN:
                 return _slerp(v0, v1, share)
-            return tuple(x + (y - x) * share for x, y in zip(v0, v1))
+            if blend == SPLINE:
+                return tuple(spline.between([v for _, v in entries], i, share))
+            mixed = tuple(x + (y - x) * share for x, y in zip(v0, v1))
+            if blend == DIRECTION:
+                length = math.sqrt(sum(v * v for v in mixed))
+                return tuple(v / length for v in mixed) if length > 1e-9 else tuple(v0)
+            return mixed
         if time <= t1 + 1e-6:
             return tuple(v1)
     return tuple(entries[-1][1])

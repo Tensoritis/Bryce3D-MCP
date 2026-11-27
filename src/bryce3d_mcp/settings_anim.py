@@ -78,7 +78,8 @@ class SettingAnimation:
     def _channel_value(self, channel: Channel, time: float):
         record = self._channel_record(channel)
         return keyframes.at(self._channel_entries(channel), time,
-                            points=keyframes.time_curve(record))
+                            keyframes.blend_of(channel.class_name),
+                            keyframes.time_curve(record))
 
     def _is_animated(self, channel: Channel) -> bool:
         record = self._channel_record(channel)

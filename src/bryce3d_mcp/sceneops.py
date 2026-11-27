@@ -63,17 +63,24 @@ OPERATIONS = {
                 "Preview does not show it."),
     "path": (("points",), ("name", "closed", "smooth"),
              "Add a Bryce path object through points [[x,y,z],...] in Bryce units. closed "
-             "makes a loop. smooth (true) saves many points along a smooth curve through "
-             "yours; false saves just yours. Bryce's 30 ready-made paths are object "
-             'presets: insert_preset with library "Paths". A path can be moved but not '
-             "resized or turned."),
+             "makes a loop. smooth (true) saves many points along an even, loop-free curve "
+             "through yours. false saves exactly your points and Bryce draws its own curve "
+             "through them (uneven spacing can make it loop); then a point may also be "
+             '{"at":[x,y,z],"tension":t,"continuity":c,"bias":b}, each -1 to 1: tension 1 '
+             "pulls the curve tight (on every inner point it gives straight lines), "
+             "continuity bends it sharply at the point, bias leans it before or after. "
+             "Bryce's 30 ready-made paths are object presets: insert_preset with library "
+             '"Paths". A path can be moved but not resized or turned.'),
     "follow_path": ((), ("name", "target", "path", "preset", "points", "closed", "centre",
                          "scale", "turn", "start", "end", "keys", "face", "heading_offset",
                          "look_at", "reverse", "curve", "duration"),
                     "Move an object (name) or the camera (target camera) along a path at a "
-                    "steady speed, by writing position keys. Give one of path (a path "
+                    "steady speed, by writing position keys (one per frame unless keys says "
+                    "fewer; fewer are easier to edit in Bryce but follow less closely). Give one of path (a path "
                     "object in the scene), preset (a Bryce path by name) or points "
-                    "[[x,y,z],...]. centre, scale (one number) and turn (degrees) move, "
+                    "[[x,y,z],...] (shaped points as for op path use Bryce's curve). A path "
+                    "object or preset is followed along the curve Bryce draws. "
+                    "centre, scale (one number) and turn (degrees) move, "
                     "resize and swing the route. start and end are frames; keys is how "
                     "many to write. face true points it the way it travels (an object's "
                     "+z side, or the camera, which then also tilts); heading_offset adds "
@@ -113,12 +120,16 @@ OPERATIONS = {
                   "object spin, put keys less than 180 degrees apart. duration "
                   "(seconds) sets the animation's length, which always reaches the last "
                   "key. curve shapes the timing from a channel's first key to its last "
-                  "(Bryce blends keys in straight lines, and this is its own time curve): "
+                  "(this is Bryce's own time curve): "
                   '"linear", "ease", "ease_in", "ease_out", "hold", or points '
                   '[[time, progress], ..., [1, 1]] from [0, 0], both 0 to 1, each '
                   'optionally "smooth" (default) or "straight"; or one of these per '
                   'channel, {"position": "ease"}. Give curve without keys to reshape '
-                  "existing motion. Position, rotation and scale keys have been seen "
+                  "existing motion. As in Bryce, position moves on a smooth curve through "
+                  "all its keys (with only two keys it runs straight but starts and ends "
+                  "faster than its middle; three or more keys can swing wide at a turn), "
+                  "rotation turns smoothly from key to key, and other settings change "
+                  "evenly. Position, rotation and scale keys have been seen "
                   "playing in Bryce; curves and the other targets have not yet."),
     "time_marker": ((), ("frame", "time"),
                     "Move Bryce's time marker (give frame or time in seconds). The scene "
@@ -330,7 +341,8 @@ def _follow(scene: Br3, library: Br3 | None, sources: _Sources, fields: dict) ->
         kind, ref = scene.find(value)
         if kind != "path":
             raise BryceError(f"{value!r} is not a path object")
-        route, loops = scene.path_route(ref)
+        route, loops, shaping = scene.path_route(ref)
+        shape = "bryce"
     elif source == "preset":
         found = presets.find(sources.folder(), "objects", value, "Paths")
         shelf = presets.load(found)
@@ -338,9 +350,13 @@ def _follow(scene: Br3, library: Br3 | None, sources: _Sources, fields: dict) ->
                 if tag == motion.PATH_TAG]
         if not refs:
             raise BryceError(f"{value!r} holds no path")
-        route, loops = shelf.path_route(refs[0])
+        route, loops, shaping = shelf.path_route(refs[0])
+        shape = "bryce"
     else:
-        route, loops = motion.check_points(value), False
+        route, shaping = motion.parse_points(value)
+        loops = False
+        # Shaped points get Bryce's curve; plain ones the loop-free one.
+        shape = "even" if shaping is None else "bryce_loop" if closed else "bryce"
     if centre is not None or scale is not None or turn is not None:
         middle = [(max(p[a] for p in route) + min(p[a] for p in route)) / 2
                   for a in range(3)]
@@ -348,12 +364,12 @@ def _follow(scene: Br3, library: Br3 | None, sources: _Sources, fields: dict) ->
         if not isinstance(factor, (int, float)) or not 0 < factor < 1e4:
             raise BryceError("scale must be one positive number")
         if centre is not None:
-            centre = motion.check_points([centre, [v + 1 for v in centre]], "centre")[0]
+            centre = motion.parse_points([centre, [v + 1 for v in centre]], "centre")[0][0]
         route = motion.place_route(
             [[v - m for v, m in zip(p, middle)] for p in route],
             middle if centre is None else centre, factor, float(turn or 0))
     return scene.follow(route, loops if closed is None else bool(closed),
-                        library=library, **fields)
+                        library=library, shape=shape, shaping=shaping, **fields)
 
 
 def _mesh(scene: Br3, library: Br3 | None, fields: dict) -> dict:

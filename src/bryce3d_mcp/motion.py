@@ -8,10 +8,12 @@ then maximum corner, doubles), and from 700 the points: x, y, z as doubles, then
 tension, continuity, bias and twist as floats. The remaining bytes of a point are
 whatever was in memory when it was saved.
 
+Between its points Bryce draws the curve in spline.py, shaped by the tension,
+continuity and bias of each point; following a saved path uses that same curve.
+The twist of a point is not used.
+
 Bryce links a follower to a path in a way that is not decoded, so following is done
-by writing ordinary position keys along the path. The curve between points here is
-a centripetal Catmull-Rom spline; Bryce's own tension, continuity and bias are
-not applied.
+by writing ordinary position keys along the path, by default one for every frame.
 """
 
 from __future__ import annotations
@@ -19,6 +21,7 @@ from __future__ import annotations
 import math
 import struct
 
+from . import spline
 from .animation import Path
 from .errors import BryceError
 
@@ -28,6 +31,11 @@ _TCBT = 24                                  # tension, continuity, bias, twist
 MAX_POINTS = 500
 MAX_KEYS = 600
 _CLOSE_ENOUGH = 0.03                        # of the path's size: ends that meet
+SHAPE_FIELDS = ("tension", "continuity", "bias")
+# How a route's points become a curve: "even" is a loop-free smooth curve through
+# them, "bryce" is what Bryce draws through the points of a path object, and
+# "bryce_loop" is Bryce's curve closed on itself.
+SHAPES = ("even", "bryce", "bryce_loop")
 
 
 def read_points(payload: bytes) -> list[tuple]:
@@ -44,6 +52,12 @@ def read_points(payload: bytes) -> list[tuple]:
     return points
 
 
+def read_shaping(payload: bytes) -> list[tuple]:
+    """(tension, continuity, bias) of every point of a path record."""
+    return [struct.unpack_from("<3f", payload, _POINTS + _STRIDE * i + _TCBT)
+            for i in range(len(read_points(payload)))]
+
+
 def extent(points) -> list[float]:
     return [max(p[a] for p in points) - min(p[a] for p in points) for a in range(3)]
 
@@ -57,19 +71,40 @@ def split_loop(points) -> tuple[list, bool]:
     return points, False
 
 
-def check_points(points, what: str = "points") -> list[list[float]]:
+def parse_points(points, what: str = "points") -> tuple[list, list | None]:
+    """(points, shaping). A point is [x, y, z], or {"at": [x, y, z]} with any of
+    tension, continuity and bias from -1 to 1. `shaping` is None when no point
+    sets any."""
     if not isinstance(points, list) or not 2 <= len(points) <= MAX_POINTS:
         raise BryceError(f"{what}: give 2 to {MAX_POINTS} [x, y, z] points")
-    out = []
+    out, shaping, shaped = [], [], False
     for point in points:
+        values = [0.0, 0.0, 0.0]
+        if isinstance(point, dict):
+            unknown = sorted(set(point) - {"at", *SHAPE_FIELDS})
+            if unknown or "at" not in point:
+                raise BryceError(f"{what}: a shaped point takes at, "
+                                 f"{', '.join(SHAPE_FIELDS)}")
+            for n, field in enumerate(SHAPE_FIELDS):
+                if field in point:
+                    value = point[field]
+                    if not _is_number(value) or not -1 <= value <= 1:
+                        raise BryceError(f"{what}: {field} goes from -1 to 1")
+                    values[n], shaped = float(value), True
+            point = point["at"]
         if not isinstance(point, (list, tuple)) or len(point) != 3 or not all(
-                isinstance(v, (int, float)) and not isinstance(v, bool)
-                and math.isfinite(v) and abs(v) < 1e7 for v in point):
+                _is_number(v) and abs(v) < 1e7 for v in point):
             raise BryceError(f"{what}: each point is [x, y, z] numbers")
         out.append([float(v) for v in point])
+        shaping.append(tuple(values))
     if max(extent(out)) <= 0:
         raise BryceError(f"{what}: the path has no length")
-    return out
+    return out, shaping if shaped else None
+
+
+def _is_number(value) -> bool:
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(value))
 
 
 def smooth(points, closed: bool, per_stretch: int = 8) -> list[list[float]]:
@@ -80,22 +115,28 @@ def smooth(points, closed: bool, per_stretch: int = 8) -> list[list[float]]:
     return [path.at(i / count)[0] for i in range(count + 1)]
 
 
-def record(donor: bytes, points) -> bytes:
+def record(donor: bytes, points, shaping=None) -> bytes:
     """A path record holding `points` (from the centre, file units), made from a
-    path Bryce saved."""
+    path Bryce saved. Its bounding box covers the curve Bryce will draw, which can
+    reach past the points."""
     read_points(donor)                       # refuses an unreadable donor
     blank = bytearray(donor[_POINTS:_POINTS + _STRIDE])
     blank[_TCBT:_TCBT + 16] = bytes(16)
     body = bytearray(donor[:_POINTS])
     struct.pack_into("<I", body, _COUNT, len(points))
-    struct.pack_into("<6d", body, _BOX,
-                     *(min(p[a] for p in points) for a in range(3)),
-                     *(max(p[a] for p in points) for a in range(3)))
-    for point in points:
+    struct.pack_into("<6d", body, _BOX, *_box(spline.sample(points, tcb=shaping, steps=32)))
+    for i, point in enumerate(points):
         item = bytearray(blank)
         struct.pack_into("<3d", item, 0, *point)
+        if shaping:
+            struct.pack_into("<3f", item, _TCBT, *shaping[i])
         body += item
     return bytes(body)
+
+
+def _box(points) -> list[float]:
+    return [*(min(p[a] for p in points) for a in range(3)),
+            *(max(p[a] for p in points) for a in range(3))]
 
 
 def place_route(points, centre, scale: float = 1.0, turn: float = 0.0) -> list:
@@ -107,11 +148,28 @@ def place_route(points, centre, scale: float = 1.0, turn: float = 0.0) -> list:
              centre[2] + scale * (z * cos - x * sin)] for x, y, z in points]
 
 
+def curve_through(points, closed: bool, shape: str = "even", shaping=None):
+    """The curve of a route (see SHAPES), travelled by distance."""
+    if shape == "even":
+        return Path(points, closed)
+    return spline.Route(points, shape == "bryce_loop", shaping)
+
+
+def reversed_route(points, shaping) -> tuple[list, list | None]:
+    """The same curve, travelled the other way: bias changes sides."""
+    turned = None if shaping is None else [(t, c, -b) for t, c, b in reversed(shaping)]
+    return list(reversed(points)), turned
+
+
 def travel(points, closed: bool, first: int, last: int, count: int,
-           reverse: bool = False) -> list[dict]:
+           reverse: bool = False, shape: str = "even", shaping=None) -> list[dict]:
     """`count` moments along a path at a steady speed: frame, position, and the
     compass heading and climb (degrees) of the direction of travel."""
-    path = Path(list(reversed(points)) if reverse else points, closed)
+    if reverse:
+        points, shaping = reversed_route(points, shaping)
+    path = curve_through(points, closed, shape, shaping)
+    # A saved loop is drawn as an open curve whose ends may not quite meet.
+    wraps = closed and math.dist(path.samples[0], path.samples[-1]) < 1e-6 * path.lengths[-1]
     frames = sorted({first + round(i * (last - first) / (count - 1))
                      for i in range(count)})
     step = 0.002
@@ -119,8 +177,8 @@ def travel(points, closed: bool, first: int, last: int, count: int,
     for frame in frames:
         done = (frame - first) / (last - first)
         # On a loop, look across the join so that the last frame matches the first.
-        behind = path.at(done - step if closed else max(0.0, done - step))[0]
-        ahead = path.at(done + step if closed else min(1.0, done + step))[0]
+        behind = path.at((done - step) % 1.0 if wraps else max(0.0, done - step))[0]
+        ahead = path.at((done + step) % 1.0 if wraps else min(1.0, done + step))[0]
         dx, dy, dz = (b - a for a, b in zip(behind, ahead))
         flat = math.hypot(dx, dz)
         if flat > 1e-9:
@@ -136,27 +194,35 @@ def travel(points, closed: bool, first: int, last: int, count: int,
 class PathObjects:
     """Path objects in a scene, and following paths. Mixed into Br3."""
 
-    def path_route(self, ref) -> tuple[list, bool]:
-        """A path object's points in Bryce units, and whether it is a loop."""
-        points, closed = split_loop(read_points(self._payload(ref)))
+    def path_route(self, ref) -> tuple[list, bool, list]:
+        """A path object's points in Bryce units, whether it is a loop, and the
+        shaping of each point. Every saved point is listed (a loop ends where it
+        began), so that spline.Route draws what Bryce draws."""
+        payload = self._payload(ref)
+        points = read_points(payload)
         centre = self.centre_of(ref)
-        return [[(c + v) * self.UNIT for c, v in zip(centre, p)] for p in points], closed
+        return ([[(c + v) * self.UNIT for c, v in zip(centre, p)] for p in points],
+                split_loop(points)[1], read_shaping(payload))
 
     def add_path(self, points: list, name: str | None = None, closed: bool = False,
                  smooth_curve: bool = True, donors=()) -> dict:
         """Add a Bryce path object through points given in Bryce units."""
-        points = check_points(points)
+        points, shaping = parse_points(points)
+        if shaping and smooth_curve:
+            raise BryceError("tension, continuity and bias shape the points you give: "
+                             "set smooth to false so that exactly those points are saved")
         if smooth_curve and len(points) > 2:
             points = smooth(points, closed)
         elif closed:
             points = points + [points[0]]
+            shaping = shaping and shaping + [shaping[0]]
         if len(points) > MAX_POINTS:
             raise BryceError(f"a path takes at most {MAX_POINTS} points")
-        middle = [(max(p[a] for p in points) + min(p[a] for p in points)) / 2
-                  for a in range(3)]
+        box = _box(spline.sample(points, tcb=shaping, steps=32))
+        middle = [(box[a] + box[a + 3]) / 2 for a in range(3)]
         local = [[(v - m) / self.UNIT for v, m in zip(p, middle)] for p in points]
         source, donor = self._path_donor(donors)
-        data = record(source._payload(donor), local)      # fails before any change
+        data = record(source._payload(donor), local, shaping)   # fails first
         stem = (name or "Path 1")[:24].strip() or "Path 1"
         if any(self._name(k) == stem for _, k in self._objects()):
             stem = self._unique_name(stem)
@@ -190,7 +256,8 @@ class PathObjects:
                target: str = "object", start: int = 0, end: int | None = None,
                keys: int | None = None, face: bool = False,
                heading_offset: float = 0.0, look_at=None, reverse: bool = False,
-               curve=None, duration: float | None = None, library=None) -> dict:
+               curve=None, duration: float | None = None, library=None,
+               shape: str = "even", shaping=None) -> dict:
         """Key an object or the camera along `route` at a steady speed (a time curve
         changes the speed)."""
         if target not in ("object", "camera"):
@@ -210,15 +277,16 @@ class PathObjects:
                 raise BryceError(f"{label} must be a frame number")
         if end <= start:
             raise BryceError("end must be after start")
-        stretches = len(route) if closed else len(route) - 1
         if keys is None:
-            keys = max(2, min(stretches * 6 + 1, 121))
+            # Bryce curves between keys with a short handle, so keys far apart make
+            # the speed ripple and cut sharp turns. One per frame follows the route.
+            keys = max(2, min(end - start + 1, MAX_KEYS))
         if not isinstance(keys, int) or not 2 <= keys <= MAX_KEYS:
             raise BryceError(f"keys must be 2 to {MAX_KEYS}")
         keys = min(keys, end - start + 1)
         if not math.isfinite(heading_offset):
             raise BryceError("heading_offset must be a number of degrees")
-        moments = travel(route, closed, start, end, keys, reverse)
+        moments = travel(route, closed, start, end, keys, reverse, shape, shaping)
         base = None
         if target == "object" and face:
             base = self.describe(*self.find(name))["rotation"]
@@ -238,7 +306,7 @@ class PathObjects:
             items.append(item)
         result = self.set_keyframes(name, items, duration, library, target=target,
                                     curve="linear" if curve is None else curve)
-        length = Path(route, closed).lengths[-1]
+        length = curve_through(route, closed, shape, shaping).lengths[-1]
         return {"followed": {"target": name or "camera", "keys": len(items),
                              "frames": [start, end], "length": round(length, 1),
                              "closed": closed},
