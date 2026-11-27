@@ -179,3 +179,14 @@ def test_rendering_stops_at_the_first_problem_and_keeps_unsaved_work(studio):
 def test_a_folder_that_is_not_an_animation_is_refused(studio, tmp_path):
     with pytest.raises(Exception, match="not a folder made by"):
         server.br3_render_animation(str(tmp_path), confirm=True)
+
+
+def test_a_light_can_pulse_and_change_colour():
+    frames = animation.plan(3, [{"target": "object", "name": "Lamp", "keys": [
+        {"frame": 0, "light": {"intensity": 0, "color": "#000000"}},
+        {"frame": 2, "light": {"intensity": 100, "color": "#ffffff"}}]}], "linear")
+    assert frames[1][0]["light"] == {"intensity": 50.0, "color": [0.5, 0.5, 0.5]}
+    overshoot = animation.plan(6, [{"target": "object", "name": "Lamp", "keys": [
+        {"frame": f, "light": {"intensity": v}} for f, v in ((0, 0), (1, 100), (4, 100),
+                                                            (5, 0))]}], "smooth")
+    assert all(0 <= step[0]["light"]["intensity"] <= 100 for step in overshoot)

@@ -12,7 +12,7 @@ from bryce3d_mcp import presets, preview, sceneops
 from bryce3d_mcp.br3 import (SKY_CACHE, UNIT, Br3, camera_matrix, quaternion_from_euler,
                              quaternion_from_matrix, rotation_matrix)
 from bryce3d_mcp.errors import BryceError
-from scene_files import (basic_scene, group_donor, material_library, sky_library,
+from scene_files import (basic_scene, group_donor, light_scene, material_library, sky_library,
                          template_scene)
 
 
@@ -461,3 +461,74 @@ def test_mountain_presets_stand_at_half_their_height():
         if info["position"][1] == pytest.approx(info["size"][1] / 2, rel=0.01):
             standing.append(round(info["size"][1]))
     assert len(standing) >= 15 and len(set(standing)) >= 3
+
+
+def test_light_settings_are_stored_as_bryce_stores_them():
+    scene = Br3.from_bytes(light_scene())
+    assert named(scene)["Radial 1"]["light"] == {
+        "color": "#ffffff", "intensity": 25.0, "falloff": "linear", "casts_shadows": True,
+        "infinite": False, "visible": False}
+    assert named(scene)["Spot 1"]["light"]["edge_softness"] == 0
+    scene.set_light("Spot 1", {"color": "#ff8000", "intensity": 80, "falloff": "squared",
+                               "casts_shadows": False, "visible": True,
+                               "edge_softness": 40})
+    again = reread(scene)
+    payload = again._payload(again.find("Spot 1")[1])
+    assert struct.unpack_from("<I", payload, 272)[0] == 0x1100 | 0x80000000 | 0x800 | 0x200
+    assert struct.unpack_from("<3f", payload, 644) == pytest.approx((1, 128 / 255, 0))
+    assert struct.unpack_from("<d", payload, 656)[0] == pytest.approx(16.0)  # 80 / 5
+    assert struct.unpack_from("<d", payload, 836)[0] == pytest.approx(2.0)   # 40 / 20
+    assert named(again)["Spot 1"]["light"] == {
+        "color": "#ff8000", "intensity": 80.0, "falloff": "squared", "casts_shadows": False,
+        "infinite": False, "visible": True, "edge_softness": 40.0}
+    # The falloff choices exclude each other, and a switch can be turned back off.
+    again.set_light("Spot 1", {"falloff": "none", "casts_shadows": True, "infinite": True})
+    flags = struct.unpack_from("<I", again._payload(again.find("Spot 1")[1]), 272)[0]
+    assert flags == 0x1100 | 0x400 | 0x200 | 0x2000
+
+
+def test_square_lights_take_a_softness_for_each_side():
+    scene = Br3.from_bytes(light_scene())
+    scene.set_light("Square 1", {"edge_softness": [20, 60]})
+    payload = scene._payload(scene.find("Square 1")[1])
+    assert struct.unpack_from("<2f", payload, 836) == (1.0, 3.0)
+    assert named(scene)["Square 1"]["light"]["edge_softness"] == [20.0, 60.0]
+
+
+@pytest.mark.parametrize("name, settings, message", [
+    ("Radial 1", {"edge_softness": 10}, "no edge softness"),
+    ("Radial 1", {"intensity": 101}, "0 to 100"),
+    ("Radial 1", {"falloff": "cubic"}, "falloff must be"),
+    ("Radial 1", {"infinite": 1}, "true or false"),
+    ("Radial 1", {"brightness": 1}, "unknown light settings"),
+    ("Radial 1", {}, "must be an object"),
+])
+def test_bad_light_settings_are_refused(name, settings, message):
+    with pytest.raises(BryceError, match=message):
+        Br3.from_bytes(light_scene()).set_light(name, settings)
+
+
+def test_lights_can_be_set_while_being_added(library, install):
+    source = Br3.from_bytes(light_scene())
+    scene = run(Br3.from_bytes(basic_scene()), source, install,
+                {"op": "add", "kind": "spot_light", "name": "Key", "position": [0, 40, 0],
+                 "light": {"intensity": 60, "color": "#80c0ff"}},
+                {"op": "duplicate", "name": "Key", "new_name": "Fill",
+                 "light": {"intensity": 10}})
+    assert named(scene)["Key"]["light"]["intensity"] == 60
+    assert named(scene)["Fill"]["light"] == {**named(scene)["Key"]["light"], "intensity": 10}
+    with pytest.raises(BryceError, match="is not a light"):
+        sceneops.apply(scene, [{"op": "set", "name": "Cube 1", "light": {"intensity": 5}}])
+
+
+@pytest.mark.skipif(not os.environ.get("BRYCE3D_SAMPLE_SCENE"),
+                    reason="set BRYCE3D_SAMPLE_SCENE to test real lights")
+def test_lights_bryce_made_read_as_new_lights():
+    sample = Br3.load(os.environ["BRYCE3D_SAMPLE_SCENE"])
+    lights = [o for o in sample.objects() if o["kind"].endswith("light")]
+    if not lights:
+        pytest.skip("the sample scene has no lights")
+    for found in lights:
+        assert found["light"]["color"] == "#ffffff"
+        assert found["light"]["intensity"] == 25      # what Bryce shows for a new light
+        assert found["light"]["falloff"] == "linear" and found["light"]["casts_shadows"]

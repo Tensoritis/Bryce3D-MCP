@@ -60,6 +60,7 @@ applies completely or writes nothing.
 | `material_preset` | One of Bryce's 48 bundled materials (Mirror, Metallic Chrome, checkerboards, woods, metals), then adjust it |
 | `texture` | Drive a material channel with a named Bryce texture. `BasicSin24` on `bump` makes ripples |
 | `sky_preset` | The sky and sun of one of Bryce's 42 sky presets |
+| `light` (a field of `add`, `set`, `duplicate`) | A light's `color`, `intensity` (0 to 100, as in Bryce's Edit Light box; new lights have 25), `falloff` (`linear`, `squared`, `none`), `edge_softness` for spot, square spot and parallel lights, and true/false `casts_shadows`, `infinite` and `visible` |
 | `terrain` | Reshape a terrain from its own heights or any picture, using the terrain operations below |
 | `mesh` | A **new 3D shape** written straight into the scene: `extrude` an outline, `lathe` a profile, `custom` points and faces, or an `obj` file. Edges sharper than `smooth_angle` (40) stay crisp |
 | `texture_scale` | Multiply a procedural texture's three scale numbers, to resize or stretch its pattern |
@@ -103,10 +104,10 @@ resumed) and joins them into `render.gif`. Bryce's own timeline is not used or w
 ```
 
 Tracks can drive the camera (position, look_at, heading, pitch, bank, fov), any object
-(position, rotation, scale, size, material), the sun and sky settings. A camera or object
-can follow a smooth path at a steady speed, optionally facing the way it travels. Easing is
-`linear`, `ease` or `smooth`. Up to 600 frames; each is a full scene file, so large scenes
-use a lot of disk space.
+(position, rotation, scale, size, material, a light's numbers and color), the sun and sky
+settings. A camera or object can follow a smooth path at a steady speed, optionally facing
+the way it travels. Easing is `linear`, `ease` or `smooth`. Up to 600 frames; each is a
+full scene file, so large scenes use a lot of disk space.
 
 ## Saving and loading
 
@@ -175,7 +176,7 @@ half the stated height, plus a missing boolean part. All three are fixed in 0.6.
 
 ## Status - read this first
 
-Version 0.6.0. The Python code has automated tests, run on Linux. The bridge DLL is tested
+Version 0.7.0. The Python code has automated tests, run on Linux. The bridge DLL is tested
 in a harness that loads your real `Bryce 3D.exe` and `Axiom.dll` on Linux with stand-ins for
 Windows. **Parts of it have not run on Windows yet; see the table.**
 
@@ -189,6 +190,7 @@ Windows. **Parts of it have not run on Windows yet; see the table.**
 | Terrain height | **Fixed in 0.6.0:** terrains are half as tall as earlier versions said. Bryce's mountain presets sit at half their height, and a render agrees |
 | Sky and sun settings | **Fixed in 0.5.0:** earlier versions did not write the copy Bryce draws from. All 38 cached positions agree with the settings in four Bryce-saved scenes. Preset skies and the sun direction rendered; single values not checked in a render |
 | Sky mode and switches | New in 0.6.0. Each bit was read from the code that fills Bryce's menu and Sky & Fog window, and every preset sky with its atmosphere on has exactly one mode. **Not rendered** |
+| Light settings | New in 0.7.0. Each was read from the code behind Bryce's Edit Light window, and lights saved by Bryce read back as new lights do in Bryce (white, intensity 25). Light gels and the light radius and shadow ambience values that animations can drive are not covered. **Not rendered** |
 | Camera including bank | Reading matches a real render within 1.7 pixels. Writing and bank **rendered**: a negative bank raises the right end of the horizon |
 | Textures from the `texture` operation | **Rendered** (water ripples, rock color) after the 0.5.1 fix: each texture link needs its type marker |
 | Texture scale | The three numbers were identified from Bryce's presets. **Whether a larger number makes a pattern larger or smaller is not confirmed** |
@@ -208,7 +210,8 @@ Windows. **Parts of it have not run on Windows yet; see the table.**
 shadows in about a second, and says for each object whether it is in frame, off an edge,
 behind the camera or hidden. Against Bryce's render of a test scene, object outlines lined
 up within about 2 pixels, and new meshes and terrains line up with the gallery renders. It does **not** show textures, ripples, Bryce's skies and clouds,
-atmosphere, reflections, transparency, boolean cuts, object-on-object shadows or lights.
+atmosphere, reflections, transparency, boolean cuts, object-on-object shadows or light
+from light objects.
 It draws new meshes and camera tilt. Use it for layout, and `br3_render` for the look: a
 textured, reflective scene looks flat and plain in the preview.
 

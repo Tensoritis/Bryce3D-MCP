@@ -17,7 +17,7 @@ EASINGS = ("linear", "smooth", "ease")
 # target -> fields a keyframe may set
 FIELDS = {
     "camera": ("position", "look_at", "heading", "pitch", "bank", "fov"),
-    "object": ("position", "rotation", "scale", "size", "material"),
+    "object": ("position", "rotation", "scale", "size", "material", "light"),
     "sun": ("azimuth", "altitude", "disc_color", "halo_color"),
     "sky": ("settings",),
 }
@@ -257,6 +257,8 @@ def _shape(parts: list[str], value: list[float]):
         return (value[0] + 180) % 360 - 180 if abs(value[0]) > 180 else value[0]
     if name in ("scale", "size"):
         return [max(0.01, v) for v in value]
+    if name in ("intensity", "edge_softness"):    # a smooth curve can overshoot
+        value = [min(100.0, max(0.0, v)) for v in value]
     if len(value) == 1:
         return value[0]
     return value

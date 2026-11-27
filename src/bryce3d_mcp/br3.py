@@ -73,6 +73,23 @@ SKY_SWITCHES = {
 _VOLUMETRIC = {"off": 0, "rough": 0x800000, "fine": 0x1000000}
 _SKY_FIELDS = {"stars": 868, "comets": 872}     # whole numbers after the bits
 
+# Light settings, read off the code behind Bryce's Edit Light dialog. The tick boxes
+# and falloff choices are bits of the object's flag word at 272. The numbers are
+# stored smaller than the dialog shows them: intensity by 5, edge softness by 20.
+_LIGHT_COLOUR, _LIGHT_INTENSITY, _EDGE_SOFTNESS = 644, 656, 836
+_INTENSITY_STEP, _SOFTNESS_STEP = 5.0, 20.0
+_VISIBLE_LIGHT, _NO_FALLOFF, _NO_SHADOWS = 0x200, 0x400, 0x800
+_INFINITE_LIGHT, _SQUARED_FALLOFF = 0x2000, 0x80000000
+LIGHT_FALLOFFS = {"linear": 0, "squared": _SQUARED_FALLOFF, "none": _NO_FALLOFF}
+LIGHT_SWITCHES = ("casts_shadows", "infinite", "visible")
+LIGHT_SETTINGS = ("color", "intensity", "falloff", "edge_softness", *LIGHT_SWITCHES)
+# kind -> (how the edge softness is stored, its setting records)
+_SOFT_EDGES = {
+    "spot_light": ("<d", ("ConL_eFallOff",)),
+    "square_spot_light": ("<f", ("PyrL_eFallOffX", "PyrL_eFallOffY")),
+    "parallel_light": ("<f", ("CubeL_eFalloffX", "CubeL_eFalloffY")),
+}
+
 # user-facing kind -> root list tag
 KINDS = {
     "plane": "plne3dob", "cube": "cube3dob", "sphere": "sphr3dob", "torus": "toru3dob",
@@ -738,6 +755,84 @@ class Br3:
         self._write(ref, _FLAGS, struct.pack("<I", flags))
         self.set_boolean(ref, role)
 
+    def light(self, kind: str, key: Ref) -> dict:
+        """A light's settings, with numbers as Bryce's Edit Light dialog shows them."""
+        payload = self._payload(key)
+        flags = struct.unpack_from("<I", payload, _FLAGS)[0]
+        colour = struct.unpack_from("<3f", payload, _LIGHT_COLOUR)
+        stored = struct.unpack_from("<d", payload, _LIGHT_INTENSITY)[0]
+        found = {
+            "color": "#" + "".join(f"{round(min(1.0, max(0.0, c)) * 255):02x}"
+                                   for c in colour),
+            "intensity": round(stored * _INTENSITY_STEP, 2),
+            "falloff": ("squared" if flags & _SQUARED_FALLOFF
+                        else "none" if flags & _NO_FALLOFF else "linear"),
+            "casts_shadows": not flags & _NO_SHADOWS,
+            "infinite": bool(flags & _INFINITE_LIGHT),
+            "visible": bool(flags & _VISIBLE_LIGHT),
+        }
+        if kind in _SOFT_EDGES:
+            form, names = _SOFT_EDGES[kind]
+            values = [round(v * _SOFTNESS_STEP, 2) for v in struct.unpack_from(
+                f"<{len(names)}{form[1]}", payload, _EDGE_SOFTNESS)]
+            found["edge_softness"] = values[0] if len(set(values)) == 1 else values
+        return found
+
+    def set_light(self, name: str, settings: dict) -> dict:
+        kind, key = self.find(name)
+        if not kind.endswith("light"):
+            raise BryceError(f"{name!r} is not a light")
+        if not isinstance(settings, dict) or not settings:
+            raise BryceError(f"light must be an object with any of {list(LIGHT_SETTINGS)}")
+        unknown = sorted(set(settings) - set(LIGHT_SETTINGS))
+        if unknown:
+            raise BryceError(f"unknown light settings {unknown}; use {list(LIGHT_SETTINGS)}")
+
+        def percent(value, label):
+            number = _number(value, label)
+            if not 0 <= number <= 100:
+                raise BryceError(f"{label} must be from 0 to 100")
+            return number
+
+        def update(offset, form, value, record, label):
+            self._write(key, offset, struct.pack(form, *value) if form == "<3f"
+                        else struct.pack(form, value))
+            track = self._linked(key, record)
+            if track is not None:
+                self._set_setting(track, value, label)
+
+        flags = struct.unpack_from("<I", self._payload(key), _FLAGS)[0]
+        for label, value in settings.items():
+            if label == "color":
+                update(_LIGHT_COLOUR, "<3f", _colour(value, label), "Light_C", label)
+            elif label == "intensity":
+                update(_LIGHT_INTENSITY, "<d", percent(value, label) / _INTENSITY_STEP,
+                       "Light_Int", label)
+            elif label == "falloff":
+                if value not in LIGHT_FALLOFFS:
+                    raise BryceError(f"falloff must be one of {list(LIGHT_FALLOFFS)}")
+                flags = flags & ~(_SQUARED_FALLOFF | _NO_FALLOFF) | LIGHT_FALLOFFS[value]
+            elif label == "edge_softness":
+                if kind not in _SOFT_EDGES:
+                    raise BryceError("a radial light has no edge softness")
+                form, records = _SOFT_EDGES[kind]
+                values = value if isinstance(value, (list, tuple)) else [value] * len(records)
+                if len(values) != len(records):
+                    raise BryceError("edge_softness is one number, or [x, y] for square "
+                                     "spot and parallel lights")
+                for i, (one, record) in enumerate(zip(values, records)):
+                    update(_EDGE_SOFTNESS + i * struct.calcsize(form), form,
+                           percent(one, label) / _SOFTNESS_STEP, record, label)
+            else:
+                if not isinstance(value, bool):
+                    raise BryceError(f"{label} must be true or false")
+                bit = {"casts_shadows": _NO_SHADOWS, "infinite": _INFINITE_LIGHT,
+                       "visible": _VISIBLE_LIGHT}[label]
+                on = value if label != "casts_shadows" else not value
+                flags = flags | bit if on else flags & ~bit
+        self._write(key, _FLAGS, struct.pack("<I", flags))
+        return self.light(kind, key)
+
     def _local_extent(self, kind: str, key: Ref) -> list[float]:
         """How big an object is in its own space: what its scale multiplies."""
         if kind == "terrain":
@@ -767,6 +862,8 @@ class Br3:
         material = self.material(key)
         if material:
             info["material"] = material
+        if kind.endswith("light"):
+            info["light"] = self.light(kind, key)
         if kind == "group":
             # Members are positioned relative to their group.
             info["members"] = [self.describe(k, r) for k, r in self._members(key)]

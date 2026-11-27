@@ -5,11 +5,12 @@ from __future__ import annotations
 import os
 
 from . import heightfield, meshes, presets, terrain, trimesh
-from .br3 import BOOLEAN_BITS, KINDS, MATERIAL_COLOURS, MATERIAL_VALUES, Br3
+from .br3 import (BOOLEAN_BITS, KINDS, LIGHT_FALLOFFS, LIGHT_SETTINGS, MATERIAL_COLOURS,
+                  MATERIAL_VALUES, Br3)
 from .errors import BryceError
 
 MAX_OPERATIONS = 500
-_PLACEMENT = ("position", "scale", "size", "rotation", "material", "boolean")
+_PLACEMENT = ("position", "scale", "size", "rotation", "material", "boolean", "light")
 
 # op -> (required fields, optional fields, help)
 OPERATIONS = {
@@ -76,6 +77,16 @@ def describe() -> dict:
                               "numbers (1.0 is 100%)": list(MATERIAL_VALUES)},
         "position": "center of the object in Bryce units [x, y, z]; y is up",
         "boolean": list(BOOLEAN_BITS),
+        "light_settings": {
+            "for": "add, set and duplicate on a light, as light: {...}",
+            "names": list(LIGHT_SETTINGS),
+            "color": "#rrggbb (a light's color is here, not in material)",
+            "intensity": "0 to 100 as in Bryce's Edit Light box; new lights have 25",
+            "edge_softness": "0 to 100; spot, square spot and parallel lights; "
+                             "[x, y] for the last two",
+            "falloff": list(LIGHT_FALLOFFS),
+            "true/false": "casts_shadows, infinite, visible (visible light in the air)",
+        },
         "presets": "br3_presets lists the names for insert_preset, material_preset and "
                    "sky_preset",
         "scale": "multipliers [x, y, z]; or give size in Bryce units (for primitives "
@@ -170,30 +181,24 @@ def _run(scene: Br3, op: str, fields: dict, sources: _Sources):
         return {"sky_preset": found.name, "sun": scene.sun()}
     if op == "mesh":
         return _mesh(scene, library, fields)
-    if op == "add":
+    if op in ("add", "set", "duplicate"):
         material, boolean = fields.pop("material", None), fields.pop("boolean", None)
-        info = scene.add_object(fields.pop("kind"), library=library, **fields)
-        if boolean:
-            scene.set_boolean(scene.find(info["name"])[1], boolean)
-            info = scene.describe(*scene.find(info["name"]))
-        if material:
-            scene.set_material(info["name"], material, library)
-            info = scene.describe(*scene.find(info["name"]))
-        return info
-    if op in ("set", "duplicate"):
-        name = fields.pop("name")
-        material, boolean = fields.pop("material", None), fields.pop("boolean", None)
-        if op == "duplicate":
-            info = scene.duplicate(name, fields.pop("new_name", None), library, **fields)
+        light = fields.pop("light", None)
+        if op == "add":
+            info = scene.add_object(fields.pop("kind"), library=library, **fields)
+        elif op == "set":
+            info = scene.set_object(fields.pop("name"), library=library, **fields)
         else:
-            info = scene.set_object(name, library=library, **fields)
+            info = scene.duplicate(fields.pop("name"), fields.pop("new_name", None),
+                                   library, **fields)
+        # In this order: giving a material can renumber what the name points at.
         if boolean:
             scene.set_boolean(scene.find(info["name"])[1], boolean)
-            info = scene.describe(*scene.find(info["name"]))
         if material:
             scene.set_material(info["name"], material, library)
-            info = scene.describe(*scene.find(info["name"]))
-        return info
+        if light is not None:
+            scene.set_light(info["name"], light)
+        return scene.describe(*scene.find(info["name"]))
     if op == "delete":
         scene.delete(fields["name"])
         return {"deleted": fields["name"]}

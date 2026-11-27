@@ -207,3 +207,17 @@ def sky_library() -> bytes:
     b.record("C3dSunLight", sun, key=key)                  # same id as its sky
     b.record("CPresetDescr", description("Sunset"), key=key)
     return b.pack(0)
+
+
+def light_scene() -> bytes:
+    """Lights as a new one is stored: white, intensity 25, no setting records."""
+    b = Builder()
+    objects = []
+    for class_name, tag, name, size in (("C3dSphereLight", "sphrlght", "Radial 1", 832),
+                                        ("C3dConeLight", "conelght", "Spot 1", 848),
+                                        ("C3dPyrLightType", "pyrmlght", "Square 1", 852)):
+        body = bytearray(size)
+        struct.pack_into("<I", body, 272, 0x1100)
+        struct.pack_into("<I3f3d", body, 640, 1, 1.0, 1.0, 1.0, 5.0, 1.0, 0.0)
+        objects.append((tag, b.solid(class_name, name, (0, 5, 0), payload=body)))
+    return b.build(objects)
