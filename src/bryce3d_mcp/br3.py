@@ -101,6 +101,9 @@ KINDS = {
 _GROUP_TAG, _GROUP, _LIST = "grou3dob", "C3dGroupType", "C3dObjList"
 KINDS["group"] = _GROUP_TAG
 _KIND_OF = {tag: kind for kind, tag in KINDS.items()}
+# Kinds that can be read and edited in a scene but not added to one.
+_FACE_TAG = "sqre3dob"
+_KIND_OF[_FACE_TAG] = "2d_face"
 # The class an object list entry points into. Needed because a 32-bit id is only
 # unique within a class: a group and its member list share one, so do a sky preset
 # and its sun, and preset libraries reuse old ids across classes.
@@ -110,6 +113,7 @@ _TAG_CLASS = {
     "pyra3dob": "C3dPyramid", "cone3dob": "C3dCone", "circ3dob": "C3dCircle",
     "hfld3dob": "C3dHeightField", "symh3dob": "C3dHeightField",
     "tmsh3dob": "C3dTriMeshType2", "sphrlght": "C3dSphereLight",
+    _FACE_TAG: "C3dSquare",
     "conelght": "C3dConeLight", "pyrmlght": "C3dPyrLightType",
     "cubelght": "C3dCubeLight", _GROUP_TAG: _GROUP,
 }
@@ -1336,8 +1340,9 @@ class Br3:
         heightfield.pack_name(final, 32)
         if settings.get("position") is None:
             settings["position"] = self._resting_position(self, kind, original, settings)
+        tag = next(tag for tag, ref, _ in self._root()[2] if ref == original)
         copy = self._copy(self, original)
-        self._append(KINDS[kind], copy)
+        self._append(tag, copy)
         self._rename(copy, final)
         material = settings.pop("material", None)
         if material:

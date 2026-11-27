@@ -133,6 +133,13 @@ def template_scene() -> bytes:
     return b.build([("sphr3dob", ball), ("hfld3dob", terrain)])
 
 
+def face_scene() -> bytes:
+    """A scene holding a 2D Face, a kind that cannot be added from scratch."""
+    b = Builder()
+    face = b.solid("C3dSquare", "2D Face 1", (0, 0.25, 0))
+    return b.build([("sqre3dob", face)])
+
+
 def mesh_record(name="Stone 1"):
     """A one-triangle mesh object body."""
     body = bytearray(860 + 24 * 4 + 76)
