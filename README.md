@@ -59,6 +59,7 @@ applies completely or writes nothing.
 | `insert_preset` | One of Bryce's ready-made models: 30 mountains, 30 boolean models, tutorial scenes |
 | `material_preset` | One of Bryce's 48 bundled materials (Mirror, Metallic Chrome, checkerboards, woods, metals), then adjust it |
 | `texture` | Drive a material channel with a named Bryce texture. `BasicSin24` on `bump` makes ripples |
+| `picture` | **Your own picture** (PNG, JPEG...) on an object, stored inside the scene, up to 1024 pixels a side. Choose the `channels` (color and ambient color by default), how often it tiles (`repeat`) and the wrapping `mapping`. The first picture is built from one in Bryce's `Tutorial.obp` preset file, so `BRYCE3D_INSTALL` must be found |
 | `sky_preset` | The sky and sun of one of Bryce's 42 sky presets |
 | `light` (a field of `add`, `set`, `duplicate`) | A light's `color`, `intensity` (0 to 100, as in Bryce's Edit Light box; new lights have 25), `falloff` (`linear`, `squared`, `none`), `edge_softness` for spot, square spot and parallel lights, and true/false `casts_shadows`, `infinite` and `visible` |
 | `terrain` | Reshape a terrain from its own heights or any picture, using the terrain operations below |
@@ -177,7 +178,7 @@ half the stated height, plus a missing boolean part. All three are fixed in 0.6.
 
 ## Status - read this first
 
-Version 0.8.0. The Python code has automated tests, run on Linux. The bridge DLL is tested
+Version 0.9.0. The Python code has automated tests, run on Linux. The bridge DLL is tested
 in a harness that loads your real `Bryce 3D.exe` and `Axiom.dll` on Linux with stand-ins for
 Windows. **Parts of it have not run on Windows yet; see the table.**
 
@@ -192,6 +193,7 @@ Windows. **Parts of it have not run on Windows yet; see the table.**
 | Sky and sun settings | **Fixed in 0.5.0:** earlier versions did not write the copy Bryce draws from. All 38 cached positions agree with the settings in four Bryce-saved scenes. Preset skies and the sun direction rendered; single values not checked in a render |
 | Sky mode and switches | New in 0.6.0. Each bit was read from the code that fills Bryce's menu and Sky & Fog window, and every preset sky with its atmosphere on has exactly one mode. **Not rendered** |
 | Light settings | New in 0.7.0. Each was read from the code behind Bryce's Edit Light window, and lights saved by Bryce read back as new lights do in Bryce (white, intensity 25). Light gels and the light radius and shadow ambience values that animations can drive are not covered. **Not rendered** |
+| Picture textures | New in 0.9.0. The picture format was read from Bryce's graphics library: its tutorial pictures and interface art decode with correct colors and readable text, and pictures written here decode back exactly. **Not rendered**, so how `repeat` looks on a surface is unconfirmed |
 | Camera including bank | Reading matches a real render within 1.7 pixels. Writing and bank **rendered**: a negative bank raises the right end of the horizon |
 | Textures from the `texture` operation | **Rendered** (water ripples, rock color) after the 0.5.1 fix: each texture link needs its type marker |
 | Texture scale and wrapping | New in 0.8.0. Read from Bryce's mapping code: the coordinate is multiplied by the scale, so bigger numbers repeat more often. The 11 wrapping modes follow the order in Bryce's help file, which agrees with what the code computes for each. All of Bryce's own textures read as world space with no offset or rotation. Colors are stored blue first (checked with the wood and desert textures). **No edited texture has been rendered.** Which of the four color sets a given texture draws with depends on how it is built |
@@ -397,6 +399,10 @@ objects, an item in the root object list.
 - **Texture placement:** a procedural texture record keeps the wrapping mode at 268, an
   offset at 300, a rotation quaternion at 324 and four sets of three blue-green-red colors
   at 572, 668, 940 and 1212.
+- **Pictures:** a picture texture (`pctx`) links to a stored picture at 504. Its scale is
+  `(repeat - 1) / 17`, or `1 - repeat` when bit `0x2` of the word at 272 is set. The
+  picture is `rle2`: four run-length coded planes (alpha, red, green minus red, blue minus
+  red), with an 80-byte size record. See `src/bryce3d_mcp/picture.py`.
 - **Textures:** in a material, each textured channel block is preceded by a four-byte type
   (`brtx` procedural, `pctx` picture), then the texture's id; bit `0x40` of the word at 268
   is set. A procedural texture record keeps three scale numbers (doubles at 276).
@@ -487,7 +493,7 @@ Not everything in Bryce 3D is covered by the file tools:
 - Bryce's own animation timeline, keyframes and path objects are not read or written.
   Animation here is frame-by-frame.
 - A procedural texture's noise types, filters and the way its parts are combined cannot
-  be edited. Picture textures are not covered yet.
+  be edited.
 - Inside the Labs, the agent works by looking and clicking; there are no per-control tools.
 - New meshes carry no texture coordinates; up to 50,000 triangles each.
 - Terrain operations are this project's own code, not the Terrain Editor's.

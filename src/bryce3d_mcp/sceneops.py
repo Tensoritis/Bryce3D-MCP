@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 
-from . import heightfield, meshes, presets, terrain, trimesh
+from . import heightfield, meshes, picture, presets, terrain, trimesh
 from .br3 import (BOOLEAN_BITS, KINDS, LIGHT_FALLOFFS, LIGHT_SETTINGS, MATERIAL_COLOURS,
                   MATERIAL_VALUES, TEXTURE_MAPPINGS, Br3)
 from .errors import BryceError
@@ -53,6 +53,14 @@ OPERATIONS = {
                      '{"2": [c1, c2, c3]} sets one of its four sets of three colors. '
                      "br3_info shows the current values under texture_details. A texture "
                      "shared by several channels changes in all of them."),
+    "picture": (("name", "path"), ("channels", "repeat", "mapping"),
+                "Put your own picture file (PNG, JPEG...) on an object. channels default "
+                "to color and ambient_color; add others such as bump to drive them from "
+                "the picture. repeat is how many times it tiles (one number or [x,y,z]; "
+                "under 1 shows part of it). mapping defaults to parametric, which fits "
+                "the picture to each face; the other names are those of texture_edit. "
+                "The picture is stored inside the scene, at most 1024 pixels a side. "
+                "Preview does not show it."),
     "sky_preset": (("preset",), ("library",),
                    "Take the sky and sun of one of Bryce's sky presets."),
     "terrain": (("name",), ("operations", "heightmap_path"),
@@ -185,6 +193,12 @@ def _run(scene: Br3, op: str, fields: dict, sources: _Sources):
         return scene.scale_texture(fields["name"], fields["factor"], fields.get("channels"))
     if op == "texture_edit":
         return scene.edit_texture(fields.pop("name"), fields.pop("channels", None), **fields)
+    if op == "picture":
+        path = fields.pop("path")
+        return scene.set_picture(
+            fields.pop("name"), picture.load(path), fields.pop("channels", None),
+            sources=(library, sources.donor("Tutorial.obp")),
+            label=os.path.splitext(os.path.basename(path))[0], **fields)
     if op == "sky_preset":
         found, source = sources.preset("skies", fields)
         scene.apply_sky_preset(source, found.key)
@@ -218,8 +232,8 @@ def _run(scene: Br3, op: str, fields: dict, sources: _Sources):
         grid = [v / heightfield.FULL for v in values]
         if "heightmap_path" in fields:
             from PIL import Image
-            with Image.open(fields["heightmap_path"]) as picture:
-                grid = terrain.grid_from_image(picture, size)
+            with Image.open(fields["heightmap_path"]) as heightmap:
+                grid = terrain.grid_from_image(heightmap, size)
         grid = terrain.apply(size, grid, fields.get("operations", []))
         scene.set_terrain_heights(
             name, [round(min(1.0, max(0.0, h)) * heightfield.FULL) for h in grid])

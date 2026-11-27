@@ -221,3 +221,17 @@ def light_scene() -> bytes:
         struct.pack_into("<I3f3d", body, 640, 1, 1.0, 1.0, 1.0, 5.0, 1.0, 0.0)
         objects.append((tag, b.solid(class_name, name, (0, 5, 0), payload=body)))
     return b.build(objects)
+
+
+def picture_donor() -> bytes:
+    """A file with one picture texture, to be copied."""
+    b = Builder()
+    b.next_key = 0x0C000000
+    stored = b.record("C3dCImage", b"rle2" + bytes(60) + bytes((1, 0)) * 4, "old")
+    texture = bytearray(636)
+    texture[8:12] = b"old\0"
+    struct.pack_into("<3I", texture, 264, 1, 2, 0)
+    struct.pack_into("<4d", texture, 324, 0, 0, 0, 1)
+    struct.pack_into("<2I", texture, 500, 1, stored)
+    b.record("CPictTexture", texture, "old")
+    return b.build([])

@@ -15,7 +15,7 @@ from __future__ import annotations
 import math
 import struct
 
-from . import heightfield, trimesh
+from . import heightfield, picture, trimesh
 from .ccmf import CompositeFile
 from .errors import BryceError
 
@@ -173,6 +173,12 @@ _TEXTURE_COLOUR_SETS = (572, 668, 940, 1212)
 # Bryce's own files has them, with this bit also set in the material's flag word.
 _TEXTURE_TAGS = {"C3dTexture": b"xtrb", "CPictTexture": b"xtcp"}      # 'brtx', 'pctx'
 _MATERIAL_FLAGS = 268
+# A picture texture shares the placement fields of a procedural one, except that its
+# scale says how often the picture repeats less one, in seventeenths. With bit 2 of
+# the word at 272 set it says instead how much of one picture is left out.
+_PICTURE_FLAGS, _PICTURE_ZOOMS_IN = 272, 0x2
+_PICTURE_IMAGE = 504           # link to the stored picture
+_PICTURE_STEPS = 17.0
 _USES_TEXTURES = 0x40
 _SHOWN = ("color", "diffuse", "ambient", "specular", "transparency", "reflection",
           "bump", "refraction")
@@ -384,7 +390,8 @@ class Br3:
         self._row(ref)
         if name == _LIST:
             return [(20 + 16 * i, item[1]) for i, item in enumerate(self._list_items(ref))]
-        if name in (_ROOT, "C3dTexture") or not (name.startswith("C3d")
+        # A stored picture is compressed data: nothing in it is a link.
+        if name in (_ROOT, "C3dTexture", "C3dCImage") or not (name.startswith("C3d")
                                                  or name == "CPictTexture"):
             return []
         payload = self._payload(ref)
@@ -722,7 +729,7 @@ class Br3:
                 self._write(material, block - 4, bytes(4))
                 self._write(material, block, bytes(4))
                 self._write(material, block + 20, bytes(4))
-                released.add(texture)
+                released.update(self._closure(texture))
             self._write(material, offset, data)
             track = self._linked(material, class_name)
             if track is not None:
@@ -748,15 +755,7 @@ class Br3:
         else:
             available = sorted({n for s in (self, *sources) if s for n in s.textures()})
             raise BryceError(f"no texture named {texture!r}; available: {', '.join(available)}")
-        copy = self._copy(source, ref)
-        material = self._own_material(name)
-        flags = struct.unpack_from("<I", self._payload(material), _MATERIAL_FLAGS)[0]
-        self._write(material, _MATERIAL_FLAGS, struct.pack("<I", flags | _USES_TEXTURES))
-        for channel in channels:
-            block = MATERIAL_CHANNELS[channel][0]
-            self._write(material, block - 4, _TEXTURE_TAGS[copy[0]])
-            self._write(material, block, struct.pack("<I", copy[1]))
-            self._write(material, block + 20, struct.pack("<I", _TEXTURED_FLAG))
+        material = self._link_texture(name, self._copy(source, ref), channels)
         if strength is not None:
             for channel in channels:
                 if channel in MATERIAL_VALUES:
@@ -767,6 +766,95 @@ class Br3:
                     if track is not None:
                         self._set_setting(track, strength, channel)
         return self.material(self.find(name)[1])
+
+    def _set_record_name(self, ref: Ref, name: str) -> None:
+        """Rename a texture or picture, in the record's row and, for a texture, in it."""
+        row = self._row(ref)
+        table = self._rows[ref[0]]
+        changed = row[:12] + heightfield.pack_name(name, len(row) - 12)
+        table[table.index(row)] = changed
+        self.file.set_table(*self._classes[ref[0]], table)
+        self._ids[ref[1]][ref[0]] = changed
+        if ref[0] == "CPictTexture":
+            self._write(ref, 8, heightfield.pack_name(name, 32))
+
+    def picture_of(self, ref: Ref):
+        """The stored picture of a picture texture, as an image."""
+        stored = self._linked(ref, "C3dCImage")
+        if stored is None:
+            raise BryceError("the picture texture has no picture")
+        second = struct.unpack_from(">I", self._row(stored), 8)[0]
+        return picture.decode(self._payload(stored),
+                              *picture.size_of(self.file.read(second)))
+
+    def set_picture(self, name: str, image, channels: list[str] | None = None, *,
+                    sources=(), repeat=1, mapping: str = "parametric",
+                    label: str = "Picture") -> dict:
+        """Put a picture on material channels. `image` is a PIL image; its
+        transparency is kept as the picture's alpha."""
+        channels = ["color", "ambient_color"] if channels is None else channels
+        usable = [c for c, spec in MATERIAL_CHANNELS.items() if spec[0] is not None]
+        if not channels or any(c not in usable for c in channels):
+            raise BryceError(f"channels must be some of {', '.join(usable)}")
+        if mapping not in TEXTURE_MAPPINGS:
+            raise BryceError(f"mapping must be one of {', '.join(TEXTURE_MAPPINGS)}")
+        times = ([_number(repeat, "repeat")] * 3
+                 if isinstance(repeat, (int, float)) and not isinstance(repeat, bool)
+                 else list(_triple(repeat, "repeat")))
+        if not all(0.01 <= t <= 1000 for t in times):
+            raise BryceError("repeat must be between 0.01 and 1000")
+        zoom = min(times) < 1
+        if zoom and max(times) > 1:
+            raise BryceError("repeat numbers must be all 1 or more, or all 1 or less")
+        stored = [1 - t if zoom else (t - 1) / _PICTURE_STEPS for t in times]
+        self._own_material(name)                   # fail before copying anything
+        for source in (self, *sources):
+            if source is None:
+                continue
+            donor = next((("CPictTexture", struct.unpack_from(">I", row)[0])
+                          for row in source._rows.get("CPictTexture", [])), None)
+            if donor is not None and source._linked(donor, "C3dCImage") is not None:
+                break
+        else:
+            raise BryceError("no picture texture to copy: this needs Bryce's Tutorial.obp "
+                             "preset file, or a template scene that uses a picture")
+        copy = self._copy(source, donor)
+        holder = self._linked(copy, "C3dCImage")
+        row = self._row(holder)
+        data_entry, second = struct.unpack_from(">II", row, 4)
+        self.file.replace(data_entry, picture.encode(image))
+        self.file.replace(second, picture.description(*image.size))
+        label = label.encode("ascii", "replace").decode()[:30] or "Picture"
+        self._set_record_name(holder, label)
+        self._set_record_name(copy, label)
+        flags = struct.unpack_from("<I", self._payload(copy), _PICTURE_FLAGS)[0]
+        flags = flags | _PICTURE_ZOOMS_IN if zoom else flags & ~_PICTURE_ZOOMS_IN
+        for offset, data in (
+                (_TEXTURE_MAPPING, struct.pack("<I", TEXTURE_MAPPINGS.index(mapping))),
+                (_PICTURE_FLAGS, struct.pack("<I", flags)),
+                (_TEXTURE_SCALE, struct.pack("<3d", *stored)),
+                (_TEXTURE_OFFSET, struct.pack("<3d", 0, 0, 0)),
+                (_TEXTURE_TURN, struct.pack("<4d", 0, 0, 0, 1))):
+            self._write(copy, offset, data)
+        self._link_texture(name, copy, channels)
+        return self.material(self.find(name)[1])
+
+    def _link_texture(self, name: str, texture: Ref, channels: list[str]) -> Ref:
+        """Make channels of an object's material draw from a texture record."""
+        material = self._own_material(name)
+        replaced = {ref for channel, ref in self._textures(material).items()
+                    if channel in channels and ref != texture}
+        flags = struct.unpack_from("<I", self._payload(material), _MATERIAL_FLAGS)[0]
+        self._write(material, _MATERIAL_FLAGS, struct.pack("<I", flags | _USES_TEXTURES))
+        for channel in channels:
+            block = MATERIAL_CHANNELS[channel][0]
+            self._write(material, block - 4, _TEXTURE_TAGS[texture[0]])
+            self._write(material, block, struct.pack("<I", texture[1]))
+            self._write(material, block + 20, struct.pack("<I", _TEXTURED_FLAG))
+        replaced -= set(self._textures(material).values())
+        if replaced:
+            self._discard({part for ref in replaced for part in self._closure(ref)})
+        return self._own_material(name)
 
     # A transform is (position, origin, scale, rotation quaternion) in file units.
     # Bryce keeps it in setting records and caches the resulting matrix in the
