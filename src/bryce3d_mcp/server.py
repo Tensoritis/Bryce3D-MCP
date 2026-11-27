@@ -618,8 +618,8 @@ def br3_animate(source_path: str, output_name: str, frames: int, tracks: list[di
                 fps: int = 12, easing: Literal["linear", "smooth", "ease"] = "smooth",
                 templates_path: str | None = None) -> list:
     """Make an animation: one scene file per frame from keyframes and paths, plus a
-    preview GIF. (Bryce's own timeline is not used; render the frames with
-    br3_render_animation.) Each track is {"target": "camera"|"object"|"sun"|"sky",
+    preview GIF. (This does not use Bryce's own timeline: for that, see the
+    keyframes operation of br3_edit. Render these frames with br3_render_animation.) Each track is {"target": "camera"|"object"|"sun"|"sky",
     "name": object name, "keys": [{"frame": 0, ...}], "path": {...}}.
     Keys: camera position, look_at, heading, pitch, bank, fov; object position,
     rotation, scale, size, material; sun azimuth, altitude, disc_color, halo_color;

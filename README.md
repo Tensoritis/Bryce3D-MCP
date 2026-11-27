@@ -8,8 +8,8 @@ server works four ways:
 
 1. **Scene files (preferred).** The agent builds and edits `.br3` scenes directly: objects,
    new 3D shapes, groups and booleans, materials, textures, Bryce's own preset models,
-   materials and skies, terrain heights, camera, sun, sky and moon, plus animations as a
-   series of scenes. Each edit returns a preview picture.
+   materials and skies, terrain heights, camera, sun, sky and moon, keyframes on Bryce's
+   own timeline, plus animations as a series of scenes. Each edit returns a preview picture.
 2. **Window messages.** To render, run menu commands, load, save, answer Windows file
    dialogs and take pictures, the server talks to Bryce's window directly. Bryce can stay
    behind your other windows.
@@ -67,6 +67,8 @@ applies completely or writes nothing.
 | `mesh` | A **new 3D shape** written straight into the scene: `extrude` an outline, `lathe` a profile, `custom` points and faces, or an `obj` file. Edges sharper than `smooth_angle` (40) stay crisp |
 | `texture_scale` | Multiply a procedural texture's three scale numbers. They count how often the pattern repeats, so 2 makes it half as big |
 | `texture_edit` | How a procedural texture wraps (`mapping`: object_space, world_space, parametric, parametric_scaled, world_top, spherical, cylindrical, reflection_map, random, object_top, object_front), its `scale`, `offset` and `rotation`, and its colors: `replace_colors` swaps one color for another, `color_sets` sets any of its four sets of three |
+| `keyframes` | **Animate an object on Bryce's own timeline**: keys with a `frame` or `time` and any of `position`, `rotation` and `scale` (see [Animation](#animation)) |
+| `time_marker` | Move Bryce's time marker, so the scene opens, previews and renders at that moment |
 | `camera` | Position, heading, pitch or `look_at`, `bank` (tilt: positive drops the right end of the horizon), field of view |
 | `sun` | Azimuth (relative to the camera: 0 ahead, 90 right, 180 behind), altitude, colors |
 | `sky` | `settings`: single sky values by name, including the moon phase (`MoonPhAng`, `MoonPhTA`, `MoonPhES`, `MoonPhHard`). `switches`: the sky mode (`soft`, `darker`, `custom`, `off`), `volumetric` (`off`, `rough`, `fine`) and true/false for stratus and cumulus clouds, cloud shadows, linked or fixed clouds, sun linked to view, haze and fog blended with the sun, rainbow and secondary rainbow, halo rings, illusion, moon image and phase, stars and comets |
@@ -91,9 +93,36 @@ it, so include a stone.**
 
 ## Animation
 
-`br3_animate` takes keyframes and paths and writes **one ordinary scene per frame**, with a
+There are two ways. **Bryce's own timeline** puts keys inside one scene, which you can play,
+change and render in Bryce:
+
+```json
+[
+  {"op": "keyframes", "name": "Ball", "duration": 4,
+   "keys": [{"frame": 0, "position": [-40, 10, 0]},
+            {"frame": 30, "position": [0, 40, 0]},
+            {"time": 4, "position": [40, 10, 0]}]},
+  {"op": "time_marker", "frame": 30}
+]
+```
+
+- A `keyframes` operation replaces the keys of the channels it names (`position`,
+  `rotation`, `scale`). A channel given only one key stops being animated.
+- The length always reaches the last key; `duration` can make it longer. Frames run at the
+  scene's own rate (15 a second in Bryce's new scenes).
+- `br3_info` lists each animated object's keys. To look at any moment, use `time_marker`,
+  then preview or render. On a key this is exact. **Between two keys the server places the
+  object on a straight line**, while Bryce draws its own curve, and the result says so.
+- `set` with a new `position` moves the **whole motion**. An animated rotation or scale is
+  changed with `keyframes`. Animated objects cannot be grouped or ungrouped. `duplicate`
+  keeps the motion; an object newly added from a template starts still.
+- Put rotation keys less than 180 degrees apart: each turn takes the short way.
+- Only objects can be keyed. Camera, sun, sky, material and light keys, motion paths and
+  the easing of Bryce's curves are not covered.
+
+**One scene per frame** works for everything, including the camera and sky. `br3_animate` takes keyframes and paths and writes **one ordinary scene per frame**, with a
 preview GIF. `br3_render_animation` renders the frames in Bryce a few at a time (it can be
-resumed) and joins them into `render.gif`. Bryce's own timeline is not used or written.
+resumed) and joins them into `render.gif`.
 
 ```json
 [
@@ -203,7 +232,9 @@ Windows. **Parts of it have not run on Windows yet; see the table.**
 | Preset materials and skies, rotation about Z | **Rendered** |
 | Booleans | In the first render the carved cube was missing. 0.6.0 writes the extra flags Bryce's own boolean parts have. **Not rendered since** |
 | Preset models, plain groups, lights, disk, lattice | Layouts read from Bryce's own files; all 154 bundled presets load with every link intact. **Not opened in Bryce yet** |
-| Animation | Frames and previews tested here. Rendering a series is tested against a stand-in only |
+| Position keyframes | New in 0.12.0. Starting from a scene saved before animating, adding the same keys rebuilds the five two-key records Bryce saved **byte for byte**, and all of its document settings. **A scene keyed here has not been played in Bryce** |
+| Rotation and scale keyframes | New in 0.12.0. They follow the same record layout, but no scene in which Bryce saved two of these keys has been seen. **Untested in Bryce** |
+| Frame-by-frame animation | Frames and previews tested here. Rendering a series is tested against a stand-in only |
 | Saving and loading | Save-box detection works on real pictures. The Save As and load steps are **not tried live** |
 | The bridge | **Loaded on Windows.** Opening scenes, starting renders from the menu, noticing when each finished and capturing the picture worked for all five gallery scenes |
 | Labs (`open_lab`, then click and drag) | Depends on the two rows above. **Not tried live**; the Sky Lab key is unverified |
@@ -439,6 +470,13 @@ objects, an item in the root object list.
 - **Terrain:** a scene keeps heights twice: in the terrain record, and as big-endian u16 in
   a second record (`HF_eHFMem`, from offset 208). Both are written.
 
+**Keyframes.** Every setting record is a 148-byte header, whose third u32 is the key count,
+then keys of equal size: the time in seconds (double), a u32 that is 2, and the value at
++44. A one-key record is an ordinary setting. An object also keeps the pose at the time
+marker in its own record, which is what Bryce draws. In the document settings (big-endian
+floats, seconds) the duration is at 60, frames per second at 64, the time marker at 68 and
+the working range at 72 and 76. See `src/bryce3d_mcp/keyframes.py`.
+
 **Meshes (`C3dTriMeshType2`).** After the 640-byte object header: `2, points, normals,
 triangles, 0`; at 660 a bounding box padded by 1% per side; from 860 the points and then
 the normals as doubles; then 76 bytes per triangle (three point numbers, three normal
@@ -520,8 +558,8 @@ Nothing here uses your mouse or keyboard. Keep a saved copy of any scene you car
 
 Not everything in Bryce 3D is covered by the file tools:
 
-- Bryce's own animation timeline, keyframes and path objects are not read or written.
-  Animation here is frame-by-frame.
+- On Bryce's own timeline only object position, rotation and scale can be keyed. Motion
+  path objects, camera and sky keys and the shape of Bryce's curves are not covered.
 - A procedural texture's noise types, filters and the way its parts are combined cannot
   be edited.
 - Inside the Labs, the agent works by looking and clicking; there are no per-control tools.

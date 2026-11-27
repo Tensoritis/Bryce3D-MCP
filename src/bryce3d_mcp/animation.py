@@ -1,7 +1,7 @@
 """Animation: keyframes and paths turned into one scene per frame.
 
-Bryce's own timeline is not written (its keyframe records have not been decoded).
-Instead every frame is an ordinary scene made with the same verified edits as a
+Keys on Bryce's own timeline are separate (see keyframes.py).
+Here every frame is an ordinary scene made with the same verified edits as a
 still picture; Bryce renders them one by one and the pictures are joined up.
 """
 

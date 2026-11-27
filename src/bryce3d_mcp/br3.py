@@ -15,7 +15,7 @@ from __future__ import annotations
 import math
 import struct
 
-from . import heightfield, picture, trimesh
+from . import heightfield, keyframes, picture, trimesh
 from .ccmf import CompositeFile
 from .errors import BryceError
 
@@ -104,6 +104,8 @@ _KIND_OF = {tag: kind for kind, tag in KINDS.items()}
 # Kinds that can be read and edited in a scene but not added to one.
 _FACE_TAG = "sqre3dob"
 _KIND_OF[_FACE_TAG] = "2d_face"
+_SLAB_TAG = "slab3dob"
+_KIND_OF[_SLAB_TAG] = "slab"
 # The class an object list entry points into. Needed because a 32-bit id is only
 # unique within a class: a group and its member list share one, so do a sky preset
 # and its sun, and preset libraries reuse old ids across classes.
@@ -113,7 +115,7 @@ _TAG_CLASS = {
     "pyra3dob": "C3dPyramid", "cone3dob": "C3dCone", "circ3dob": "C3dCircle",
     "hfld3dob": "C3dHeightField", "symh3dob": "C3dHeightField",
     "tmsh3dob": "C3dTriMeshType2", "sphrlght": "C3dSphereLight",
-    _FACE_TAG: "C3dSquare",
+    _FACE_TAG: "C3dSquare", _SLAB_TAG: "C3dSlab",
     "conelght": "C3dConeLight", "pyrmlght": "C3dPyrLightType",
     "cubelght": "C3dCubeLight", _GROUP_TAG: _GROUP,
 }
@@ -126,6 +128,14 @@ _NEVER_LINKED = frozenset((
 _DOCUMENT_BYTES = 416
 _DOC_FRAME, _DOC_VIEW, _DOC_FLAGS, _DOC_REPORT = 16, 32, 56, 88
 _DOC_ANTIALIASING, _DOC_OPTIMISATION = 80, 84
+# Timeline, big-endian floats in seconds (the second is frames per second).
+_DOC_DURATION, _DOC_FPS, _DOC_TIME, _DOC_RANGE = 60, 64, 68, 72
+MAX_FRAME = 100_000
+# channel -> (track, doubles in its value)
+ANIMATED = {"position": ("Obj_ePosition", 3), "rotation": ("Obj_eOrient", 4),
+            "scale": ("Obj_eScale", 3)}
+_POSE_TRACKS = (("Obj_ePosition", 3), ("Obj_eOrigin", 3), ("Obj_eScale", 3),
+                ("Obj_eOrient", 4))
 DOCUMENT_SIZES = {"default": (480, 360), "small": (320, 240), "standard": (640, 480),
                   "super_16mm": (640, 384), "cinemascope": (640, 240), "photo": (768, 512)}
 ANTIALIASING = {"off": 0, "normal": 1, "fine_art": 2}
@@ -517,12 +527,19 @@ class Br3:
         track = self._linked(key, class_name)
         if track is None:
             raise BryceError(f"this object has no {class_name} record")
-        self._write(track, _VALUE, struct.pack(f"<{len(values)}d", *values))
+        self._write_value(track, _VALUE, struct.pack(f"<{len(values)}d", *values))
+
+    def _write_value(self, track: Ref, offset: int, data: bytes) -> None:
+        """Write a value, given by its offset in a one-key record, into every key."""
+        payload = self._payload(track)
+        stride = keyframes.single_size(payload) - keyframes.HEAD
+        for i in range(keyframes.count(payload)):
+            self._write(track, offset + i * stride, data)
 
     def _setting(self, track: Ref):
         """Decode a one-value setting record by its size."""
         payload = self._payload(track)
-        size = len(payload)
+        size = keyframes.single_size(payload)
         offset = 220 if size in (232, 248) else _VALUE
         if size in (248, 204):
             return offset, "colour", struct.unpack_from("<3f", payload, offset)
@@ -537,13 +554,13 @@ class Br3:
     def _set_setting(self, track: Ref, value, label: str) -> None:
         offset, form, _ = self._setting(track)
         if form == "colour":
-            self._write(track, offset, struct.pack("<3f", *_colour(value, label)))
+            self._write_value(track, offset, struct.pack("<3f", *_colour(value, label)))
         elif form == "float":
-            self._write(track, offset, struct.pack("<f", _number(value, label)))
+            self._write_value(track, offset, struct.pack("<f", _number(value, label)))
         elif form == "double":
-            self._write(track, offset, struct.pack("<d", _number(value, label)))
+            self._write_value(track, offset, struct.pack("<d", _number(value, label)))
         elif form == "vector":
-            self._write(track, offset, struct.pack("<3d", *_triple(value, label)))
+            self._write_value(track, offset, struct.pack("<3d", *_triple(value, label)))
         else:
             raise BryceError(f"{label} has a record layout that is not supported")
 
@@ -916,6 +933,8 @@ class Br3:
         return position, [0.0] * 3, scale, quaternion_from_matrix(turn)
 
     def transform(self, ref: Ref):
+        if self.animated_channels(ref):          # the pose at the time marker
+            return self._cached_transform(ref)
         position = self._vector(ref, "Obj_ePosition")
         origin = self._vector(ref, "Obj_eOrigin")
         scale = self._vector(ref, "Obj_eScale")
@@ -946,6 +965,9 @@ class Br3:
     def place(self, ref: Ref, centre, scale, rotation, library: "Br3 | None" = None) -> None:
         """Put an object's centre at `centre` (file units). The local offset is
         folded away so that scale and rotation act about the centre."""
+        if self.animated_channels(ref):
+            self._place_animated(ref, centre, scale, rotation, library)
+            return
         cached = self._cached_transform(ref)
         wanted = (("Obj_ePosition", centre, None),
                   ("Obj_eOrigin", (0.0, 0.0, 0.0), None),
@@ -959,11 +981,269 @@ class Br3:
                     continue                       # the cache already says this
                 self._ensure_track(ref, class_name, library)
             self._set_vector(ref, class_name, value)
+        self._write_pose(ref, centre, scale, rotation)
+
+    def _write_pose(self, ref: Ref, centre, scale, rotation) -> None:
+        """The copy of an object's placement that Bryce draws from."""
         rows = rotation_matrix(rotation)
         self._write(ref, _OFFSET, struct.pack("<3d", 0.0, 0.0, 0.0))
         self._write(ref, _MATRIX, struct.pack(
             "<9d", *(rows[i][j] * scale[i] for i in range(3) for j in range(3))))
         self._write(ref, _TRANSLATION, struct.pack("<3d", *centre))
+
+    # -------------------------------------------------------------- timeline
+    def _track_values(self, ref: Ref, class_name: str, number: int):
+        track = self._linked(ref, class_name)
+        return None if track is None else keyframes.values(self._payload(track), number)
+
+    def animated_channels(self, ref: Ref) -> list[str]:
+        """Which of position, rotation and scale have more than one key."""
+        found = []
+        for channel, (class_name, _) in ANIMATED.items():
+            track = self._linked(ref, class_name)
+            if track is not None and keyframes.count(self._payload(track)) > 1:
+                found.append(channel)
+        return found
+
+    def _pose_at(self, ref: Ref, time: float):
+        """(centre, scale, rotation) at `time`, from the keys."""
+        cached = self._cached_transform(ref)
+        fallback = (cached[0], (0.0, 0.0, 0.0), cached[2], cached[3])
+        parts = []
+        for (class_name, number), otherwise in zip(_POSE_TRACKS, fallback):
+            entries = self._track_values(ref, class_name, number)
+            parts.append(tuple(otherwise) if entries is None else
+                         keyframes.at(entries, time, class_name == "Obj_eOrient"))
+        position, origin, scale, rotation = parts
+        return world_centre(position, origin, scale, rotation), list(scale), rotation
+
+    def _offset_at(self, ref: Ref, time: float, scale, rotation) -> list[float]:
+        """What the local origin adds to the stored position at `time`."""
+        entries = self._track_values(ref, "Obj_eOrigin", 3)
+        origin = (0.0, 0.0, 0.0) if entries is None else keyframes.at(entries, time)
+        return world_centre((0.0, 0.0, 0.0), origin, scale, rotation)
+
+    def animation(self, ref: Ref) -> dict:
+        """The keys of each animated channel, in the units the other tools use."""
+        fps = self.timeline()["fps"]
+        found = {}
+        for channel in self.animated_channels(ref):
+            class_name, number = ANIMATED[channel]
+            listed = []
+            for time, value in self._track_values(ref, class_name, number):
+                if channel == "position":
+                    _, scale, rotation = self._pose_at(ref, time)
+                    offset = self._offset_at(ref, time, scale, rotation)
+                    shown = [round((v + o) * UNIT, 3) + 0.0 for v, o in zip(value, offset)]
+                elif channel == "rotation":
+                    shown = [round(v, 2) + 0.0 for v in euler_from_quaternion(value)]
+                else:
+                    shown = [round(v, 4) for v in value]
+                listed.append({"frame": round(time * fps), "time": round(time, 4),
+                               "value": shown})
+            found[channel] = listed
+        return found
+
+    def timeline(self) -> dict:
+        _, data = self._document_record()
+        duration, fps, time, start, end = struct.unpack_from(">5f", data, _DOC_DURATION)
+        if not 0 < fps <= 240:
+            raise BryceError("corrupt scene: impossible frame rate")
+        return {"fps": round(fps, 3), "duration": round(duration, 4),
+                "duration_frames": round(duration * fps),
+                "time": round(time, 4), "frame": round(time * fps),
+                "working_range": [round(start, 4), round(end, 4)]}
+
+    def _timeline_floats(self):
+        entry, data = self._document_record()
+        return entry, bytearray(data), list(struct.unpack_from(">5f", data, _DOC_DURATION))
+
+    def _moment(self, item: dict, fps: float, what: str) -> int:
+        """The frame named by an item's "frame" or "time"."""
+        if ("frame" in item) == ("time" in item):
+            raise BryceError(f"{what} needs either frame or time (seconds)")
+        if "frame" in item:
+            frame = item["frame"]
+            if not isinstance(frame, int) or isinstance(frame, bool):
+                raise BryceError(f"{what}: frame must be a whole number")
+        else:
+            frame = round(_number(item["time"], f"{what}: time") * fps)
+        if not 0 <= frame <= MAX_FRAME:
+            raise BryceError(f"{what}: frames run from 0 to {MAX_FRAME}")
+        return frame
+
+    def set_time(self, moment: dict) -> dict:
+        """Move Bryce's time marker and pose every animated object to match."""
+        entry, data, (duration, fps, *_) = self._timeline_floats()
+        time = self._moment(moment, fps, "time") / fps
+        if time > duration + 0.5 / fps:
+            raise BryceError(f"the animation ends at frame {round(duration * fps)}; "
+                             "set a longer duration with the keyframes operation")
+        struct.pack_into(">f", data, _DOC_TIME, time)
+        self.file.replace(entry, bytes(data))
+        estimated = self._repose(time)
+        result = self.timeline()
+        if estimated:
+            result["estimated"] = (f"{', '.join(estimated)}: between two keys, so placed "
+                                   "on a straight line; Bryce's own curve may differ")
+        return result
+
+    def _repose(self, time: float, only: Ref | None = None) -> list[str]:
+        """Write the pose at `time` for animated objects; returns the names of
+        those that had to be estimated."""
+        estimated = []
+        waiting = [ref for _, ref in self._objects()]
+        while waiting:
+            ref = waiting.pop(0)
+            waiting.extend(member for _, member in self._members(ref)
+                           if ref[0] == _GROUP)
+            if (only is not None and ref != only) or not self.animated_channels(ref):
+                continue
+            self._write_pose(ref, *self._pose_at(ref, time))
+            for channel in self.animated_channels(ref):
+                times = [t for t, _ in self._track_values(ref, *ANIMATED[channel])]
+                if times[0] < time < times[-1] and min(abs(time - t) for t in times) > 1e-5:
+                    estimated.append(self._name(ref))
+                    break
+        return estimated
+
+    def set_keyframes(self, name: str, keys: list, duration: float | None = None,
+                      library: "Br3 | None" = None) -> dict:
+        """Replace the keys of the channels named in `keys`, a list such as
+        [{"frame": 0, "position": [x, y, z]}, {"time": 2, "position": [...],
+        "rotation": [...]}]. A channel given once stops being animated."""
+        kind, ref = self.find(name)
+        if not isinstance(keys, list) or not keys:
+            raise BryceError("keys must be a list with at least one key")
+        if len(keys) > keyframes.MAX_KEYS:
+            raise BryceError(f"at most {keyframes.MAX_KEYS} keys")
+        _, _, (old_duration, fps, now, start, end) = self._timeline_floats()
+        wanted: dict[str, dict[int, object]] = {}
+        for number, item in enumerate(keys):
+            if not isinstance(item, dict):
+                raise BryceError("each key is an object with frame or time and values")
+            unknown = sorted(set(item) - {"frame", "time", *ANIMATED})
+            if unknown:
+                raise BryceError(f"key {number}: unknown field(s) {', '.join(unknown)}; "
+                                 f"use frame or time, and {', '.join(ANIMATED)}")
+            frame = self._moment(item, fps, f"key {number}")
+            named = [channel for channel in ANIMATED if channel in item]
+            if not named:
+                raise BryceError(f"key {number} has no {' / '.join(ANIMATED)}")
+            for channel in named:
+                label = f"key {number} {channel}"
+                value = _triple(item[channel], label)
+                if channel == "scale" and min(value) <= 0:
+                    raise BryceError(f"{label} must be positive")
+                if frame in wanted.setdefault(channel, {}):
+                    raise BryceError(f"two {channel} keys are on frame {frame}")
+                wanted[channel][frame] = value
+        if duration is not None:
+            duration = _number(duration, "duration")
+            if not 0 <= duration <= MAX_FRAME / fps:
+                raise BryceError("duration (seconds) is out of range")
+
+        if not self.animated_channels(ref):
+            # Fold away the local offset and make sure there is a position track.
+            position, origin, scale, rotation = self.transform(ref)
+            self.place(ref, world_centre(position, origin, scale, rotation), scale,
+                       rotation, library)
+        shown = self._cached_transform(ref)
+        for channel, still in (("position", shown[0]), ("scale", shown[2]),
+                               ("rotation", shown[3])):
+            if channel in wanted and self._linked(ref, ANIMATED[channel][0]) is None:
+                track = self._ensure_track(ref, ANIMATED[channel][0], library)
+                record = self._payload(track)
+                self.file.replace(self._entry(track),
+                                  keyframes.build(record, [(0.0, tuple(still))]))
+        # Position last: where it is stored can depend on scale and rotation.
+        for channel in ("scale", "rotation", "position"):
+            if channel not in wanted:
+                continue
+            frames = sorted(wanted[channel])
+            entries = []
+            for frame in frames:
+                time, value = frame / fps, wanted[channel][frame]
+                if channel == "rotation":
+                    value = quaternion_from_euler(value)
+                    if entries and sum(a * b for a, b in zip(value, entries[-1][1])) < 0:
+                        value = tuple(-v for v in value)      # take the short way round
+                elif channel == "position":
+                    _, scale, rotation = self._pose_at(ref, time)
+                    offset = self._offset_at(ref, time, scale, rotation)
+                    value = tuple(v / UNIT - o for v, o in zip(value, offset))
+                entries.append((time, tuple(value)))
+            if len(entries) == 1:
+                entries = [(0.0, entries[0][1])]
+            track = self._linked(ref, ANIMATED[channel][0])
+            self.file.replace(self._entry(track),
+                              keyframes.build(self._payload(track), entries))
+
+        last = max((max(c) for c in wanted.values() if len(c) > 1), default=0) / fps
+        longest = max(last, old_duration if duration is None else duration)
+        entry, data, _ = self._timeline_floats()
+        if abs(end - old_duration) < 1e-4 or end > longest:
+            end = longest                    # the working range followed the length
+        start = min(start, end)
+        now = min(now, longest)
+        struct.pack_into(">5f", data, _DOC_DURATION, longest, fps, now, start, end)
+        self.file.replace(entry, bytes(data))
+        self._write_pose(ref, *self._pose_at(ref, now))
+        result = {"name": name, "animation": self.animation(ref),
+                  "timeline": self.timeline()}
+        if duration is not None and longest > duration + 1e-4:
+            result["note"] = "the duration was lengthened to reach the last key"
+        return result
+
+    def _place_animated(self, ref: Ref, centre, scale, rotation, library) -> None:
+        """Move an animated object: a new position moves the whole motion with it."""
+        channels = self.animated_channels(ref)
+        shown_centre, shown_scale, shown_turn = self._shown(ref)
+        changed_scale = any(abs(a - b) > 1e-6 for a, b in zip(scale, shown_scale))
+        same_turn = abs(sum(a * b for a, b in zip(rotation, shown_turn))) > 1 - 1e-9
+        for channel, changed in (("scale", changed_scale), ("rotation", not same_turn)):
+            if changed and channel in channels:
+                raise BryceError(f"{self._name(ref)!r} has animated {channel}; change it "
+                                 "with the keyframes operation")
+        moved = [a - b for a, b in zip(centre, shown_centre)]
+        for channel, changed, value in (("scale", changed_scale, scale),
+                                        ("rotation", not same_turn, rotation)):
+            if changed:
+                self._ensure_track(ref, ANIMATED[channel][0], library)
+                self._set_vector(ref, ANIMATED[channel][0], value)
+        track = self._linked(ref, "Obj_ePosition")
+        if track is None:
+            track = self._ensure_track(ref, "Obj_ePosition", library)
+        record = self._payload(track)
+        self.file.replace(self._entry(track), keyframes.build(record, [
+            (time, tuple(v + d for v, d in zip(value, moved)))
+            for time, value in keyframes.values(record, 3)]))
+        self._write_pose(ref, centre, scale, rotation)
+
+    def _shown(self, ref: Ref):
+        """(centre, scale, rotation) as Bryce is drawing the object now."""
+        position, origin, scale, rotation = self._cached_transform(ref)
+        return world_centre(position, origin, scale, rotation), scale, rotation
+
+    def _refuse_animated(self, refs, done: str) -> None:
+        for ref in refs:
+            if self.animated_channels(ref):
+                raise BryceError(f"{self._name(ref)!r} is animated and cannot be {done}; "
+                                 "remove its animation first (one key per channel)")
+
+    def _make_still(self, ref: Ref) -> None:
+        """Drop an object's animation, leaving it posed as it is shown."""
+        channels = self.animated_channels(ref)
+        if not channels:
+            return
+        centre, scale, rotation = self._shown(ref)
+        values = {"position": centre, "scale": scale, "rotation": rotation}
+        for channel in channels:
+            track = self._linked(ref, ANIMATED[channel][0])
+            self.file.replace(self._entry(track), keyframes.build(
+                self._payload(track), [(0.0, tuple(values[channel]))]))
+        if "position" in channels and self._linked(ref, "Obj_eOrigin") is not None:
+            self._set_vector(ref, "Obj_eOrigin", (0.0, 0.0, 0.0))
 
     def boolean_of(self, ref: Ref) -> str:
         flags = struct.unpack_from("<I", self._payload(ref), _FLAGS)[0]
@@ -1095,6 +1375,8 @@ class Br3:
         info["size"] = [round(v * extent * UNIT, 2)
                         for v, extent in zip(scale, self._local_extent(kind, key))]
         info["rotation"] = [round(v, 2) + 0.0 for v in euler_from_quaternion(rotation)]
+        if self.animated_channels(key):
+            info["animation"] = self.animation(key)
         if self.boolean_of(key) != "neutral":
             info["boolean"] = self.boolean_of(key)
         material = self.material(key)
@@ -1240,6 +1522,7 @@ class Br3:
             settings["position"] = self._resting_position(source, kind, matches[0], settings)
         new = self._copy(source, matches[0])
         self._append(KINDS[kind], new)
+        self._make_still(new)
         # The copy still carries the original's name until it is renamed.
         self._rename(new, final)
         material = settings.pop("material", None)
@@ -1393,6 +1676,7 @@ class Br3:
         if odd or set(negative) & set(intersect):
             raise BryceError("negative and intersect must be separate parts of names")
         members = [self.find(n)[1] for n in names]
+        self._refuse_animated(members, "grouped")
         final = name if name is not None else self._unique_name("Group")
         if any(self._name(k) == final for _, k in self._objects()):
             raise BryceError(f"an object named {final!r} already exists")
@@ -1430,6 +1714,7 @@ class Br3:
         if kind != "group":
             raise BryceError(f"{name!r} is not a group")
         items = self._list_items((_LIST, group[1]))
+        self._refuse_animated([group, *(ref for _, ref, _ in items)], "ungrouped")
         position, origin, gscale, gturn = self.transform(group)
         centre = world_centre(position, origin, gscale, gturn)
         gmatrix = rotation_matrix(gturn)
@@ -1481,6 +1766,7 @@ class Br3:
         for tag, ref, _ in items:
             copy = self._copy(source, ref)
             self._append(tag, copy)
+            self._make_still(copy)
             copies.append((tag, copy))
         centres = [self.centre_of(ref) for _, ref in copies]
         middle = [sum(c[a] for c in centres) / len(centres) for a in range(3)]
@@ -1858,6 +2144,7 @@ class Br3:
         result = {"objects": self.objects(), "camera": self.camera(), "sun": self.sun()}
         if self._rows.get("brycedocset"):
             result["document"] = self.document()
+            result["timeline"] = self.timeline()
         other = self.camera("perspective")
         if other != result["camera"]:
             result["camera_view"] = other   # differs until set_camera aligns the two

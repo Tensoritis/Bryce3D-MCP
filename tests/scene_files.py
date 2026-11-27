@@ -34,6 +34,8 @@ class Builder:
 
     def track(self, class_name, values, size=240, offset=192, form="d"):
         payload = bytearray(size)
+        struct.pack_into("<3I", payload, 0, 1, 1, 1)             # one key
+        struct.pack_into("<I", payload, 156, 2)
         struct.pack_into(f"<{len(values)}{form}", payload, offset, *values)
         return self.record(class_name, payload)
 

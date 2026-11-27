@@ -78,6 +78,20 @@ OPERATIONS = {
                  "768x512. antialiasing off, normal or fine_art (slow); optimisation "
                  "(spatial) off, low or high; render_type normal, mask, distance or "
                  "altitude. Preview keeps its own size."),
+    "keyframes": (("name", "keys"), ("duration",),
+                  "Animate an object on Bryce's own timeline. keys is a list like "
+                  '[{"frame": 0, "position": [x,y,z]}, {"time": 2, "position": [...]}]; '
+                  "each key has frame or time (seconds) and any of position, rotation "
+                  "(degrees) and scale. It replaces the keys of the channels it names; a "
+                  "channel given only once stops being animated. duration (seconds) "
+                  "sets the animation's length, which always reaches the last key. Bryce "
+                  "curves smoothly between keys. For a spin, put keys less than 180 "
+                  "degrees apart. Position keys match Bryce's own files; rotation and "
+                  "scale keys are untested in Bryce."),
+    "time_marker": ((), ("frame", "time"),
+                    "Move Bryce's time marker (give frame or time in seconds). The scene "
+                    "then opens, previews and renders at that moment. Exact on a key; "
+                    "between two keys the pose is a straight-line estimate."),
     "sun": ((), ("azimuth", "altitude", "disc_color", "halo_color"),
             "Aim the sun. Bryce stores it relative to the camera: azimuth 0 is ahead of "
             "the camera, 90 to its right, 180 behind it."),
@@ -207,6 +221,10 @@ def _run(scene: Br3, op: str, fields: dict, sources: _Sources):
             fields.pop("name"), picture.load(path), fields.pop("channels", None),
             sources=(library, sources.donor("Tutorial.obp")),
             label=os.path.splitext(os.path.basename(path))[0], **fields)
+    if op == "keyframes":
+        return scene.set_keyframes(library=library, **fields)
+    if op == "time_marker":
+        return {"timeline": scene.set_time(fields)}
     if op == "document":
         return {"document": scene.set_document(**fields)}
     if op == "sky_preset":
