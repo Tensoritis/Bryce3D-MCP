@@ -39,7 +39,7 @@ BUILD with the br3_ tools. They work on scene files:
 3. br3_preview is approximate (no textures, clouds or reflections). br3_render gives
    Bryce's real picture of a scene.
 br3_edit can also make NEW 3D shapes (op mesh: extrude, lathe, custom, OBJ), tilt
-the camera (bank), scale procedural textures and set moon phase. br3_animate makes
+the camera (bank), place and recolor procedural textures, set lights and moon phase. br3_animate makes
 keyframe and path animations as one scene per frame; br3_render_animation renders
 them and joins the pictures.
 

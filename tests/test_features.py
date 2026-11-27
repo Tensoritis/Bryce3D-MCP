@@ -532,3 +532,86 @@ def test_lights_bryce_made_read_as_new_lights():
         assert found["light"]["color"] == "#ffffff"
         assert found["light"]["intensity"] == 25      # what Bryce shows for a new light
         assert found["light"]["falloff"] == "linear" and found["light"]["casts_shadows"]
+
+
+def texture_record(scene, cube="Cube 1"):
+    material = scene._own_material(cube)
+    return scene._payload(scene._textures(material)["color"])
+
+
+def test_texture_placement_is_written_where_bryce_reads_it(scene, library, install):
+    scene = textured_scene(scene, library, install)
+    scene = run(scene, library, install,
+                {"op": "texture_edit", "name": "Cube 1", "mapping": "cylindrical",
+                 "scale": [2, 3, 4], "offset": [0.5, 0, -1], "rotation": [0, 90, 0]})
+    payload = texture_record(scene)
+    assert struct.unpack_from("<I", payload, 268)[0] == 6
+    assert struct.unpack_from("<3d", payload, 276) == (2, 3, 4)
+    assert struct.unpack_from("<3d", payload, 300) == (0.5, 0, -1)
+    assert struct.unpack_from("<4d", payload, 324) == pytest.approx(
+        quaternion_from_euler((0, 90, 0)))
+    details = named(scene)["Cube 1"]["material"]["texture_details"]["checks"]
+    assert details["mapping"] == "cylindrical" and details["offset"] == [0.5, 0, -1]
+    assert details["rotation"] == pytest.approx([0, 90, 0])
+    assert named(scene)["Cube 1"]["material"]["texture_scales"]["checks"] == [2, 3, 4]
+
+
+def test_mapping_numbers_follow_bryces_order():
+    from bryce3d_mcp.br3 import TEXTURE_MAPPINGS
+    assert TEXTURE_MAPPINGS.index("object_space") == 0
+    assert TEXTURE_MAPPINGS.index("world_space") == 1
+    assert TEXTURE_MAPPINGS.index("random") == 8 and len(TEXTURE_MAPPINGS) == 11
+
+
+def test_texture_colours_are_stored_blue_first(scene, library, install):
+    scene = textured_scene(scene, library, install)
+    scene = run(scene, library, install,
+                {"op": "texture_edit", "name": "Cube 1",
+                 "color_sets": {"2": ["#102030", None, "#ffffff"]}})
+    payload = texture_record(scene)
+    assert payload[668:680] == bytes((0x30, 0x20, 0x10, 0, 0, 0, 0, 0, 255, 255, 255, 0))
+    sets = named(scene)["Cube 1"]["material"]["texture_details"]["checks"]["color_sets"]
+    assert sets[1] == ["#102030", "#000000", "#ffffff"]
+    scene = run(scene, library, install, {"op": "texture_edit", "name": "Cube 1",
+                                          "replace_colors": {"#000000": "#2060ff"}})
+    sets = named(scene)["Cube 1"]["material"]["texture_details"]["checks"]["color_sets"]
+    assert "#000000" not in sum(sets, []) and sets[1] == ["#102030", "#2060ff", "#ffffff"]
+    assert sets[0] == ["#2060ff"] * 3
+
+
+@pytest.mark.parametrize("change, message", [
+    ({}, "at least one of"),
+    ({"mapping": "sideways"}, "mapping must be one of"),
+    ({"scale": 0}, "between 0.001"),
+    ({"color_sets": {"5": [None, None, None]}}, "sets 1 to 4"),
+    ({"replace_colors": {"#123456": "#000000"}}, "has no color"),
+    ({"mapping": "random", "channels": ["bump"]}, "no texture on bump"),
+])
+def test_bad_texture_edits_write_nothing(scene, library, install, change, message):
+    scene = textured_scene(scene, library, install)
+    before = scene.data
+    with pytest.raises(BryceError, match=message):
+        sceneops.apply(scene, [{"op": "texture_edit", "name": "Cube 1", **change}],
+                       library, install)
+    assert texture_record(Br3.from_bytes(before)) == texture_record(scene)
+
+
+@pytest.mark.skipif(not os.environ.get("BRYCE3D_INSTALL"),
+                    reason="set BRYCE3D_INSTALL to test real textures")
+def test_every_bryce_texture_reads_with_a_known_mapping():
+    folder = presets.folder(os.environ["BRYCE3D_INSTALL"])
+    names, seen = set(), 0
+    for category in ("materials", "objects"):
+        loaded = {}
+        for found in presets.entries(folder, category):
+            source = loaded.setdefault(found.library, presets.load(found))
+            for name, ref in source.textures().items():
+                if source.texture_scale_of(ref) is None:
+                    continue
+                details = source.texture_details(ref)
+                assert details["mapping"] == "world_space"      # all of Bryce's own are
+                assert details["offset"] == [0, 0, 0]
+                assert details["rotation"] == [0, 0, 0]
+                names.add(name)
+                seen += 1
+    assert seen and any(n.lower().startswith("wood") for n in names)

@@ -6,7 +6,7 @@ import os
 
 from . import heightfield, meshes, presets, terrain, trimesh
 from .br3 import (BOOLEAN_BITS, KINDS, LIGHT_FALLOFFS, LIGHT_SETTINGS, MATERIAL_COLOURS,
-                  MATERIAL_VALUES, Br3)
+                  MATERIAL_VALUES, TEXTURE_MAPPINGS, Br3)
 from .errors import BryceError
 
 MAX_OPERATIONS = 500
@@ -42,9 +42,17 @@ OPERATIONS = {
                 "by name. BasicSin24 on bump makes ripples."),
     "texture_scale": (("name", "factor"), ("channels",),
                       "Multiply a procedural texture's scale numbers (one factor, or [x, "
-                      "y, z]) to change the size of its pattern, for example ripples or a "
-                      "checkerboard. br3_info lists the current numbers. Preview does not "
-                      "show it: render once to see which way a factor goes."),
+                      "y, z]). They say how often the pattern repeats, so 2 makes ripples "
+                      "or checks half as big. br3_info lists the current numbers."),
+    "texture_edit": (("name",), ("channels", "mapping", "scale", "offset", "rotation",
+                                 "replace_colors", "color_sets"),
+                     "Edit the procedural textures on an object. mapping is how it wraps ("
+                     + ", ".join(TEXTURE_MAPPINGS) + "). scale (set, not multiply; bigger "
+                     "means smaller pattern), offset [x,y,z] and rotation [x,y,z] degrees "
+                     'place it. replace_colors {"#old": "#new"} recolors it; color_sets '
+                     '{"2": [c1, c2, c3]} sets one of its four sets of three colors. '
+                     "br3_info shows the current values under texture_details. A texture "
+                     "shared by several channels changes in all of them."),
     "sky_preset": (("preset",), ("library",),
                    "Take the sky and sun of one of Bryce's sky presets."),
     "terrain": (("name",), ("operations", "heightmap_path"),
@@ -175,6 +183,8 @@ def _run(scene: Br3, op: str, fields: dict, sources: _Sources):
                                  others, fields.get("strength"))
     if op == "texture_scale":
         return scene.scale_texture(fields["name"], fields["factor"], fields.get("channels"))
+    if op == "texture_edit":
+        return scene.edit_texture(fields.pop("name"), fields.pop("channels", None), **fields)
     if op == "sky_preset":
         found, source = sources.preset("skies", fields)
         scene.apply_sky_preset(source, found.key)

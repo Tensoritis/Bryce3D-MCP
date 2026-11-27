@@ -159,6 +159,15 @@ MATERIAL_VALUES = {name: spec[2] for name, spec in MATERIAL_CHANNELS.items()
                    if not name.endswith("color")}
 _TEXTURED_FLAG = 0x10000000
 _TEXTURE_SCALE = 276          # three doubles in a texture record, one per axis
+# The rest of a procedural texture's placement. How it wraps is a number choosing
+# one branch of Bryce's mapping code; the order is the one in Bryce's help file and
+# agrees with what each branch computes. Rotation is a quaternion, like an object's.
+_TEXTURE_MAPPING, _TEXTURE_OFFSET, _TEXTURE_TURN = 268, 300, 324
+TEXTURE_MAPPINGS = (
+    "object_space", "world_space", "parametric", "parametric_scaled", "world_top",
+    "spherical", "cylindrical", "reflection_map", "random", "object_top", "object_front")
+# Four sets of three colours, one byte each for blue, green and red, then a zero.
+_TEXTURE_COLOUR_SETS = (572, 668, 940, 1212)
 # Four bytes in front of a channel's texture link name the kind of texture it
 # points at. Without them the link cannot be followed. Every textured channel in
 # Bryce's own files has them, with this bit also set in the material's flag word.
@@ -536,6 +545,10 @@ class Br3:
                       for ref in used.values()}
             if any(value is not None for value in scales.values()):
                 out["texture_scales"] = scales
+            details = {self._texture_name(ref): self.texture_details(ref)
+                       for ref in used.values() if self.texture_scale_of(ref) is not None}
+            if details:
+                out["texture_details"] = details
         return out
 
     def texture_scale_of(self, ref: Ref) -> list[float] | None:
@@ -550,13 +563,27 @@ class Br3:
             return None
         return [round(v, 5) for v in values]
 
-    def scale_texture(self, name: str, factor, channels: list[str] | None = None) -> dict:
-        """Multiply the scale numbers of the textures on an object's material."""
-        factors = ([_number(factor, "factor")] * 3
-                   if isinstance(factor, (int, float)) and not isinstance(factor, bool)
-                   else list(_triple(factor, "factor")))
-        if not all(1e-3 <= f <= 1e3 for f in factors):
-            raise BryceError("texture scale factors must be between 0.001 and 1000")
+    def texture_details(self, ref: Ref) -> dict:
+        """How a procedural texture is placed on a surface, and its colours."""
+        payload = self._payload(ref)
+        mapping = struct.unpack_from("<I", payload, _TEXTURE_MAPPING)[0]
+        details = {
+            "mapping": (TEXTURE_MAPPINGS[mapping] if mapping < len(TEXTURE_MAPPINGS)
+                        else f"unknown ({mapping})"),
+            "offset": [round(v, 5) + 0.0 for v in
+                       struct.unpack_from("<3d", payload, _TEXTURE_OFFSET)],
+        }
+        turn = struct.unpack_from("<4d", payload, _TEXTURE_TURN)
+        if sum(v * v for v in turn) > 0.5:
+            details["rotation"] = [round(v, 2) + 0.0 for v in euler_from_quaternion(turn)]
+        details["color_sets"] = [
+            ["#" + payload[start + 4 * i:start + 4 * i + 3][::-1].hex() for i in range(3)]
+            for start in _TEXTURE_COLOUR_SETS]
+        return details
+
+    def _procedural_textures(self, name: str, channels: list[str] | None) -> set[Ref]:
+        """The procedural textures on some channels (default: all textured ones),
+        after checking that each can be edited."""
         material = self._own_material(name)
         used = self._textures(material)
         wanted = list(used) if channels is None else channels
@@ -564,10 +591,95 @@ class Br3:
         if missing or not wanted:
             raise BryceError(f"no texture on {', '.join(missing) or 'any channel'} of "
                              f"{name!r}; textured channels: {', '.join(used) or 'none'}")
-        for ref in {used[c] for c in wanted}:
+        refs = {used[c] for c in wanted}
+        for ref in refs:
             if self.texture_scale_of(ref) is None:
-                raise BryceError(f"the scale of {self._texture_name(ref)!r} cannot be "
-                                 "changed (it is not a procedural 3D texture)")
+                raise BryceError(f"{self._texture_name(ref)!r} cannot be changed (it is "
+                                 "not a procedural 3D texture)")
+        return refs
+
+    def edit_texture(self, name: str, channels: list[str] | None = None, *,
+                     mapping: str | None = None, scale=None, offset=None, rotation=None,
+                     replace_colors: dict | None = None,
+                     color_sets: dict | None = None) -> dict:
+        """Change how a material's procedural textures wrap and what colours they use.
+        A texture used by several channels changes in all of them."""
+        if all(v is None for v in (mapping, scale, offset, rotation, replace_colors,
+                                   color_sets)):
+            raise BryceError("give at least one of mapping, scale, offset, rotation, "
+                             "replace_colors or color_sets")
+        writes: list[tuple[int, bytes]] = []
+        if mapping is not None:
+            if mapping not in TEXTURE_MAPPINGS:
+                raise BryceError(f"mapping must be one of {', '.join(TEXTURE_MAPPINGS)}")
+            writes.append((_TEXTURE_MAPPING,
+                           struct.pack("<I", TEXTURE_MAPPINGS.index(mapping))))
+        if scale is not None:
+            values = ([_number(scale, "scale")] * 3
+                      if isinstance(scale, (int, float)) and not isinstance(scale, bool)
+                      else list(_triple(scale, "scale")))
+            if not all(1e-3 <= v <= 1e4 for v in values):
+                raise BryceError("texture scale must be between 0.001 and 10000")
+            writes.append((_TEXTURE_SCALE, struct.pack("<3d", *values)))
+        if offset is not None:
+            values = _triple(offset, "offset")
+            if max(map(abs, values)) > 1e4:
+                raise BryceError("texture offset must be within 10000")
+            writes.append((_TEXTURE_OFFSET, struct.pack("<3d", *values)))
+        if rotation is not None:
+            writes.append((_TEXTURE_TURN,
+                           struct.pack("<4d", *quaternion_from_euler(rotation))))
+
+        def packed(value) -> bytes:
+            red, green, blue = (round(c * 255) for c in _colour(value, "texture color"))
+            return bytes((blue, green, red, 0))
+
+        slots: dict[int, bytes] = {}              # (set, place) -> new colour
+        if color_sets is not None:
+            if not isinstance(color_sets, dict) or not color_sets:
+                raise BryceError('color_sets is like {"2": ["#ff0000", null, "#000000"]}')
+            for number, colours in color_sets.items():
+                if str(number) not in ("1", "2", "3", "4") \
+                        or not isinstance(colours, list) or len(colours) != 3:
+                    raise BryceError("color_sets takes sets 1 to 4, each a list of three "
+                                     "colors (null keeps one)")
+                start = _TEXTURE_COLOUR_SETS[int(number) - 1]
+                slots.update({start + 4 * i: packed(c) for i, c in enumerate(colours)
+                              if c is not None})
+        if replace_colors is not None and (not isinstance(replace_colors, dict)
+                                           or not replace_colors):
+            raise BryceError('replace_colors is like {"#ffffff": "#2060ff"}')
+
+        refs = self._procedural_textures(name, channels)
+        planned = []
+        for ref in sorted(refs):                  # check everything before writing
+            changes = dict(slots)
+            payload = self._payload(ref)
+            for old, new in (replace_colors or {}).items():
+                wanted = packed(old)[:3]
+                places = [start + 4 * i for start in _TEXTURE_COLOUR_SETS
+                          for i in range(3)
+                          if payload[start + 4 * i:start + 4 * i + 3] == wanted]
+                if not places:
+                    have = sorted({c for row in self.texture_details(ref)["color_sets"]
+                                   for c in row})
+                    raise BryceError(f"{self._texture_name(ref)!r} has no color {old}; "
+                                     f"it has {', '.join(have)}")
+                changes.update({place: packed(new) for place in places})
+            planned.append((ref, writes + sorted(changes.items())))
+        for ref, todo in planned:
+            for where, data in todo:
+                self._write(ref, where, data)
+        return self.material(self.find(name)[1])
+
+    def scale_texture(self, name: str, factor, channels: list[str] | None = None) -> dict:
+        """Multiply the scale numbers of the textures on an object's material."""
+        factors = ([_number(factor, "factor")] * 3
+                   if isinstance(factor, (int, float)) and not isinstance(factor, bool)
+                   else list(_triple(factor, "factor")))
+        if not all(1e-3 <= f <= 1e3 for f in factors):
+            raise BryceError("texture scale factors must be between 0.001 and 1000")
+        for ref in self._procedural_textures(name, channels):
             values = struct.unpack_from("<3d", self._payload(ref), _TEXTURE_SCALE)
             self._write(ref, _TEXTURE_SCALE, struct.pack(
                 "<3d", *(v * f for v, f in zip(values, factors))))

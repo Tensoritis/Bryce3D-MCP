@@ -63,7 +63,8 @@ applies completely or writes nothing.
 | `light` (a field of `add`, `set`, `duplicate`) | A light's `color`, `intensity` (0 to 100, as in Bryce's Edit Light box; new lights have 25), `falloff` (`linear`, `squared`, `none`), `edge_softness` for spot, square spot and parallel lights, and true/false `casts_shadows`, `infinite` and `visible` |
 | `terrain` | Reshape a terrain from its own heights or any picture, using the terrain operations below |
 | `mesh` | A **new 3D shape** written straight into the scene: `extrude` an outline, `lathe` a profile, `custom` points and faces, or an `obj` file. Edges sharper than `smooth_angle` (40) stay crisp |
-| `texture_scale` | Multiply a procedural texture's three scale numbers, to resize or stretch its pattern |
+| `texture_scale` | Multiply a procedural texture's three scale numbers. They count how often the pattern repeats, so 2 makes it half as big |
+| `texture_edit` | How a procedural texture wraps (`mapping`: object_space, world_space, parametric, parametric_scaled, world_top, spherical, cylindrical, reflection_map, random, object_top, object_front), its `scale`, `offset` and `rotation`, and its colors: `replace_colors` swaps one color for another, `color_sets` sets any of its four sets of three |
 | `camera` | Position, heading, pitch or `look_at`, `bank` (tilt: positive drops the right end of the horizon), field of view |
 | `sun` | Azimuth (relative to the camera: 0 ahead, 90 right, 180 behind), altitude, colors |
 | `sky` | `settings`: single sky values by name, including the moon phase (`MoonPhAng`, `MoonPhTA`, `MoonPhES`, `MoonPhHard`). `switches`: the sky mode (`soft`, `darker`, `custom`, `off`), `volumetric` (`off`, `rough`, `fine`) and true/false for stratus and cumulus clouds, cloud shadows, linked or fixed clouds, sun linked to view, haze and fog blended with the sun, rainbow and secondary rainbow, halo rings, illusion, moon image and phase, stars and comets |
@@ -176,7 +177,7 @@ half the stated height, plus a missing boolean part. All three are fixed in 0.6.
 
 ## Status - read this first
 
-Version 0.7.0. The Python code has automated tests, run on Linux. The bridge DLL is tested
+Version 0.8.0. The Python code has automated tests, run on Linux. The bridge DLL is tested
 in a harness that loads your real `Bryce 3D.exe` and `Axiom.dll` on Linux with stand-ins for
 Windows. **Parts of it have not run on Windows yet; see the table.**
 
@@ -193,7 +194,7 @@ Windows. **Parts of it have not run on Windows yet; see the table.**
 | Light settings | New in 0.7.0. Each was read from the code behind Bryce's Edit Light window, and lights saved by Bryce read back as new lights do in Bryce (white, intensity 25). Light gels and the light radius and shadow ambience values that animations can drive are not covered. **Not rendered** |
 | Camera including bank | Reading matches a real render within 1.7 pixels. Writing and bank **rendered**: a negative bank raises the right end of the horizon |
 | Textures from the `texture` operation | **Rendered** (water ripples, rock color) after the 0.5.1 fix: each texture link needs its type marker |
-| Texture scale | The three numbers were identified from Bryce's presets. **Whether a larger number makes a pattern larger or smaller is not confirmed** |
+| Texture scale and wrapping | New in 0.8.0. Read from Bryce's mapping code: the coordinate is multiplied by the scale, so bigger numbers repeat more often. The 11 wrapping modes follow the order in Bryce's help file, which agrees with what the code computes for each. All of Bryce's own textures read as world space with no offset or rotation. Colors are stored blue first (checked with the wood and desert textures). **No edited texture has been rendered.** Which of the four color sets a given texture draws with depends on how it is built |
 | Preset materials and skies, rotation about Z | **Rendered** |
 | Booleans | In the first render the carved cube was missing. 0.6.0 writes the extra flags Bryce's own boolean parts have. **Not rendered since** |
 | Preset models, plain groups, lights, disk, lattice | Layouts read from Bryce's own files; all 154 bundled presets load with every link intact. **Not opened in Bryce yet** |
@@ -393,6 +394,9 @@ objects, an item in the root object list.
 - **Sizes:** primitives span -1 to 1 before scaling. A mesh's stored points count double,
   and a terrain's heights run from -0.5 to 0.5 (a symmetric lattice's from -1 to 1). One
   file unit is 10.24 Bryce units.
+- **Texture placement:** a procedural texture record keeps the wrapping mode at 268, an
+  offset at 300, a rotation quaternion at 324 and four sets of three blue-green-red colors
+  at 572, 668, 940 and 1212.
 - **Textures:** in a material, each textured channel block is preceded by a four-byte type
   (`brtx` procedural, `pctx` picture), then the texture's id; bit `0x40` of the word at 268
   is set. A procedural texture record keeps three scale numbers (doubles at 276).
@@ -482,8 +486,8 @@ Not everything in Bryce 3D is covered by the file tools:
 
 - Bryce's own animation timeline, keyframes and path objects are not read or written.
   Animation here is frame-by-frame.
-- Texture mapping modes, editing a texture's internals, and picture textures are not
-  covered. Existing textures can be reused and procedural ones rescaled.
+- A procedural texture's noise types, filters and the way its parts are combined cannot
+  be edited. Picture textures are not covered yet.
 - Inside the Labs, the agent works by looking and clicking; there are no per-control tools.
 - New meshes carry no texture coordinates; up to 50,000 triangles each.
 - Terrain operations are this project's own code, not the Terrain Editor's.
