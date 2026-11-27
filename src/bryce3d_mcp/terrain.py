@@ -15,7 +15,7 @@ from typing import Any, Callable
 
 from PIL import Image, ImageDraw
 
-from . import heightfield
+from . import editor_tools, heightfield
 from .ccmf import CompositeFile
 from .errors import BryceError
 from .meshes import _value_noise, heightmap
@@ -364,8 +364,104 @@ def op_generate(size, grid, shape="mountain", seed=0, roughness=0.5, mode="repla
     return [a + (combine(a, b) - a) * weight for a, b in zip(grid, new)]
 
 
+# -- the Terrain Editor's own tools ----------------------------------------------
+def _in_editor(grid: Grid, low: float, high: float, work: Callable) -> Grid:
+    """Run an editor tool on the heights as Bryce holds them."""
+    heights = [round(min(1.0, max(0.0, h)) * editor_tools.TOP) for h in grid]
+    result = work(heights, round(low * editor_tools.TOP), round(high * editor_tools.TOP))
+    return [h / editor_tools.TOP for h in result]
+
+
+def _filter(size, grid, make, strength, low, high):
+    return _in_editor(grid, low, high, lambda h, a, b:
+                      editor_tools.blend(h, make(size, h), strength, a, b))
+
+
+def op_bryce_smooth(size, grid, strength=1.0, times=1, low=0.0, high=1.0):
+    """The Smoothing button."""
+    for _ in range(int(times)):
+        grid = _filter(size, grid, lambda n, h: editor_tools.convolve(n, h, editor_tools.SMOOTH),
+                       strength, low, high)
+    return grid
+
+
+def op_bryce_sharpen(size, grid, strength=0.25, low=0.0, high=1.0):
+    """The Sharpening button; a negative strength softens."""
+    return _filter(size, grid, lambda n, h: editor_tools.convolve(n, h, editor_tools.SHARPEN),
+                   strength, low, high)
+
+
+def op_bryce_relief_noise(size, grid, strength=0.25, low=0.0, high=1.0):
+    """The Relief Noise half of its button: an embossing filter."""
+    return _filter(size, grid, lambda n, h: editor_tools.convolve(n, h, editor_tools.RELIEF),
+                   strength, low, high)
+
+
+def op_bryce_raise_lower(size, grid, amount=0.25, low=0.0, high=1.0):
+    """The Raise/Lower button: heights grow (or, negative, shrink) in proportion."""
+    return _filter(size, grid, lambda n, h: [0] * len(h), -amount, low, high)
+
+
+def op_bryce_gaussian_edges(size, grid, strength=1.0, low=0.0, high=1.0):
+    """The Gaussian Edges button."""
+    return _filter(size, grid, editor_tools.gaussian_edges, strength, low, high)
+
+
+def op_bryce_equalize(size, grid, strength=1.0, low=0.0, high=1.0):
+    """The Equalize half of its button."""
+    return _filter(size, grid, editor_tools.equalize, strength, low, high)
+
+
+def op_bryce_subplateaus(size, grid, strength=1.0, seed=0, low=0.0, high=1.0):
+    """The Subplateaus half of its button."""
+    rand = editor_tools.Rand(int(seed))
+    return _in_editor(grid, low, high, lambda h, a, b: editor_tools.blend(
+        h, editor_tools.subplateaus(size, h, rand, a, b), strength, a, b))
+
+
+def op_bryce_spikes(size, grid, strength=1.0, seed=0, low=0.0, high=1.0):
+    """The Spikes half of its button."""
+    return _filter(size, grid, lambda n, h: editor_tools.spikes(n, h, editor_tools.Rand(int(seed))),
+                   strength, low, high)
+
+
+def op_bryce_sawtooth(size, grid, strength=0.25, seed=0, low=0.0, high=1.0):
+    """The Sawtooth half of its button."""
+    return _filter(size, grid,
+                   lambda n, h: editor_tools.sawtooth(n, h, editor_tools.Rand(int(seed))),
+                   strength, low, high)
+
+
+def _repeat(grid, times, low, high, work):
+    for _ in range(int(times)):
+        grid = _in_editor(grid, low, high, work)
+    return grid
+
+
+def op_bryce_height_noise(size, grid, times=1, seed=0):
+    """The Height Noise button. Each time adds a little."""
+    rand = editor_tools.Rand(int(seed))
+    return _repeat(grid, times, 0, 1, lambda h, a, b: editor_tools.height_noise(size, h, rand))
+
+
+def op_bryce_slope_noise(size, grid, times=1, seed=0, low=0.0, high=1.0):
+    """The Slope Noise button. low and high limit which slope values are softened."""
+    rand = editor_tools.Rand(int(seed))
+    return _repeat(grid, times, low, high,
+                   lambda h, a, b: editor_tools.slope_noise(size, h, rand, a, b))
+
+
+def op_bryce_erode(size, grid, times=1, seed=0, low=0.0, high=1.0):
+    """The Erode button: 1500 raindrops each time. Drops stop outside low to high."""
+    rand = editor_tools.Rand(int(seed))
+    return _repeat(grid, times, low, high,
+                   lambda h, a, b: editor_tools.erode(size, h, rand, a, b))
+
+
 # name -> (function, {parameter: (lowest, highest) or allowed values or None})
 _UNIT, _SEED = (0.0, 1.0), (0, 2 ** 31)
+_RANGE = {"low": _UNIT, "high": _UNIT}
+_TIMES = (1, 50)
 OPERATIONS: dict[str, tuple[Callable, dict[str, Any]]] = {
     "normalize": (op_normalize, {"low": _UNIT, "high": _UNIT}),
     "scale": (op_scale, {"factor": (0.0, 10.0)}),
@@ -397,8 +493,20 @@ OPERATIONS: dict[str, tuple[Callable, dict[str, Any]]] = {
                                "seed": _SEED, "roughness": _UNIT,
                                "mode": ("replace", "add", "max", "min", "multiply"),
                                "weight": _UNIT}),
+    "bryce_smooth": (op_bryce_smooth, {"strength": _UNIT, "times": _TIMES, **_RANGE}),
+    "bryce_sharpen": (op_bryce_sharpen, {"strength": (-4.0, 4.0), **_RANGE}),
+    "bryce_raise_lower": (op_bryce_raise_lower, {"amount": (-1.0, 4.0), **_RANGE}),
+    "bryce_gaussian_edges": (op_bryce_gaussian_edges, {"strength": _UNIT, **_RANGE}),
+    "bryce_equalize": (op_bryce_equalize, {"strength": _UNIT, **_RANGE}),
+    "bryce_erode": (op_bryce_erode, {"times": (1, 20), "seed": _SEED, **_RANGE}),
+    "bryce_height_noise": (op_bryce_height_noise, {"times": _TIMES, "seed": _SEED}),
+    "bryce_slope_noise": (op_bryce_slope_noise, {"times": _TIMES, "seed": _SEED, **_RANGE}),
+    "bryce_spikes": (op_bryce_spikes, {"strength": (-2.0, 2.0), "seed": _SEED, **_RANGE}),
+    "bryce_sawtooth": (op_bryce_sawtooth, {"strength": (-1.0, 1.0), "seed": _SEED, **_RANGE}),
+    "bryce_subplateaus": (op_bryce_subplateaus, {"strength": _UNIT, "seed": _SEED, **_RANGE}),
+    "bryce_relief_noise": (op_bryce_relief_noise, {"strength": (-1.0, 1.0), **_RANGE}),
 }
-_WHOLE = {"steps", "passes", "cells", "octaves", "seed", "iterations",
+_WHOLE = {"times", "steps", "passes", "cells", "octaves", "seed", "iterations",
           "droplets", "quarter_turns"}
 
 
@@ -427,7 +535,7 @@ def validate(operations: list[dict], size: int) -> None:
     """Check everything before running anything."""
     if len(operations) > 50:
         raise BryceError("at most 50 operations per call")
-    thermal = droplets = 0
+    thermal = droplets = presses = filtered = 0
     for position, step in enumerate(operations):
         if not isinstance(step, dict) or step.get("op") not in OPERATIONS:
             raise BryceError(f"operation {position}: 'op' must be one of {', '.join(OPERATIONS)}")
@@ -444,7 +552,13 @@ def validate(operations: list[dict], size: int) -> None:
             thermal += step.get("iterations", 20) * size * size
         if name == "hydraulic_erosion":
             droplets += step.get("droplets", 20000)
+        if name == "bryce_erode":
+            presses += step.get("times", 1)
+        elif name.startswith("bryce_"):
+            filtered += step.get("times", 1) * size * size * (4 if name == "bryce_sawtooth" else 1)
     # The engine is plain Python; keep a single call to a couple of minutes.
+    if filtered > 30_000_000 or presses > 40:
+        raise BryceError("too much work for one call; use fewer repeats")
     if thermal > 30_000_000 or droplets > 300_000:
         raise BryceError("too much erosion for one call; use fewer iterations or droplets")
 

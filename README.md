@@ -178,7 +178,7 @@ half the stated height, plus a missing boolean part. All three are fixed in 0.6.
 
 ## Status - read this first
 
-Version 0.9.0. The Python code has automated tests, run on Linux. The bridge DLL is tested
+Version 0.10.0. The Python code has automated tests, run on Linux. The bridge DLL is tested
 in a harness that loads your real `Bryce 3D.exe` and `Axiom.dll` on Linux with stand-ins for
 Windows. **Parts of it have not run on Windows yet; see the table.**
 
@@ -194,6 +194,7 @@ Windows. **Parts of it have not run on Windows yet; see the table.**
 | Sky mode and switches | New in 0.6.0. Each bit was read from the code that fills Bryce's menu and Sky & Fog window, and every preset sky with its atmosphere on has exactly one mode. **Not rendered** |
 | Light settings | New in 0.7.0. Each was read from the code behind Bryce's Edit Light window, and lights saved by Bryce read back as new lights do in Bryce (white, intensity 25). Light gels and the light radius and shadow ambience values that animations can drive are not covered. **Not rendered** |
 | Picture textures | New in 0.9.0. The picture format was read from Bryce's graphics library: its tutorial pictures and interface art decode with correct colors and readable text, and pictures written here decode back exactly. **Not rendered**, so how `repeat` looks on a surface is unconfirmed |
+| Terrain Editor tools | New in 0.10.0. Read instruction by instruction and checked here for behavior on Bryce's mountain presets. **Not compared with Bryce's editor** on the same terrain, and the drag direction of two-way buttons is a choice made here |
 | Camera including bank | Reading matches a real render within 1.7 pixels. Writing and bank **rendered**: a negative bank raises the right end of the horizon |
 | Textures from the `texture` operation | **Rendered** (water ripples, rock color) after the 0.5.1 fix: each texture link needs its type marker |
 | Texture scale and wrapping | New in 0.8.0. Read from Bryce's mapping code: the coordinate is multiplied by the scale, so bigger numbers repeat more often. The 11 wrapping modes follow the order in Bryce's help file, which agrees with what the code computes for each. All of Bryce's own textures read as world space with no offset or rotation. Colors are stored blue first (checked with the wood and desert textures). **No edited texture has been rendered.** Which of the four color sets a given texture draws with depends on how it is built |
@@ -314,6 +315,29 @@ operations. Either can start from any picture (a 16-bit PNG keeps full precision
 Operations: `generate`, `hill`, `crater`, `plateau`, `path`, `noise`, `ridges`,
 `thermal_erosion`, `hydraulic_erosion`, `terrace`, `smooth`, `sharpen`, `normalize`,
 `scale`, `offset`, `gamma`, `clip`, `invert`, `flip`, `rotate`, `edge_falloff`.
+
+**Bryce's own Terrain Editor tools**, rewritten from the program's code (the filter weights,
+rounding, pass order and border handling are Bryce's):
+
+| Operation | Editor button |
+| --- | --- |
+| `bryce_erode` | Erode: 1500 raindrops a press, each cutting the channel it runs down |
+| `bryce_smooth`, `bryce_sharpen` | Smoothing, Sharpening |
+| `bryce_raise_lower` | Raise/Lower |
+| `bryce_gaussian_edges` | Gaussian Edges |
+| `bryce_height_noise`, `bryce_slope_noise` | Height Noise, Slope Noise |
+| `bryce_equalize`, `bryce_subplateaus` | Equalize / Subplateaus |
+| `bryce_spikes` | the Spikes half of Spikes / Blob Maker |
+| `bryce_sawtooth` | the Sawtooth half of Sawtooth / Cross Ridge2 |
+| `bryce_relief_noise` | the Relief Noise half of Mounds / Relief Noise |
+
+Where you would drag a button, `strength` 1 is the finished effect. `low` and `high` are the
+editor's filtering range. `seed` makes random patterns repeatable; Bryce's own differ from
+run to run. Which half of a two-name button is which was read from its click code.
+**Not rewritten:** Fractal, Eroded, Mounds, Dampen / Raise Edges, Posterize, Subcontours,
+the brush tools (Square Edges, Round Edges, Basic Noise, painting with the mouse) and the
+Filtering tab's curve. The operations above them cover similar ground with this project's
+own methods.
 
 The grid size is that of the terrain you start from. Bryce's own libraries include 128, 256
 and 512 grids.
@@ -496,7 +520,8 @@ Not everything in Bryce 3D is covered by the file tools:
   be edited.
 - Inside the Labs, the agent works by looking and clicking; there are no per-control tools.
 - New meshes carry no texture coordinates; up to 50,000 triangles each.
-- Terrain operations are this project's own code, not the Terrain Editor's.
+- Only some Terrain Editor tools are rewritten (see Terrain operations); the other terrain
+  operations are this project's own.
 - `br3_open_in_bryce` needs a path made of Windows ANSI characters, under 260 bytes.
 - Only Bryce 3D is supported, and the bridge only the build it was made for.
 - Without the bridge, unsaved work cannot be detected in advance.

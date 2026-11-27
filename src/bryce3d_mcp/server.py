@@ -433,7 +433,8 @@ def terrain_export(path: str, name: str, index: int = 0) -> list:
 
 @tool
 def terrain_operations() -> str:
-    """The editing operations terrain_edit accepts, with defaults and limits."""
+    """The editing operations terrain_edit accepts, with defaults and limits. Those
+    named bryce_* do what the buttons of Bryce's own Terrain Editor do."""
     return json.dumps(terrain.describe_operations())
 
 
