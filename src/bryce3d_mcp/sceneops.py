@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 
-from . import heightfield, meshes, picture, presets, terrain, trimesh
+from . import heightfield, meshes, motion, picture, presets, terrain, trimesh
 from .br3 import (BOOLEAN_BITS, KINDS, LIGHT_FALLOFFS, LIGHT_SETTINGS, MATERIAL_COLOURS,
                   MATERIAL_VALUES, TEXTURE_MAPPINGS, Br3)
 from .errors import BryceError
@@ -61,6 +61,24 @@ OPERATIONS = {
                 "the picture to each face; the other names are those of texture_edit. "
                 "The picture is stored inside the scene, at most 1024 pixels a side. "
                 "Preview does not show it."),
+    "path": (("points",), ("name", "closed", "smooth"),
+             "Add a Bryce path object through points [[x,y,z],...] in Bryce units. closed "
+             "makes a loop. smooth (true) saves many points along a smooth curve through "
+             "yours; false saves just yours. Bryce's 30 ready-made paths are object "
+             'presets: insert_preset with library "Paths". A path can be moved but not '
+             "resized or turned."),
+    "follow_path": ((), ("name", "target", "path", "preset", "points", "closed", "centre",
+                         "scale", "turn", "start", "end", "keys", "face", "heading_offset",
+                         "look_at", "reverse", "curve", "duration"),
+                    "Move an object (name) or the camera (target camera) along a path at a "
+                    "steady speed, by writing position keys. Give one of path (a path "
+                    "object in the scene), preset (a Bryce path by name) or points "
+                    "[[x,y,z],...]. centre, scale (one number) and turn (degrees) move, "
+                    "resize and swing the route. start and end are frames; keys is how "
+                    "many to write. face true points it the way it travels (an object's "
+                    "+z side, or the camera, which then also tilts); heading_offset adds "
+                    "degrees. look_at keeps the camera on one spot. curve (as for "
+                    "keyframes) changes the speed. Bryce's own path link is not used."),
     "sky_preset": (("preset",), ("library",),
                    "Take the sky and sun of one of Bryce's sky presets."),
     "terrain": (("name",), ("operations", "heightmap_path"),
@@ -235,6 +253,12 @@ def _run(scene: Br3, op: str, fields: dict, sources: _Sources):
             fields.pop("name"), picture.load(path), fields.pop("channels", None),
             sources=(library, sources.donor("Tutorial.obp")),
             label=os.path.splitext(os.path.basename(path))[0], **fields)
+    if op == "path":
+        return scene.add_path(
+            fields["points"], fields.get("name"), bool(fields.get("closed", False)),
+            bool(fields.get("smooth", True)), donors=(library, sources.donor("Paths.obp")))
+    if op == "follow_path":
+        return _follow(scene, library, sources, fields)
     if op == "keyframes":
         return scene.set_keyframes(library=library, **fields)
     if op == "time_marker":
@@ -292,6 +316,44 @@ def _run(scene: Br3, op: str, fields: dict, sources: _Sources):
     if settings:
         scene.set_sky(settings)
     return {"sky_changed": sorted({**(settings or {}), **(switches or {})})}
+
+
+def _follow(scene: Br3, library: Br3 | None, sources: _Sources, fields: dict) -> dict:
+    given = [key for key in ("path", "preset", "points") if fields.get(key) is not None]
+    if len(given) != 1:
+        raise BryceError("give one of path, preset or points")
+    source = given[0]
+    value = fields.pop(source)
+    centre, scale = fields.pop("centre", None), fields.pop("scale", None)
+    turn, closed = fields.pop("turn", None), fields.pop("closed", None)
+    if source == "path":
+        kind, ref = scene.find(value)
+        if kind != "path":
+            raise BryceError(f"{value!r} is not a path object")
+        route, loops = scene.path_route(ref)
+    elif source == "preset":
+        found = presets.find(sources.folder(), "objects", value, "Paths")
+        shelf = presets.load(found)
+        refs = [ref for tag, ref, _ in shelf._list_items(("C3dRootObjList", found.key))
+                if tag == motion.PATH_TAG]
+        if not refs:
+            raise BryceError(f"{value!r} holds no path")
+        route, loops = shelf.path_route(refs[0])
+    else:
+        route, loops = motion.check_points(value), False
+    if centre is not None or scale is not None or turn is not None:
+        middle = [(max(p[a] for p in route) + min(p[a] for p in route)) / 2
+                  for a in range(3)]
+        factor = 1.0 if scale is None else scale
+        if not isinstance(factor, (int, float)) or not 0 < factor < 1e4:
+            raise BryceError("scale must be one positive number")
+        if centre is not None:
+            centre = motion.check_points([centre, [v + 1 for v in centre]], "centre")[0]
+        route = motion.place_route(
+            [[v - m for v, m in zip(p, middle)] for p in route],
+            middle if centre is None else centre, factor, float(turn or 0))
+    return scene.follow(route, loops if closed is None else bool(closed),
+                        library=library, **fields)
 
 
 def _mesh(scene: Br3, library: Br3 | None, fields: dict) -> dict:

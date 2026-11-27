@@ -79,6 +79,24 @@ def _channel(keys: list[tuple[int, list]], frame: int, easing: str) -> list:
     return _spline(v0, v1, v2, v3, t)
 
 
+def _centripetal(p0, p1, p2, p3, t: float):
+    """Catmull-Rom spaced by the square root of the distance between points: through
+    p1 (t=0) and p2 (t=1) without the loops and backtracking that unevenly spaced
+    points give the even kind. For evenly spaced points the two are the same."""
+    knots = [0.0]
+    for a, b in ((p0, p1), (p1, p2), (p2, p3)):
+        knots.append(knots[-1] + max(math.dist(a, b) ** 0.5, 1e-9))
+    t0, t1, t2, t3 = knots
+    u = t1 + (t2 - t1) * t
+
+    def mix(a, b, from_, to):
+        share = (u - from_) / (to - from_)
+        return [x + (y - x) * share for x, y in zip(a, b)]
+
+    a1, a2, a3 = mix(p0, p1, t0, t1), mix(p1, p2, t1, t2), mix(p2, p3, t2, t3)
+    return mix(mix(a1, a2, t0, t2), mix(a2, a3, t1, t3), t1, t2)
+
+
 class Path:
     """A smooth curve through points, travelled at a steady speed."""
 
@@ -106,7 +124,7 @@ class Path:
         self.samples = [pts[0]]
         for s in range(segments):
             corners = [point(s + k) for k in (-1, 0, 1, 2)]
-            self.samples += [_spline(*corners, k / steps) for k in range(1, steps + 1)]
+            self.samples += [_centripetal(*corners, k / steps) for k in range(1, steps + 1)]
         self.lengths = [0.0]
         for a, b in zip(self.samples, self.samples[1:]):
             self.lengths.append(self.lengths[-1] + math.dist(a, b))

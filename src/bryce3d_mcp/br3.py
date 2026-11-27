@@ -15,7 +15,7 @@ from __future__ import annotations
 import math
 import struct
 
-from . import heightfield, keyframes, picture, settings_anim, trimesh
+from . import heightfield, keyframes, motion, picture, settings_anim, trimesh
 from . import curve as curves
 from .ccmf import CompositeFile
 from .errors import BryceError
@@ -107,6 +107,7 @@ _FACE_TAG = "sqre3dob"
 _KIND_OF[_FACE_TAG] = "2d_face"
 _SLAB_TAG = "slab3dob"
 _KIND_OF[_SLAB_TAG] = "slab"
+_KIND_OF[motion.PATH_TAG] = "path"
 # The class an object list entry points into. Needed because a 32-bit id is only
 # unique within a class: a group and its member list share one, so do a sky preset
 # and its sun, and preset libraries reuse old ids across classes.
@@ -119,6 +120,7 @@ _TAG_CLASS = {
     _FACE_TAG: "C3dSquare", _SLAB_TAG: "C3dSlab",
     "conelght": "C3dConeLight", "pyrmlght": "C3dPyrLightType",
     "cubelght": "C3dCubeLight", _GROUP_TAG: _GROUP,
+    motion.PATH_TAG: motion.PATH_CLASS,
 }
 _NEVER_LINKED = frozenset((
     _LIST, _ROOT, "CPresetDescr", "objpresetdesc", "matprevcimage", "objprevcimage",
@@ -346,7 +348,9 @@ def euler_from_quaternion(q) -> tuple[float, float, float]:
     return tuple(math.degrees(a) for a in (rx, ry, rz))
 
 
-class Br3(settings_anim.SettingAnimation):
+class Br3(settings_anim.SettingAnimation, motion.PathObjects):
+    UNIT = UNIT
+
     def __init__(self, composite: CompositeFile) -> None:
         self.file = composite
         self._reindex()
@@ -993,7 +997,12 @@ class Br3(settings_anim.SettingAnimation):
         """Put an object's centre at `centre` (file units). The local offset is
         folded away so that scale and rotation act about the centre."""
         if self.animated_channels(ref):
+            self._refuse_reshaped_path(ref, scale, rotation)
             self._place_animated(ref, centre, scale, rotation, library)
+            return
+        if ref[0] == motion.PATH_CLASS:
+            self._refuse_reshaped_path(ref, scale, rotation)
+            self._move_path(ref, centre, library)
             return
         cached = self._cached_transform(ref)
         wanted = (("Obj_ePosition", centre, None),
@@ -1009,6 +1018,29 @@ class Br3(settings_anim.SettingAnimation):
                 self._ensure_track(ref, class_name, library)
             self._set_vector(ref, class_name, value)
         self._write_pose(ref, centre, scale, rotation)
+
+    def _refuse_reshaped_path(self, ref: Ref, scale, rotation) -> None:
+        """A path's points are saved already resized and turned."""
+        if ref[0] != motion.PATH_CLASS:
+            return
+        # One of Bryce's presets has settings that disagree with what it draws, so
+        # either of the two counts as unchanged.
+        for _, _, size, turn in (self.transform(ref), self._cached_transform(ref)):
+            if all(abs(a - b) <= 1e-6 for a, b in zip(scale, size)) \
+                    and abs(sum(a * b for a, b in zip(rotation, turn))) >= 1 - 1e-9:
+                return
+        raise BryceError("a path can be moved but not resized or turned; make a new "
+                             "one with the path operation, or use scale and turn in "
+                             "follow_path")
+
+    def _move_path(self, ref: Ref, centre, library: "Br3 | None") -> None:
+        """Move a path, leaving everything about its shape as Bryce saved it."""
+        self._ensure_track(ref, "Obj_ePosition", library)
+        self._set_vector(ref, "Obj_ePosition", centre)
+        if self._linked(ref, "Obj_eOrigin") is not None:
+            self._set_vector(ref, "Obj_eOrigin", (0.0, 0.0, 0.0))
+        self._write(ref, _OFFSET, struct.pack("<3d", 0.0, 0.0, 0.0))
+        self._write(ref, _TRANSLATION, struct.pack("<3d", *centre))
 
     def _write_pose(self, ref: Ref, centre, scale, rotation) -> None:
         """The copy of an object's placement that Bryce draws from."""
@@ -1784,6 +1816,15 @@ class Br3(settings_anim.SettingAnimation):
         info["size"] = [round(v * extent * UNIT, 2)
                         for v, extent in zip(scale, self._local_extent(kind, key))]
         info["rotation"] = [round(v, 2) + 0.0 for v in euler_from_quaternion(rotation)]
+        if kind == "path":
+            try:
+                points = motion.read_points(self._payload(key))
+            except BryceError:
+                info.pop("size")
+            else:
+                info["size"] = [round(v * UNIT, 2) for v in motion.extent(points)]
+                loop, closed = motion.split_loop(points)
+                info["path"] = {"points": len(points), "closed": closed}
         if self.animated_channels(key):
             info["animation"] = self.animation(key)
             shapes = self.curves_of(key)
