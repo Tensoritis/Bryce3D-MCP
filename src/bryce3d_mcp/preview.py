@@ -135,9 +135,12 @@ def _local_parts(scene: Br3, kind: str, ref, detail: int = 64) -> list:
 
 
 def object_parts(scene: Br3, kind: str, ref, detail: int = 64) -> list:
-    """_local_parts with the vertices in Bryce units. `detail` is how many samples
-    a side to draw of a terrain finer than 128."""
-    return [(points * UNIT, faces, material, cuts)
+    """_local_parts with the vertices in Bryce units, carried into whatever the
+    object is joined to. `detail` is how many samples a side to draw of a terrain
+    finer than 128."""
+    matrix, move = scene.frame_around(ref)
+    matrix, move = np.array(matrix), np.array(move)
+    return [((points @ matrix + move) * UNIT, faces, material, cuts)
             for points, faces, material, cuts in _local_parts(scene, kind, ref, detail)]
 
 

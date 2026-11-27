@@ -15,7 +15,7 @@ from __future__ import annotations
 import math
 import struct
 
-from . import heightfield, keyframes, motion, picture, settings_anim, trimesh
+from . import heightfield, keyframes, links, motion, picture, settings_anim, trimesh
 from . import curve as curves
 from .ccmf import CompositeFile
 from .errors import BryceError
@@ -40,6 +40,7 @@ _HF_MEMORY = 208        # heights in HF_eHFMem, big-endian
 _CAMERA_MATRIX, _CAMERA_TRANSLATION = 380, 452    # 3x3 doubles, then 3 doubles
 _CAMERA_ANGLES, _CAMERA_FOV = 644, 724            # pitch, heading, bank; field of view
 _CAMERA_OFFSET = 356                              # 3 doubles turned by the matrix
+_LIGHT_CLASSES = ("C3dSphereLight", "C3dConeLight", "C3dPyrLightType", "C3dCubeLight")
 _SUN_VECTOR = 860
 
 _OFFSET, _MATRIX, _TRANSLATION = 356, 380, 452     # same cache layout as cameras
@@ -352,7 +353,7 @@ _SAVED_ON_MAC = ("this model was saved on a Mac, with its bytes in the "
                  "other order; reading those is not supported yet")
 
 
-class Br3(settings_anim.SettingAnimation, motion.PathObjects):
+class Br3(settings_anim.SettingAnimation, motion.PathObjects, links.Links):
     UNIT = UNIT
 
     def __init__(self, composite: CompositeFile) -> None:
@@ -460,7 +461,7 @@ class Br3(settings_anim.SettingAnimation, motion.PathObjects):
         if name == _LIST:
             return [(20 + 16 * i, item[1]) for i, item in enumerate(self._list_items(ref))]
         # A stored picture is compressed data: nothing in it is a link.
-        if name in (_ROOT, "C3dTexture", "C3dCImage") or not (name.startswith("C3d")
+        if name in (_ROOT, links.TRACK_LIST, "C3dTexture", "C3dCImage") or not (name.startswith("C3d")
                                                  or name == "CPictTexture"):
             return []
         payload = self._payload(ref)
@@ -473,7 +474,10 @@ class Br3(settings_anim.SettingAnimation, motion.PathObjects):
                 target = self._resolve(name, offset, value)
                 if target:
                     found.append((offset, target))
-        if name == _GROUP and _LIST in self._ids.get(key, ()):
+        # A group's members, or what is joined to an object: a list under its own id.
+        if _LIST in self._ids.get(key, ()) and (
+                name == _GROUP or (name in _TAG_CLASS.values()
+                                   and _GROUP not in self._ids[key])):
             found.append((None, (_LIST, key)))
         return found
 
@@ -517,7 +521,8 @@ class Br3(settings_anim.SettingAnimation, motion.PathObjects):
         self._write_list(self._first(_ROOT), items)
 
     def _objects(self) -> list[tuple[str, Ref]]:
-        return [(_KIND_OF.get(tag, tag), ref) for tag, ref, _ in self._root()[2]
+        """Every object of the scene: those in its list, then what is joined to each."""
+        return [(_KIND_OF.get(tag, tag), ref) for tag, ref, _, _ in self._family()
                 if tag != "basecamr"]
 
     def _members(self, group: Ref) -> list[tuple[str, Ref]]:
@@ -525,6 +530,42 @@ class Br3(settings_anim.SettingAnimation, motion.PathObjects):
         if _LIST not in self._ids.get(group[1], ()):
             return []
         return [(_KIND_OF.get(tag, tag), ref) for tag, ref, _ in self._list_items(listing)]
+
+    _turn_matrix = staticmethod(lambda turn: rotation_matrix(turn))
+    _turn_from = staticmethod(lambda matrix: quaternion_from_matrix(matrix))
+
+    def _kind_of_record(self, ref: Ref) -> str:
+        tag = self._entry_for(ref)
+        return _KIND_OF.get(tag, tag)
+
+    def _slot_of(self, class_name: str) -> int:
+        return _TRACK_SLOT[class_name]
+
+    def _viewing_camera(self) -> Ref:
+        """The Camera View's record, which Bryce's own tracking links point from."""
+        return self._camera_key("perspective") or self._first(_CAMERA)
+
+    def _aim_camera(self, target) -> None:
+        """Point the drawn copy of both views at `target` (file units)."""
+        keys = [k for k in (self._camera_key("perspective"), self._camera_key("director"))
+                if k is not None] or [self._first(_CAMERA)]
+        for key in keys:
+            payload = self._payload(key)
+            offset = struct.unpack_from("<3d", payload, _CAMERA_OFFSET)
+            flat = struct.unpack_from("<9d", payload, _CAMERA_MATRIX)
+            move = struct.unpack_from("<3d", payload, _CAMERA_TRANSLATION)
+            eye = [sum(offset[i] * flat[i * 3 + a] for i in range(3)) + move[a]
+                   for a in range(3)]
+            dx, dy, dz = (t - e for t, e in zip(target, eye))
+            if math.hypot(dx, dy, dz) < 1e-9:
+                continue
+            roll = struct.unpack_from("<3d", payload, _CAMERA_ANGLES)[2]
+            angles = (-math.atan2(dy, math.hypot(dx, dz)), math.atan2(dx, dz), roll)
+            self._write(key, _CAMERA_OFFSET, struct.pack("<3d", 0.0, 0.0, 0.0))
+            self._write(key, _CAMERA_TRANSLATION, struct.pack("<3d", *eye))
+            self._write(key, _CAMERA_MATRIX, struct.pack(
+                "<9d", *(v for row in camera_matrix(*angles) for v in row)))
+            self._write(key, _CAMERA_ANGLES, struct.pack("<3d", *angles))
 
     def _name(self, key: Ref) -> str:
         return self._payload(key)[8:48].split(b"\0")[0].decode("latin-1")
@@ -1009,7 +1050,11 @@ class Br3(settings_anim.SettingAnimation, motion.PathObjects):
         return position, [0.0] * 3, scale, quaternion_from_matrix(turn)
 
     def transform(self, ref: Ref):
-        if self.animated_channels(ref):          # the pose at the time marker
+        # Animated, tracking and path-riding objects are drawn from the cache.
+        if self.animated_channels(ref) or (self.tracking() and any(
+                e[1] == ref[1] for e in self.tracking())) or (
+                ref[0].startswith("C3d") and len(self._payload(ref)) >= 640
+                and self.rides_path(ref)):
             return self._cached_transform(ref)
         position = self._vector(ref, "Obj_ePosition")
         origin = self._vector(ref, "Obj_eOrigin")
@@ -1192,7 +1237,9 @@ class Br3(settings_anim.SettingAnimation, motion.PathObjects):
         struct.pack_into(">f", data, _DOC_TIME, time)
         self.file.replace(entry, bytes(data))
         self._repose(time)
+        self.pose_riders(time)
         self._pose_settings(time)
+        self.refresh_tracking()
         return self.timeline()
 
     def _repose(self, time: float, only: Ref | None = None) -> None:
@@ -1609,6 +1656,11 @@ class Br3(settings_anim.SettingAnimation, motion.PathObjects):
         if not name:
             raise BryceError("an object track needs the object's name")
         kind, ref = self.find(name)
+        parent = self.parent_of(ref)
+        if parent is not None:
+            raise BryceError(f"{name!r} is joined to {self._name(parent)!r}, so keys of "
+                             "its own would be measured inside it, which is not "
+                             "supported yet. Key the parent, or unjoin it first")
         if not keys and curve is None:
             raise BryceError("give keys, a curve, or both")
         keys = keys or []
@@ -1877,8 +1929,14 @@ class Br3(settings_anim.SettingAnimation, motion.PathObjects):
     def describe(self, kind: str, key: Ref) -> dict:
         info = {"name": self._name(key), "kind": kind}
         position, origin, scale, rotation = self.transform(key)
-        info["position"] = [round(v * UNIT, 3) + 0.0
-                            for v in world_centre(position, origin, scale, rotation)]
+        centre = world_centre(position, origin, scale, rotation)
+        if self.parent_of(key) is not None:      # report it as it stands in the scene
+            matrix, centre = self._scene_shape(key)
+            parts = links.split(matrix)
+            if parts is not None:                # else slanted: left as stored
+                scale, rotation = parts[0], self._turn_from(parts[1])
+        info["position"] = [round(v * UNIT, 3) + 0.0 for v in centre]
+        info.update(self.describe_links(key))
         info["scale"] = [round(v, 4) for v in scale]
         info["size"] = [round(v * extent * UNIT, 2)
                         for v, extent in zip(scale, self._local_extent(kind, key))]
@@ -1918,6 +1976,19 @@ class Br3(settings_anim.SettingAnimation, motion.PathObjects):
         kind, key = self.find(name)
         if scale is not None and size is not None:
             raise BryceError("give scale or size, not both")
+        parent = self.parent_of(key)
+        if parent is not None and any(v is not None for v in (position, scale, size,
+                                                              rotation)):
+            # A joined object is edited as a free one, in scene terms, and rejoined.
+            if self.animated_channels(key) or self.rides_path(key):
+                raise BryceError(f"{name!r} moves inside its parent; change its keys or "
+                                 "unjoin it first")
+            above = self._name(parent)
+            self._unjoin(key, library)
+            self.set_object(name, position=position, scale=scale, size=size,
+                            rotation=rotation, library=library)
+            self.join(name, above, library)
+            position = scale = size = rotation = None
         if size is not None:
             scale = [v / (extent * UNIT) for v, extent in
                      zip(_triple(size, "size"), self._local_extent(kind, key))]
@@ -1988,20 +2059,21 @@ class Br3(settings_anim.SettingAnimation, motion.PathObjects):
             pending.append((old, row[12:], source._payload(old), source._links(old),
                             source.file.read(second) if second else b"",
                             names[:names.index(old[0])]))
-        # A group and its member list must keep sharing one id.
+        # A group or a parent and its list must keep sharing one id.
         shared: dict[int, int] = {}
         fresh: dict[Ref, int] = {}
         for old in order:
-            paired = old[0] in (_GROUP, _LIST)
+            paired = (_LIST, old[1]) in order and (
+                old[0] == _LIST or old[0] == _GROUP or old[0] in _TAG_CLASS.values())
             key = shared.get(old[1]) if paired else None
             if key is None:
                 key = self._new_key(set(fresh.values()))
             if paired:
                 shared[old[1]] = key
             fresh[old] = key
-        for old, tail, payload, links, companion, earlier in pending:
+        for old, tail, payload, pointers, companion, earlier in pending:
             body = bytearray(payload)
-            for offset, target in links:
+            for offset, target in pointers:
                 if offset is not None and target in fresh:
                     struct.pack_into("<I", body, offset, fresh[target])
             self._add_record(old[0], fresh[old], bytes(body), tail, companion, earlier)
@@ -2143,9 +2215,14 @@ class Br3(settings_anim.SettingAnimation, motion.PathObjects):
         heightfield.pack_name(final, 32)
         if settings.get("position") is None:
             settings["position"] = self._resting_position(self, kind, original, settings)
+        if self.parent_of(original) is not None or self.children_of(original):
+            raise BryceError(f"{name!r} is joined to another object; unjoin it before "
+                             "making a copy")
         tag = next(tag for tag, ref, _ in self._root()[2] if ref == original)
         copy = self._copy(self, original)
         self._append(tag, copy)
+        if self.target_of(original) is not None and original[0] not in _LIGHT_CLASSES:
+            self._flag(copy, links._ATTRIBUTES, links._TRACKS, False)
         self._rename(copy, final)
         material = settings.pop("material", None)
         if material:
@@ -2158,7 +2235,21 @@ class Br3(settings_anim.SettingAnimation, motion.PathObjects):
 
     def delete(self, name: str) -> None:
         _, ref = self.find(name)
-        self._write_root([raw for _, other, raw in self._root()[2] if other != ref])
+        for child in self.children_of(ref):      # what is joined to it stays put
+            if child[0] == _CAMERA:
+                raise BryceError(f"the camera is joined to {name!r}")
+            self._unjoin(child)
+        entries = self.tracking()
+        for entry in [e for e in entries if e[3] == ref[1]]:
+            follower = self._by_id(entry[0], entry[1])
+            if follower is not None and follower[0] != _CAMERA:
+                if follower[0] not in _LIGHT_CLASSES:
+                    self._flag(follower, links._ATTRIBUTES, links._TRACKS, False)
+                self._restore_turn(follower)
+        if entries:
+            self._write_tracking([e for e in entries if ref[1] not in (e[1], e[3])])
+        self._take_out(ref)
+        self._reindex()
         self._discard(set(self._closure(ref)))
 
     def _discard(self, doomed: set[Ref]) -> None:
@@ -2203,6 +2294,10 @@ class Br3(settings_anim.SettingAnimation, motion.PathObjects):
         heightfield.pack_name(final, 32)
         source, template = self._group_donor((self, library, *donors))
         boolean = bool(negative or intersect)
+        for member_name, ref in zip(names, members):
+            if self.parent_of(ref) is not None or self.children_of(ref):
+                raise BryceError(f"{member_name!r} is joined to another object; "
+                                 "unjoin it before grouping")
         centres = [self.centre_of(ref) for ref in members]
         middle = [(min(c[a] for c in centres) + max(c[a] for c in centres)) / 2
                   for a in range(3)]

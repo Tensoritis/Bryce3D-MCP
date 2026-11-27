@@ -31,6 +31,17 @@ OPERATIONS = {
               "Group objects so they move as one. List some in negative to cut them out "
               "of the others, or in intersect to keep only the overlap."),
     "ungroup": (("name",), (), "Take a group apart."),
+    "join": (("name", "to"), (),
+             "Join an object to another (Bryce's linking): moving, turning or resizing "
+             "the parent `to` then carries name with it, keys included. Neither moves "
+             "when joined. A group cannot be the parent. An unevenly stretched parent "
+             "cannot take a child that is turned inside it."),
+    "unjoin": (("name",), (), "Set a joined object free, where it stands."),
+    "track": (("name", "target"), (),
+              "Keep name (an object, a spot light, or \"camera\") facing the object "
+              "target, as Bryce's tracking does: the +z side of objects, the beam of "
+              "spot lights. Its own rotation is kept for when tracking ends."),
+    "untrack": (("name",), (), "Stop tracking."),
     "insert_preset": (("preset",), ("library", "name", "position", "scale", "rotation"),
                       "Add a ready-made model from Bryce's object presets (mountains, "
                       "boolean lessons, tutorial models). scale is one number."),
@@ -73,7 +84,7 @@ OPERATIONS = {
              '"Paths". A path can be moved but not resized or turned.'),
     "follow_path": ((), ("name", "target", "path", "preset", "points", "closed", "centre",
                          "scale", "turn", "start", "end", "keys", "face", "heading_offset",
-                         "look_at", "reverse", "curve", "duration"),
+                         "look_at", "reverse", "curve", "duration", "native"),
                     "Move an object (name) or the camera (target camera) along a path at a "
                     "steady speed, by writing position keys (one per frame unless keys says "
                     "fewer; fewer are easier to edit in Bryce but follow less closely). Give one of path (a path "
@@ -85,7 +96,10 @@ OPERATIONS = {
                     "many to write. face true points it the way it travels (an object's "
                     "+z side, or the camera, which then also tilts); heading_offset adds "
                     "degrees. look_at keeps the camera on one spot. curve (as for "
-                    "keyframes) changes the speed. Bryce's own path link is not used."),
+                    "keyframes) changes the speed. native true makes Bryce's own path link "
+                    "instead of position keys (name and path only, with start, end, "
+                    "reverse, curve and duration): the object is joined to the path, so "
+                    "moving the path moves its route too."),
     "sky_preset": (("preset",), ("library",),
                    "Take the sky and sun of one of Bryce's sky presets."),
     "terrain": (("name",), ("operations", "heightmap_path"),
@@ -207,6 +221,7 @@ def apply(scene: Br3, operations: list[dict], library: Br3 | None = None,
         except BryceError as error:
             raise BryceError(f"operation {number} ({step['op']}): {error}. "
                              "Nothing was written.") from error
+    scene.refresh_tracking()             # later operations may have moved a target
     return results
 
 
@@ -238,6 +253,14 @@ def _run(scene: Br3, op: str, fields: dict, sources: _Sources):
                            donors=(sources.donor("Boolean Objects.obp"),), **fields)
     if op == "ungroup":
         return scene.ungroup(fields["name"], library)
+    if op == "join":
+        return scene.join(fields["name"], fields["to"], library)
+    if op == "unjoin":
+        return scene.unjoin(fields["name"], library)
+    if op == "track":
+        return scene.track(fields["name"], fields["target"])
+    if op == "untrack":
+        return scene.untrack(fields["name"], library)
     if op == "insert_preset":
         found, source = sources.preset("objects", fields)
         return scene.insert_preset(source, found.key, found.name, library=library, **fields)
@@ -330,6 +353,14 @@ def _run(scene: Br3, op: str, fields: dict, sources: _Sources):
 
 
 def _follow(scene: Br3, library: Br3 | None, sources: _Sources, fields: dict) -> dict:
+    if fields.pop("native", False):
+        extra = sorted(set(fields) - {"name", "path", "start", "end", "reverse",
+                                      "curve", "duration"})
+        if extra or not fields.get("name") or not fields.get("path"):
+            raise BryceError("native takes name and path, with start, end, reverse, "
+                             f"curve and duration{'; not ' + ', '.join(extra) if extra else ''}")
+        return scene.follow_native(fields.pop("name"), fields.pop("path"),
+                                   library=library, **fields)
     given = [key for key in ("path", "preset", "points") if fields.get(key) is not None]
     if len(given) != 1:
         raise BryceError("give one of path, preset or points")

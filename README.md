@@ -57,6 +57,8 @@ applies completely or writes nothing.
 | `set` | Rename, move, scale or size, rotate, recolor an object |
 | `duplicate`, `delete` | Copy or remove an object or group |
 | `group`, `ungroup` | Group objects. `negative` and `intersect` make booleans |
+| `join`, `unjoin` | **Bryce's object linking**: a parent carries what is joined to it (see [Linking and tracking](#linking-and-tracking)) |
+| `track`, `untrack` | Keep an object, a spot light or the camera facing another object |
 | `insert_preset` | One of Bryce's ready-made models: 30 mountains, 30 boolean models, tutorial scenes |
 | `material_preset` | One of Bryce's 48 bundled materials (Mirror, Metallic Chrome, checkerboards, woods, metals), then adjust it |
 | `texture` | Drive a material channel with a named Bryce texture. `BasicSin24` on `bump` makes ripples |
@@ -220,9 +222,47 @@ changes when things happen, and the table above still decides the route.
   the follower the way it travels; `look_at` keeps the camera on one spot; `centre`,
   `scale` and `turn` refit the route.
 - A path object or preset is followed along the curve Bryce draws for it.
-- **It is not Bryce's own path link.** How Bryce ties a follower to a path is not decoded,
-  so editing the path in Bryce afterwards will not move the follower. A point's twist is
-  not used.
+- By default the follower gets its own position keys, so editing the path in Bryce
+  afterwards does not move it. With `"native": true` it is put on **Bryce's own path
+  link** instead (see below). A point's twist is not used either way.
+
+### Linking and tracking
+
+```json
+[
+  {"op": "join", "name": "Moon", "to": "Planet"},
+  {"op": "keyframes", "name": "Planet", "duration": 3, "keys": [
+    {"frame": 0, "rotation": [0, 0, 0]}, {"frame": 90, "rotation": [0, 120, 0]}]},
+  {"op": "track", "name": "camera", "target": "Planet"},
+  {"op": "track", "name": "Spot 1", "target": "Moon"},
+  {"op": "follow_path", "name": "Ship", "path": "Orbit", "native": true, "end": 90}
+]
+```
+
+- `join` makes one object the child of another. Nothing moves when they are joined.
+  Afterwards, moving, turning or resizing the parent (by hand or by keys) carries the
+  child along. Links can be chained. Positions, sizes and rotations are still given and
+  reported in scene terms.
+- A joined object cannot have keys of its own yet: key the parent. It cannot be grouped
+  or duplicated until it is unjoined, and a group cannot be a parent. A parent stretched
+  unevenly cannot take a child that is turned inside it, because that needs a slant.
+  Deleting a parent leaves its children where they are.
+- `track` turns the follower to face its target and keeps it that way as either moves.
+  Objects face it with their **+z side** (a cone's tip does not point at it; a long box
+  built along z does), spot and square spot lights with their beam, and the camera looks
+  at it. `untrack` gives an object its earlier rotation back. Parallel light tracking
+  has no saved example to check against.
+- `follow_path` with `native` joins the object to a path object in the scene and stores
+  how far along it is at each time, as Bryce does. Move the path and the object comes
+  too. It takes `start`, `end`, `reverse`, `curve` and `duration`, and the follower is
+  not turned to face its direction of travel (the `face` option belongs to ordinary keys).
+
+**How sure is this?** The layouts were read from the Mac-saved scenes on the Bryce CD,
+which hold 75 joins, riders on paths and many tracking links. Of 73 tracking links
+tested, 72 point at their target within 0.001 degrees when worked out as here; one camera
+is about 4.5 degrees off. The 18 Windows-saved CD scenes hold only groups; their lists match
+what is written here, but **none has a tracking list or a path link, and none of these
+three features made here has been opened in Bryce.**
 
 **One scene per frame** works for everything, including the camera and sky. `br3_animate` takes keyframes and paths and writes **one ordinary scene per frame**, with a
 preview GIF. `br3_render_animation` renders the frames in Bryce a few at a time (it can be
@@ -318,7 +358,7 @@ It needs Bryce's own preset files, builds in a minute or two and is about 23 MB.
 
 ## Status - read this first
 
-Version 0.15.0. The Python code has automated tests, run on Linux. The bridge DLL is tested
+Version 0.16.0. The Python code has automated tests, run on Linux. The bridge DLL is tested
 in a harness that loads your real `Bryce 3D.exe` and `Axiom.dll` on Linux with stand-ins for
 Windows. **Parts of it have not run on Windows yet; see the table.**
 
@@ -348,6 +388,7 @@ Windows. **Parts of it have not run on Windows yet; see the table.**
 | Movement between keys | **Changed in 0.14.0:** earlier versions moved positions in straight lines, which Bryce does not. Checked against the values Bryce saved at its time marker in the animated scenes on the Bryce CD: all of more than 400 in-between positions agree to within a millionth of a file unit. Straight blending agrees for the field of view, a lamp's brightness, a material color, the sky and sun colors and numbers tested (in one or a few cases each) and 4 of 5 camera angles (the fifth lies outside both of its keys). The sun's direction agrees in both cases. **Object rotation is only partly settled:** it agrees exactly in 3 poses from 2 scenes, but differs by 0.2 to 85 degrees in 3 other scenes, and why is not known. Lamp color and the local origin had no in-between case; the origin uses the position rule because its records are laid out the same way |
 | Camera, sun, sky, material and lamp keys | Written into the records Bryce itself keeps for them (lamp records are built here; where the CD's scenes attach lamp records agrees in all 40 cases). **Keys made here have not been played in Bryce** |
 | Path objects and `follow_path` | The record was read from Bryce's 30 path presets, which all load and can be followed. **Changed in 0.14.0:** the curve between path points was read from Bryce's code. In two CD scenes, objects on Bryce's own path link sit within 0.00002 file units of that curve; the bounding boxes Bryce saved agree with it, including the effect of tension (one box is about 0.003 off on one side). How far along the path Bryce puts a follower agrees to about 0.03% of its length. Continuity and bias were read from code only, with no saved case. **Fixed in 0.15.0:** paths made here were drawn wrongly in Bryce because of a damaged value copied from one preset; the corrected record has not been opened in Bryce |
+| Linking, tracking, native path link | New in 0.16.0. Read from Mac-saved CD scenes (see [Linking and tracking](#linking-and-tracking)). **Not opened in Bryce** |
 | Frame-by-frame animation | Frames and previews tested here. Rendering a series is tested against a stand-in only |
 | Saving and loading | Save-box detection works on real pictures. The Save As and load steps are **not tried live** |
 | The bridge | **Loaded on Windows.** Opening scenes, starting renders from the menu, noticing when each finished and capturing the picture worked for all five gallery scenes |
@@ -605,7 +646,16 @@ curve; from 700, 100 bytes a point: position (doubles), then tension, continuity
 twist (floats). Points are saved already resized and turned. See
 `src/bryce3d_mcp/motion.py`. A follower on Bryce's own link has a track of 48-byte keys
 whose value is a float from 0 to the number of points less one, a share of the path's
-length; how the follower is tied to one path is not known.
+length. A follower is a child of the path in the object lists; see Links below.
+
+**Links (`src/bryce3d_mcp/links.py`).** A joined object leaves the root list for a list
+(`C3dObjList`) with its parent's id; the parent's own entry then holds that id in its last
+word, as a group's does, and the child's flag word at 272 gains `0x4`. A child's cached
+matrix and centre are measured inside its parent. Tracking is one record
+(`C3dObjTrackList`, id 1): a 12-byte header and 24 bytes a link (follower tag and id,
+target tag and id). It changes only the follower's cached matrix, and sets `0x1000` in the
+word at 268 of ordinary objects. A path rider is a child of the path with `0x800` set in
+that word, a track at 488 (`Obj_ePathT`) and no position track.
 
 **Bryce's spline.** Each stretch is a cubic Bezier. Its handles are those of a
 tension-continuity-bias (Kochanek-Bartels) spline with a factor of **0.19 between position
@@ -698,10 +748,10 @@ Nothing here uses your mouse or keyboard. Keep a saved copy of any scene you car
 
 Not everything in Bryce 3D is covered by the file tools:
 
-- Not every Bryce 3D feature can be driven from files. Known gaps: Bryce's own link from
-  a follower to a path, and the twist of path points; keys on sky switches,
-  texture settings and light settings other than color and intensity; linking one object
-  to another, tracking, and Object Attributes options such as locking, hiding and families;
+- Not every Bryce 3D feature can be driven from files. Known gaps: the twist of path
+  points; keys on sky switches, texture settings and light settings other than color and
+  intensity; keys on a joined object; Object Attributes options such as locking, hiding
+  and families;
   adding new 2D faces and slabs; light gels; the 360 panorama render type. Some of these
   can be reached by clicking through the bridge, which is untried in the Labs. This list
   may not be complete.
