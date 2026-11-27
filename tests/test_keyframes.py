@@ -58,11 +58,9 @@ def test_keys_may_use_seconds_in_any_order_and_a_longer_duration():
 
 def test_the_time_marker_poses_what_is_drawn():
     scene = animated()
-    on_key = scene.set_time({"frame": 30})
-    assert "estimated" not in on_key and on_key["frame"] == 30
+    assert scene.set_time({"frame": 30})["frame"] == 30
     close(cube(scene)["position"], [30, 10, 0])
-    between = scene.set_time({"time": 1})
-    assert "Cube 1" in between["estimated"]
+    scene.set_time({"time": 1})
     close(cube(Br3.from_bytes(scene.data))["position"], [15, 10, 0])
     with pytest.raises(BryceError, match="ends at frame 30"):
         scene.set_time({"frame": 31})
@@ -137,7 +135,7 @@ def test_animated_objects_cannot_be_grouped():
 
 
 @pytest.mark.parametrize("keys, message", [
-    ([], "at least one"),
+    ([], "keys, a curve, or both"),
     ([{"position": [0, 0, 0]}], "either frame or time"),
     ([{"frame": 1, "time": 1, "position": [0, 0, 0]}], "either frame or time"),
     ([{"frame": 1}], "has no position"),

@@ -15,7 +15,8 @@ from __future__ import annotations
 import math
 import struct
 
-from . import heightfield, keyframes, picture, trimesh
+from . import heightfield, keyframes, picture, settings_anim, trimesh
+from . import curve as curves
 from .ccmf import CompositeFile
 from .errors import BryceError
 
@@ -232,6 +233,12 @@ _SHOWN = ("color", "diffuse", "ambient", "specular", "transparency", "reflection
           "bump", "refraction")
 
 
+def _mac_list(payload: bytes) -> bool:
+    """Whether an object list is big-endian: version 1, then 0 where a list saved
+    on a PC has 1."""
+    return payload[:8] == b"\0\0\0\1\0\0\0\0"
+
+
 def _tag(raw: bytes) -> str:
     return raw[::-1].decode("latin-1")
 
@@ -339,7 +346,7 @@ def euler_from_quaternion(q) -> tuple[float, float, float]:
     return tuple(math.degrees(a) for a in (rx, ry, rz))
 
 
-class Br3:
+class Br3(settings_anim.SettingAnimation):
     def __init__(self, composite: CompositeFile) -> None:
         self.file = composite
         self._reindex()
@@ -412,9 +419,16 @@ class Br3:
                     return name, value
         return None
 
+    def mac_model(self, key: int) -> bool:
+        """Whether an object preset was saved on a Mac."""
+        return _mac_list(self._payload(("C3dRootObjList", key)))
+
     def _list_items(self, ref: Ref) -> list[tuple[str, Ref, bytes]]:
         """(tag, record, raw 16 bytes) for each entry of an object list."""
         payload = self._payload(ref)
+        if _mac_list(payload):
+            raise BryceError("this model was saved on a Mac, with its bytes in the "
+                             "other order; reading those is not supported yet")
         count = struct.unpack_from("<I", payload, 8)[0]
         if 12 + 16 * count > len(payload):
             raise BryceError("corrupt scene: object list is too short")
@@ -532,9 +546,9 @@ class Br3:
     def _write_value(self, track: Ref, offset: int, data: bytes) -> None:
         """Write a value, given by its offset in a one-key record, into every key."""
         payload = self._payload(track)
-        stride = keyframes.single_size(payload) - keyframes.HEAD
+        step = keyframes.stride(payload)
         for i in range(keyframes.count(payload)):
-            self._write(track, offset + i * stride, data)
+            self._write(track, offset + i * step, data)
 
     def _setting(self, track: Ref):
         """Decode a one-value setting record by its size."""
@@ -542,14 +556,25 @@ class Br3:
         size = keyframes.single_size(payload)
         offset = 220 if size in (232, 248) else _VALUE
         if size in (248, 204):
-            return offset, "colour", struct.unpack_from("<3f", payload, offset)
-        if size in (232, 196):
-            return offset, "float", struct.unpack_from("<f", payload, offset)[0]
-        if size == 200:
-            return offset, "double", struct.unpack_from("<d", payload, offset)[0]
-        if size >= _VALUE + 24 and track[0].endswith("Vctr"):
-            return offset, "vector", struct.unpack_from("<3d", payload, offset)
-        return offset, None, None
+            form, code, number = "colour", "f", 3
+        elif size in (232, 196):
+            form, code, number = "float", "f", 1
+        elif size == 200:
+            form, code, number = "double", "d", 1
+        elif size >= _VALUE + 24 and track[0].endswith("Vctr"):
+            form, code, number = "vector", "d", 3
+        else:
+            return offset, None, None
+        if keyframes.count(payload) > 1:         # as it stands at the time marker
+            entries = keyframes.values(payload, number, code, offset - keyframes.HEAD)
+            try:
+                moment = self.timeline()["time"]
+            except BryceError:                   # a preset library has no timeline
+                moment = 0.0
+            value = keyframes.at(entries, moment, points=keyframes.time_curve(payload))
+        else:
+            value = struct.unpack_from(f"<{number}{code}", payload, offset)
+        return offset, form, value if number == 3 else value[0]
 
     def _set_setting(self, track: Ref, value, label: str) -> None:
         offset, form, _ = self._setting(track)
@@ -772,6 +797,8 @@ class Br3:
             raise BryceError(f"unknown material settings {unknown}; "
                              f"use {sorted(MATERIAL_CHANNELS)}")
         material = self._own_material(name)
+        self._refuse_animated_settings(self._material_channels(material, set(settings)),
+                                       f"the material of {name!r}")
         released = set()
         for label, value in settings.items():
             block, offset, class_name = MATERIAL_CHANNELS[label]
@@ -1005,6 +1032,9 @@ class Br3:
                 found.append(channel)
         return found
 
+    def _track_curve(self, ref: Ref, class_name: str):
+        return keyframes.time_curve(self._payload(self._linked(ref, class_name)))
+
     def _pose_at(self, ref: Ref, time: float):
         """(centre, scale, rotation) at `time`, from the keys."""
         cached = self._cached_transform(ref)
@@ -1013,14 +1043,16 @@ class Br3:
         for (class_name, number), otherwise in zip(_POSE_TRACKS, fallback):
             entries = self._track_values(ref, class_name, number)
             parts.append(tuple(otherwise) if entries is None else
-                         keyframes.at(entries, time, class_name == "Obj_eOrient"))
+                         keyframes.at(entries, time, class_name == "Obj_eOrient",
+                                      self._track_curve(ref, class_name)))
         position, origin, scale, rotation = parts
         return world_centre(position, origin, scale, rotation), list(scale), rotation
 
     def _offset_at(self, ref: Ref, time: float, scale, rotation) -> list[float]:
         """What the local origin adds to the stored position at `time`."""
         entries = self._track_values(ref, "Obj_eOrigin", 3)
-        origin = (0.0, 0.0, 0.0) if entries is None else keyframes.at(entries, time)
+        origin = ((0.0, 0.0, 0.0) if entries is None else keyframes.at(
+            entries, time, points=self._track_curve(ref, "Obj_eOrigin")))
         return world_centre((0.0, 0.0, 0.0), origin, scale, rotation)
 
     def animation(self, ref: Ref) -> dict:
@@ -1081,40 +1113,410 @@ class Br3:
                              "set a longer duration with the keyframes operation")
         struct.pack_into(">f", data, _DOC_TIME, time)
         self.file.replace(entry, bytes(data))
-        estimated = self._repose(time)
-        result = self.timeline()
-        if estimated:
-            result["estimated"] = (f"{', '.join(estimated)}: between two keys, so placed "
-                                   "on a straight line; Bryce's own curve may differ")
+        self._repose(time)
+        self._pose_settings(time)
+        return self.timeline()
+
+    def _repose(self, time: float, only: Ref | None = None) -> None:
+        """Write the pose at `time` for animated objects."""
+        for _, ref in self._every_object():
+            if (only is None or ref == only) and self.animated_channels(ref):
+                self._write_pose(ref, *self._pose_at(ref, time))
+
+    def curves_of(self, ref: Ref) -> dict:
+        found = {}
+        for channel in self.animated_channels(ref):
+            points = keyframes.time_curve(self._payload(
+                self._linked(ref, ANIMATED[channel][0])))
+            if points:
+                found[channel] = curves.describe(points)
+        return found
+
+    # -- what can be keyed besides object poses ----------------------------------------
+    def _camera_channels(self) -> list:
+        views = [k for k in (self._camera_key("perspective"), self._camera_key("director"))
+                 if k is not None] or [self._first(_CAMERA)]
+        owners = [k for k in views if self._linked(k, "Obj_ePosition") is not None]
+        if not owners:
+            return []
+        # Both views show the same shot; one of them may have no tracks of its own.
+        mirrors = tuple(k for k in views if k not in owners)
+
+        def position(key, v):
+            self._write(key, _CAMERA_OFFSET, struct.pack("<3d", 0.0, 0.0, 0.0))
+            self._write(key, _CAMERA_TRANSLATION, struct.pack("<3d", *v))
+
+        def orientation(key, v):
+            matrix = [n for row in camera_matrix(*v) for n in row]
+            self._write(key, _CAMERA_MATRIX, struct.pack("<9d", *matrix))
+            self._write(key, _CAMERA_ANGLES, struct.pack("<3d", *v))
+
+        def fov(key, v):
+            self._write(key, _CAMERA_FOV, struct.pack("<d", *v))
+
+        def angles(v):
+            return {"heading": round(math.degrees(v[1]), 2) + 0.0,
+                    "pitch": round(-math.degrees(v[0]), 2) + 0.0,
+                    "bank": round(math.degrees(v[2]), 2) + 0.0}
+
+        def make(name, class_name, number, cache, show):
+            return settings_anim.Channel(name, class_name, owners, _VALUE, "d", number,
+                                         cache, show, mirrors=mirrors)
+        return [make("position", "Obj_ePosition", 3, position,
+                     lambda v: [round(n * UNIT, 3) + 0.0 for n in v]),
+                make("orientation", "Cam_eCraOrient", 3, orientation, angles),
+                make("fov", "Cam_eFOV", 1, fov, lambda v: round(math.degrees(v[0]), 2))]
+
+    def _sun_channels(self) -> list:
+        owner = self._first("C3dSunLight")
+        tracks = self._scene_settings("C3dSunLight", "SunL_e")
+        out = []
+        for name, label, form, shape, show in (
+                ("direction", "SunVctr", "d", "<3d", settings_anim.sun_angles),
+                ("disc_color", "DiscClr", "f", "<3f", settings_anim.hex_colour),
+                ("halo_color", "HaloClr", "f", "<3f", settings_anim.hex_colour)):
+            if label in tracks:
+                def cache(key, v, offset=SUN_CACHE[label], shape=shape):
+                    self._write(key, offset, struct.pack(shape, *v))
+                out.append(settings_anim.Channel(
+                    name, "SunL_e" + label, [owner], _VALUE, form, 3, cache, show))
+        return out
+
+    def _sky_channels(self, only=None) -> list:
+        tracks = self._scene_settings("C3dBaseSky", "Sky_e")
+        out = []
+        for label, track in sorted(tracks.items()):
+            if only is not None and label not in only:
+                continue
+            offset, form, _ = self._setting(track)
+            if form is None:
+                continue
+            colour = form == "colour"
+            cached = SKY_CACHE.get(label)
+
+            def cache(key, v, offset=cached, colour=colour):
+                if offset is not None:
+                    self._write(key, offset, struct.pack("<3f" if colour else "<d", *v))
+            out.append(settings_anim.Channel(
+                label, "Sky_e" + label, [self._first("C3dBaseSky")], offset,
+                "d" if form == "double" else "f", 3 if colour else 1, cache,
+                settings_anim.hex_colour if colour else settings_anim._plain))
+        return out
+
+    def _material_channels(self, material: Ref, only=None) -> list:
+        out = []
+        for label, (_, cached, class_name) in MATERIAL_CHANNELS.items():
+            if only is not None and label not in only:
+                continue
+            colour = label in MATERIAL_COLOURS
+            track = self._linked(material, class_name)
+            if track is None:
+                offset = 220
+            else:
+                offset, form, _ = self._setting(track)
+                if form not in ("colour", "float"):
+                    continue
+
+            def cache(key, v, offset=cached, colour=colour):
+                self._write(key, offset, struct.pack("<3f" if colour else "<f", *v))
+            out.append(settings_anim.Channel(
+                label, class_name, [material], offset, "f", 3 if colour else 1, cache,
+                settings_anim.hex_colour if colour else settings_anim._plain,
+                settings_anim.MATERIAL_SLOTS[class_name]))
+        return out
+
+    def _light_channels(self, light: Ref) -> list:
+        def colour(key, v):
+            self._write(key, _LIGHT_COLOUR, struct.pack("<3f", *v))
+
+        def intensity(key, v):
+            self._write(key, _LIGHT_INTENSITY, struct.pack("<d", *v))
+
+        make = settings_anim.Channel
+        return [make("color", "Light_C", [light], _VALUE, "f", 3, colour,
+                     settings_anim.hex_colour, settings_anim.LIGHT_SLOTS["Light_C"]),
+                make("intensity", "Light_Int", [light], _VALUE, "d", 1, intensity,
+                     lambda v: round(v[0] * _INTENSITY_STEP, 2),
+                     settings_anim.LIGHT_SLOTS["Light_Int"])]
+
+    def _every_object(self):
+        waiting = list(self._objects())
+        while waiting:
+            tag, ref = waiting.pop(0)
+            if ref[0] == _GROUP:
+                waiting.extend(self._members(ref))
+            yield tag, ref
+
+    def _setting_groups(self):
+        """(target, object name or None, channels) for everything keyable."""
+        if self._first(_CAMERA) is not None:
+            yield "camera", None, self._camera_channels()
+        if self._first("C3dSunLight") is not None:
+            yield "sun", None, self._sun_channels()
+        if self._first("C3dBaseSky") is not None:
+            yield "sky", None, self._sky_channels()
+        for tag, ref in self._every_object():
+            material = self._linked(ref, _MATERIAL)
+            if material is not None:
+                yield "material", self._name(ref), self._material_channels(material)
+            if ref[0].endswith(("Light", "LightType")):
+                yield "light", self._name(ref), self._light_channels(ref)
+
+    def _target_channels(self, target: str, name: str | None, fields=None):
+        """(channels by name, object ref or None) for one keyframes target."""
+        if target in ("camera", "sun", "sky"):
+            if name:
+                raise BryceError(f"a {target} track needs no name")
+            channels = {"camera": self._camera_channels, "sun": self._sun_channels,
+                        "sky": self._sky_channels}[target]()
+        else:
+            if not name:
+                raise BryceError(f"a {target} track needs the object's name")
+            kind, ref = self.find(name)
+            if target == "light":
+                if not kind.endswith("light"):
+                    raise BryceError(f"{name!r} is not a light")
+                channels = self._light_channels(ref)
+            else:
+                channels = self._material_channels(self._own_material(name))
+        if not channels:
+            raise BryceError(f"this scene has no {target} tracks")
+        return {c.name: c for c in channels}
+
+    def _stored_setting(self, channel) -> tuple:
+        """A material setting that has no track yet, from the material record."""
+        payload = self._payload(channel.owners[0])
+        offset = MATERIAL_CHANNELS[channel.name][1]
+        return struct.unpack_from(f"<{channel.number}f", payload, offset)
+
+    def _key_settings(self, target, name, keys, duration, curve, library) -> dict:
+        channels = self._target_channels(target, name)
+        fields = {"camera": settings_anim.CAMERA_FIELDS,
+                  "sun": settings_anim.SUN_FIELDS}.get(target)
+        if fields is None:
+            fields = {c: c for c in channels}
+        _, _, (old_duration, fps, now, *_) = self._timeline_floats()
+        if target == "light":
+            ref = self.find(name)[1]
+            shown = self.light(self.find(name)[0], ref)
+            present = {"color": _colour(shown["color"], "color"),
+                       "intensity": (shown["intensity"] / _INTENSITY_STEP,)}
+        else:
+            ref = None
+
+        by_frame: dict[int, dict] = {}
+        for number, item in enumerate(keys or []):
+            if not isinstance(item, dict):
+                raise BryceError("each key is an object with frame or time and values")
+            unknown = sorted(set(item) - {"frame", "time", *fields})
+            if unknown:
+                raise BryceError(f"key {number}: unknown {target} setting(s) "
+                                 f"{', '.join(unknown)}; use {', '.join(fields)}")
+            frame = self._moment(item, fps, f"key {number}")
+            values = {k: v for k, v in item.items() if k in fields}
+            if not values:
+                raise BryceError(f"key {number} sets nothing")
+            slot = by_frame.setdefault(frame, {})
+            again = sorted(set(slot) & set(values))
+            if again:
+                raise BryceError(f"two {again[0]} keys are on frame {frame}")
+            slot.update(values)
+
+        named = {fields[k] for values in by_frame.values() for k in values}
+        if isinstance(curve, dict):
+            stray = sorted(set(curve) - set(channels))
+            if stray:
+                raise BryceError(f"curve names unknown channel(s) {', '.join(stray)}; "
+                                 f"use {', '.join(channels)}")
+        if not named:
+            if curve is None:
+                raise BryceError("give keys, a curve, or both")
+            moving = [c for c in channels if self._is_animated(channels[c])
+                      and (not isinstance(curve, dict) or c in curve)]
+            if not moving:
+                raise BryceError("a curve needs a channel with two keys or more")
+            named = set(moving)
+
+        if target == "camera" and not any(map(self._is_animated, channels.values())):
+            self.set_camera()          # fold away offsets and align both cameras
+        for channel_name in named:
+            if self._channel_record(channels[channel_name]) is None:
+                value = (present[channel_name] if target == "light"
+                         else self._stored_setting(channels[channel_name]))
+                self._seed_track(channels[channel_name], library, value)
+        channels = self._target_channels(target, name)
+
+        entries: dict[str, list] = {}
+        if by_frame:
+            frames = sorted(by_frame)
+            if target in ("camera", "sun"):
+                build = self._camera_entries if target == "camera" else self._sun_entries
+                entries = build(channels, by_frame, frames, fps, now)
+            else:
+                for frame in frames:
+                    for key, value in by_frame[frame].items():
+                        label = f"frame {frame} {key}"
+                        channel = channels[key]
+                        if channel.number == 3:
+                            stored = tuple(_colour(value, label))
+                        else:
+                            number = _number(value, label)
+                            if target == "light":
+                                if not 0 <= number <= 100:
+                                    raise BryceError(f"{label} must be from 0 to 100")
+                                number /= _INTENSITY_STEP
+                            stored = (number,)
+                        entries.setdefault(key, []).append((frame / fps, stored))
+        if target == "material":
+            textured = sorted(set(entries) & set(self._textures(self._own_material(name))))
+            if textured:
+                raise BryceError(f"{', '.join(textured)} is driven by a texture; set a "
+                                 "plain value with set_material first, then key it")
+
+        for channel_name in sorted(named):
+            spec = curve.get(channel_name) if isinstance(curve, dict) else curve
+            self._write_channel(channels[channel_name], entries.get(channel_name), spec)
+
+        last = max((f for f in by_frame), default=0) / fps
+        longest = self._extend_timeline(last if len(by_frame) > 1 else 0.0, duration)
+        now = min(now, longest)
+        for channel_name in named:
+            channel = channels[channel_name]
+            self._show_channel(channel, self._channel_value(channel, now))
+        result = {"target": target, "animation": {
+            c: self._channel_report(channels[c], fps) for c in sorted(named)},
+            "timeline": self.timeline()}
+        if name:
+            result["name"] = name
+        if duration is not None and longest > duration + 1e-4:
+            result["note"] = "the duration was lengthened to reach the last key"
         return result
 
-    def _repose(self, time: float, only: Ref | None = None) -> list[str]:
-        """Write the pose at `time` for animated objects; returns the names of
-        those that had to be estimated."""
-        estimated = []
-        waiting = [ref for _, ref in self._objects()]
-        while waiting:
-            ref = waiting.pop(0)
-            waiting.extend(member for _, member in self._members(ref)
-                           if ref[0] == _GROUP)
-            if (only is not None and ref != only) or not self.animated_channels(ref):
-                continue
-            self._write_pose(ref, *self._pose_at(ref, time))
-            for channel in self.animated_channels(ref):
-                times = [t for t, _ in self._track_values(ref, *ANIMATED[channel])]
-                if times[0] < time < times[-1] and min(abs(time - t) for t in times) > 1e-5:
-                    estimated.append(self._name(ref))
-                    break
-        return estimated
+    def _camera_entries(self, channels, by_frame, frames, fps, now) -> dict:
+        view = self.camera()
+        entries: dict[str, list] = {}
+        for frame in frames:
+            item = by_frame[frame]
+            if "position" in item:
+                position = _triple(item["position"], f"frame {frame} position")
+                entries.setdefault("position", []).append(
+                    (frame / fps, tuple(v / UNIT for v in position)))
+            if "fov" in item:
+                fov = _number(item["fov"], f"frame {frame} fov")
+                if not 1 <= fov <= 170:
+                    raise BryceError("fov must be 1-170 degrees")
+                entries.setdefault("fov", []).append((frame / fps, (math.radians(fov),)))
 
-    def set_keyframes(self, name: str, keys: list, duration: float | None = None,
-                      library: "Br3 | None" = None) -> dict:
+        # Heading, pitch and bank share one track: a key that leaves one out keeps
+        # it from the key before.
+        held = {"heading": view["heading"], "pitch": view["pitch"], "bank": view["bank"]}
+        held["heading"] = (held["heading"] + 180) % 360 - 180
+        first = True
+        for frame in frames:
+            item = by_frame[frame]
+            turned = [k for k in ("heading", "pitch", "bank", "look_at") if k in item]
+            if not turned:
+                continue
+            if "look_at" in item:
+                if "heading" in item or "pitch" in item:
+                    raise BryceError("give look_at or heading/pitch, not both")
+                if "position" in item:
+                    eye = _triple(item["position"], "position")
+                elif entries.get("position"):
+                    eye = [v * UNIT for v in
+                           keyframes.at(entries["position"], frame / fps)]
+                elif self._is_animated(channels["position"]):
+                    eye = [v * UNIT for v in
+                           self._channel_value(channels["position"], frame / fps)]
+                else:
+                    eye = view["position"]
+                target = _triple(item["look_at"], f"frame {frame} look_at")
+                dx, dy, dz = (b - a for a, b in zip(eye, target))
+                if not (dx or dz):
+                    raise BryceError("look_at must not be straight above or below the camera")
+                heading = math.degrees(math.atan2(dx, dz))
+                if not first:                          # turn the short way round
+                    heading += 360 * round((held["heading"] - heading) / 360)
+                held["heading"] = heading
+                held["pitch"] = math.degrees(math.atan2(dy, math.hypot(dx, dz)))
+            for angle in ("heading", "pitch", "bank"):
+                if angle in item:
+                    held[angle] = _number(item[angle], f"frame {frame} {angle}")
+            if not -90 <= held["pitch"] <= 90:
+                raise BryceError("pitch must be -90 to 90 degrees")
+            first = False
+            entries.setdefault("orientation", []).append((frame / fps, (
+                math.radians(-held["pitch"]), math.radians(held["heading"]),
+                math.radians(held["bank"]))))
+        return entries
+
+    def _sun_entries(self, channels, by_frame, frames, fps, now) -> dict:
+        held = self.sun()
+        entries: dict[str, list] = {}
+        for frame in frames:
+            item = by_frame[frame]
+            if "azimuth" in item or "altitude" in item:
+                for angle in ("azimuth", "altitude"):
+                    if angle in item:
+                        held[angle] = _number(item[angle], f"frame {frame} {angle}")
+                entries.setdefault("direction", []).append(
+                    (frame / fps, settings_anim.unit_vector(held["azimuth"],
+                                                            held["altitude"])))
+            for colour in ("disc_color", "halo_color"):
+                if colour in item:
+                    entries.setdefault(colour, []).append(
+                        (frame / fps, tuple(_colour(item[colour], colour))))
+        return entries
+
+    def _extend_timeline(self, last: float, duration: float | None) -> float:
+        """Make the animation long enough for `last`; returns its length."""
+        entry, data, (old_duration, fps, now, start, end) = self._timeline_floats()
+        longest = max(last, old_duration if duration is None else duration)
+        if abs(end - old_duration) < 1e-4 or end > longest:
+            end = longest                    # the working range followed the length
+        start = min(start, end)
+        now = min(now, longest)
+        struct.pack_into(">5f", data, _DOC_DURATION, longest, fps, now, start, end)
+        self.file.replace(entry, bytes(data))
+        return longest
+
+    def set_keyframes(self, name: str | None = None, keys: list | None = None,
+                      duration: float | None = None, library: "Br3 | None" = None,
+                      target: str = "object", curve=None) -> dict:
+        """Give an object or a setting its keys and time curve. All or nothing: the
+        work is done on a copy, so a refused request leaves the scene as it was."""
+        work = Br3.from_bytes(self.data)
+        result = work._set_keyframes(name, keys, duration, library, target, curve)
+        self.__dict__.update(work.__dict__)
+        return result
+
+    def _set_keyframes(self, name, keys, duration, library, target, curve) -> dict:
         """Replace the keys of the channels named in `keys`, a list such as
         [{"frame": 0, "position": [x, y, z]}, {"time": 2, "position": [...],
         "rotation": [...]}]. A channel given once stops being animated."""
+        if target not in settings_anim.TARGETS:
+            raise BryceError(f"target must be one of {', '.join(settings_anim.TARGETS)}")
+        if keys is not None and not isinstance(keys, list):
+            raise BryceError("keys must be a list")
+        if keys is not None and len(keys) > keyframes.MAX_KEYS:
+            raise BryceError(f"at most {keyframes.MAX_KEYS} keys")
+        if duration is not None:
+            duration = _number(duration, "duration")
+            fps = self.timeline()["fps"]
+            if not 0 <= duration <= MAX_FRAME / fps:
+                raise BryceError("duration (seconds) is out of range")
+        if target != "object":
+            return self._key_settings(target, name, keys, duration, curve, library)
+        if not name:
+            raise BryceError("an object track needs the object's name")
         kind, ref = self.find(name)
-        if not isinstance(keys, list) or not keys:
-            raise BryceError("keys must be a list with at least one key")
+        if not keys and curve is None:
+            raise BryceError("give keys, a curve, or both")
+        keys = keys or []
+        if isinstance(curve, dict):
+            stray = sorted(set(curve) - set(ANIMATED))
+            if stray:
+                raise BryceError(f"curve names unknown channel(s) {', '.join(stray)}")
         if len(keys) > keyframes.MAX_KEYS:
             raise BryceError(f"at most {keyframes.MAX_KEYS} keys")
         _, _, (old_duration, fps, now, start, end) = self._timeline_floats()
@@ -1138,12 +1540,10 @@ class Br3:
                 if frame in wanted.setdefault(channel, {}):
                     raise BryceError(f"two {channel} keys are on frame {frame}")
                 wanted[channel][frame] = value
-        if duration is not None:
-            duration = _number(duration, "duration")
-            if not 0 <= duration <= MAX_FRAME / fps:
-                raise BryceError("duration (seconds) is out of range")
+        if not wanted and not self.animated_channels(ref):
+            raise BryceError("a curve needs a channel with two keys or more")
 
-        if not self.animated_channels(ref):
+        if wanted and not self.animated_channels(ref):
             # Fold away the local offset and make sure there is a position track.
             position, origin, scale, rotation = self.transform(ref)
             self.place(ref, world_centre(position, origin, scale, rotation), scale,
@@ -1179,18 +1579,25 @@ class Br3:
             self.file.replace(self._entry(track),
                               keyframes.build(self._payload(track), entries))
 
+        for channel, (class_name, _) in ANIMATED.items():
+            spec = curve.get(channel) if isinstance(curve, dict) else curve
+            if spec is None or (wanted and channel not in wanted):
+                continue
+            track = self._linked(ref, class_name)
+            if track is None or keyframes.count(self._payload(track)) < 2:
+                continue
+            self.file.replace(self._entry(track), keyframes.with_curve(
+                self._payload(track), curves.points(spec)))
+
         last = max((max(c) for c in wanted.values() if len(c) > 1), default=0) / fps
-        longest = max(last, old_duration if duration is None else duration)
-        entry, data, _ = self._timeline_floats()
-        if abs(end - old_duration) < 1e-4 or end > longest:
-            end = longest                    # the working range followed the length
-        start = min(start, end)
+        longest = self._extend_timeline(last, duration)
         now = min(now, longest)
-        struct.pack_into(">5f", data, _DOC_DURATION, longest, fps, now, start, end)
-        self.file.replace(entry, bytes(data))
         self._write_pose(ref, *self._pose_at(ref, now))
         result = {"name": name, "animation": self.animation(ref),
                   "timeline": self.timeline()}
+        shapes = self.curves_of(ref)
+        if shapes:
+            result["curves"] = shapes
         if duration is not None and longest > duration + 1e-4:
             result["note"] = "the duration was lengthened to reach the last key"
         return result
@@ -1319,6 +1726,8 @@ class Br3:
             if track is not None:
                 self._set_setting(track, value, label)
 
+        self._refuse_animated_settings(
+            [c for c in self._light_channels(key) if c.name in settings], f"light {name!r}")
         flags = struct.unpack_from("<I", self._payload(key), _FLAGS)[0]
         for label, value in settings.items():
             if label == "color":
@@ -1377,6 +1786,9 @@ class Br3:
         info["rotation"] = [round(v, 2) + 0.0 for v in euler_from_quaternion(rotation)]
         if self.animated_channels(key):
             info["animation"] = self.animation(key)
+            shapes = self.curves_of(key)
+            if shapes:
+                info["curves"] = shapes
         if self.boolean_of(key) != "neutral":
             info["boolean"] = self.boolean_of(key)
         material = self.material(key)
@@ -1898,6 +2310,7 @@ class Br3:
         unknown = sorted(set(settings) - set(tracks))
         if unknown:
             raise BryceError(f"unknown sky settings {unknown}; use {sorted(tracks)}")
+        self._refuse_animated_settings(self._sky_channels(set(settings)), "the sky")
         for label, value in settings.items():
             self._set_setting(tracks[label], value, label)
             self._cache_setting("C3dBaseSky", SKY_CACHE.get(label), tracks[label])
@@ -2047,6 +2460,11 @@ class Br3:
 
     def set_sun(self, azimuth=None, altitude=None, disc_color=None, halo_color=None) -> dict:
         tracks = self._scene_settings("C3dSunLight", "SunL_e")
+        touched = {name for name, value in (
+            ("direction", azimuth if azimuth is not None else altitude),
+            ("disc_color", disc_color), ("halo_color", halo_color)) if value is not None}
+        self._refuse_animated_settings(
+            [c for c in self._sun_channels() if c.name in touched], "the sun")
         if azimuth is not None or altitude is not None:
             current = self.sun()
             a = math.radians(_number(current["azimuth"] if azimuth is None else azimuth,
@@ -2099,6 +2517,7 @@ class Br3:
         """Move both the Director's View and the Camera View, so the render is the
         same whichever of the two Bryce is showing. Anything not given is taken from
         the Director's View."""
+        self._refuse_animated_settings(self._camera_channels(), "the camera")
         current = self.camera()
         if look_at is not None and (heading is not None or pitch is not None):
             raise BryceError("give look_at or heading/pitch, not both")
@@ -2145,6 +2564,10 @@ class Br3:
         if self._rows.get("brycedocset"):
             result["document"] = self.document()
             result["timeline"] = self.timeline()
+        if self._rows.get("brycedocset"):
+            moving = self.animated_settings()
+            if moving:
+                result["animated_settings"] = moving
         other = self.camera("perspective")
         if other != result["camera"]:
             result["camera_view"] = other   # differs until set_camera aligns the two

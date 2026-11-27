@@ -78,20 +78,34 @@ OPERATIONS = {
                  "768x512. antialiasing off, normal or fine_art (slow); optimisation "
                  "(spatial) off, low or high; render_type normal, mask, distance or "
                  "altitude. Preview keeps its own size."),
-    "keyframes": (("name", "keys"), ("duration",),
-                  "Animate an object on Bryce's own timeline. keys is a list like "
-                  '[{"frame": 0, "position": [x,y,z]}, {"time": 2, "position": [...]}]; '
-                  "each key has frame or time (seconds) and any of position, rotation "
-                  "(degrees) and scale. It replaces the keys of the channels it names; a "
-                  "channel given only once stops being animated. duration (seconds) "
-                  "sets the animation's length, which always reaches the last key. Bryce "
-                  "curves smoothly between keys. For a spin, put keys less than 180 "
-                  "degrees apart. Position keys match Bryce's own files; rotation and "
-                  "scale keys are untested in Bryce."),
+    "keyframes": ((), ("name", "keys", "target", "curve", "duration"),
+                  "Animate on Bryce's own timeline. target is object (default), camera, "
+                  "sun, sky, material or light; object, material and light also need "
+                  "name. keys is a list like "
+                  '[{"frame": 0, "position": [x,y,z]}, {"time": 2, "position": [...]}], '
+                  "each with frame or time (seconds) and settings: object - position, "
+                  "rotation (degrees), scale; camera - position, heading, pitch, bank, "
+                  "look_at, fov; sun - azimuth, altitude, disc_color, halo_color; sky - "
+                  "the names br3_info lists under sky; material - the set_material "
+                  "names; light - color, intensity (0-100). It replaces the keys of the "
+                  "channels it names (heading, pitch, bank and look_at are one channel, "
+                  "orientation; azimuth and altitude are direction); a channel given "
+                  "only once stops being animated. Camera headings are used as written, "
+                  "so 0 to 360 is a full turn; look_at turns the short way. For an "
+                  "object spin, put keys less than 180 degrees apart. duration "
+                  "(seconds) sets the animation's length, which always reaches the last "
+                  "key. curve shapes the timing from a channel's first key to its last "
+                  "(Bryce blends keys in straight lines, and this is its own time curve): "
+                  '"linear", "ease", "ease_in", "ease_out", "hold", or points '
+                  '[[time, progress], ..., [1, 1]] from [0, 0], both 0 to 1, each '
+                  'optionally "smooth" (default) or "straight"; or one of these per '
+                  'channel, {"position": "ease"}. Give curve without keys to reshape '
+                  "existing motion. Position, rotation and scale keys have been seen "
+                  "playing in Bryce; curves and the other targets have not yet."),
     "time_marker": ((), ("frame", "time"),
                     "Move Bryce's time marker (give frame or time in seconds). The scene "
-                    "then opens, previews and renders at that moment. Exact on a key; "
-                    "between two keys the pose is a straight-line estimate."),
+                    "then opens, previews and renders at that moment, with every "
+                    "animated object and setting worked out the way Bryce does it."),
     "sun": ((), ("azimuth", "altitude", "disc_color", "halo_color"),
             "Aim the sun. Bryce stores it relative to the camera: azimuth 0 is ahead of "
             "the camera, 90 to its right, 180 behind it."),

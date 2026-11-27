@@ -67,6 +67,8 @@ def entries(directory: str, category: str) -> list[Preset]:
             key = struct.unpack_from(">I", row)[0]
             if needs not in library._ids.get(key, {}):
                 continue                                  # a placeholder entry
+            if category == "objects" and library.mac_model(key):
+                continue                                  # cannot be inserted yet
             payload = library._payload((described_by, key))
             name = _text(payload[:64]) or f"{os.path.splitext(file_name)[0]} {len(found) + 1}"
             found.append(Preset(file_name, path, name, _text(payload[64:]), key))
