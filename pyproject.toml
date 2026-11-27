@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bryce3d-mcp"
-version = "0.4.0"
+version = "0.5.0"
 description = "MCP server that lets AI agents build and edit MetaCreations Bryce 3D scenes"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -18,6 +18,9 @@ bryce3d-mcp = "bryce3d_mcp.server:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+bryce3d_mcp = ["bin/*.dll"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

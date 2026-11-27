@@ -27,6 +27,13 @@ class FakeBackend:
         self.on_menu = None
         self.render_frames = 0
         self._frame = 0
+        self.windows = {1}
+        self.box_on_open = False
+        self.unsaved = None
+        self.counters = None
+        self.on_fill = None
+        self.on_open = None
+        self.capture = None      # what a capture of the whole interface shows
 
     def _input(self, *event):
         if not self.focused:
@@ -42,6 +49,8 @@ class FakeBackend:
 
     def click(self, x, y, button="left", count=1):
         self._input("click", (x, y), count)
+        if self.capture is not None and getattr(self, "box_closes_on_click", False):
+            self.capture = None
         if (x, y) in layout.PRIMITIVES.values() and not self.create_does_nothing:
             self.created += 1
         elif (x, y) in (layout.ATTR_OK, layout.ATTR_CANCEL):
@@ -76,6 +85,8 @@ class FakeBackend:
         return self.backdrop
 
     def grab(self, box):
+        if box == layout.CAPTURE_BOX and self.capture is not None:
+            return self.capture
         size = (box[2] - box[0], box[3] - box[1])
         if box == layout.STATUS_BOX:
             return Image.new("RGB", size, (self.created % 256, 0, 0))
@@ -89,6 +100,27 @@ class FakeBackend:
 
     def open_file(self, path):
         self.log.append(("open_file", path))
+        if self.on_open:
+            self.on_open(path)
+        if self.box_on_open:
+            self.windows.add(2)
+
+    def window_ids(self):
+        return set(self.windows)
+
+    def end(self):
+        self.log.append(("end",))
+
+    def activity(self):
+        return None if self.counters is None else dict(self.counters)
+
+    def unsaved_changes(self):
+        return self.unsaved
+
+    def forget_changes(self):
+        self.log.append(("forget",))
+        self.unsaved = False
+        return True
 
     def foreground_class(self):
         return self.window_class
@@ -107,6 +139,8 @@ class FakeBackend:
     def fill_dialog(self, dialog, text):
         self.log.append(("fill_dialog", dialog, text))
         self.open_dialogs.clear()
+        if self.on_fill:
+            self.on_fill(text)
 
     def press_dialog_button(self, dialog, button_id):
         self.log.append(("button", dialog, button_id))

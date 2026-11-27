@@ -25,4 +25,7 @@ echo.
 echo To add it to Claude Code, run:
 echo   claude mcp add bryce3d -e "BRYCE3D_OUTPUT_DIR=%~dp0workspace" -- "%~dp0.venv\Scripts\python.exe" -m bryce3d_mcp
 echo For Claude Desktop, see README.md.
+echo.
+echo Optional: with Bryce running and your work saved, test the bridge with
+echo   "%~dp0.venv\Scripts\python.exe" -m bryce3d_mcp --check-bridge
 pause

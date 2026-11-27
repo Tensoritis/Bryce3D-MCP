@@ -5,6 +5,7 @@ from __future__ import annotations
 import functools
 import io
 import json
+import math
 import os
 import re
 import struct
@@ -20,7 +21,7 @@ except ImportError:  # mcp 1.x
     from mcp.server.fastmcp import Image
     from mcp.server.fastmcp.exceptions import ToolError
 
-from . import heightfield, layout, meshes, presets, preview, scene, sceneops, terrain
+from . import animation, heightfield, layout, meshes, presets, preview, scene, sceneops, terrain
 from .br3 import Br3
 from .ccmf import CompositeFile
 from .commands import COMMANDS
@@ -37,14 +38,25 @@ BUILD with the br3_ tools. They work on scene files:
    building. br3_info lists everything in a scene.
 3. br3_preview is approximate (no textures, clouds or reflections). br3_render gives
    Bryce's real picture of a scene.
+br3_edit can also make NEW 3D shapes (op mesh: extrude, lathe, custom, OBJ), tilt
+the camera (bank), scale procedural textures and set moon phase. br3_animate makes
+keyframe and path animations as one scene per frame; br3_render_animation renders
+them and joins the pictures.
+
+FILES: load_file opens, merges or imports into the running Bryce; save_scene saves
+it and checks the file was written. Bryce's own "save your changes?" box is
+answered with answer_save_box. Never discard unsaved work without the user's yes.
 
 RUN BRYCE with bryce_command (any menu item), bryce_file_command, bryce_dialogs and
 screenshot. These use window messages and pictures of Bryce's own windows: they do
 not move the mouse, type, or take focus.
 
-LAST RESORT - click, drag, hover, press_keys, type_text, create_object, build_scene
-and the other interface tools take over the user's mouse and keyboard while they
-run. Use them only when the user wants that. Then:
+INSIDE BRYCE (open_lab for the Terrain Editor, Materials Lab, Sky Lab and Motion
+Lab, and everything else on screen): ask the user, then call bryce_connect_bridge. After that, click,
+drag, hover, press_keys, type_text, create_object, build_scene and the other
+interface tools drive Bryce with a VIRTUAL mouse and keyboard that only Bryce
+sees; the user's own are left alone. Without the bridge these tools refuse unless
+the user has set BRYCE3D_REAL_INPUT=1. Then:
 - Call screenshot first. Coordinates are UI pixels from the top-left of the 640x480
   interface; a screenshot starts at y=-20, so UI y = image y - 20.
 - hover makes Bryce name the control in its bottom-left status text.
@@ -69,12 +81,60 @@ def get_controller() -> BryceController:
     return _controller
 
 
+def _bridged(controller: BryceController) -> bool:
+    return hasattr(controller.backend, "bridge")
+
+
 def _ui(action: Callable[[BryceController], Any]) -> Any:
-    """Run one UI action: one at a time, with Bryce focused first."""
+    """Run one interface action, one at a time: with the bridge's virtual input, or,
+    only if the user has opted in, with the real mouse after focusing Bryce."""
     with _lock:
         controller = get_controller()
+        if not _bridged(controller) and os.environ.get("BRYCE3D_REAL_INPUT") != "1":
+            raise BryceError(
+                "this tool uses a mouse inside Bryce. Call bryce_connect_bridge (once the "
+                "user agrees) for a virtual one that leaves theirs alone. To let it use "
+                "the real mouse and keyboard instead, the user can set "
+                "BRYCE3D_REAL_INPUT=1.")
         controller.backend.begin()
-        return action(controller)
+        try:
+            return action(controller)
+        finally:
+            controller.backend.end()
+
+
+def connect_bridge() -> dict:
+    """Load the bridge into the running Bryce and route input through it."""
+    from . import bridge
+    from .virtual import BridgeBackend
+    controller = get_controller()
+    if _bridged(controller):
+        try:
+            controller.backend.bridge.hello()
+            return {"already_connected": True}
+        except BryceError:
+            disconnect_bridge()
+    base = controller.backend
+    folder = base.install_folder()
+    if not folder:
+        raise BryceError("Bryce 3D is not running")
+    client = bridge.attach(base.process_id(), folder)
+    controller.backend = BridgeBackend(base, client)
+    return {"connected": True, **controller.backend.info()["bridge"]}
+
+
+def disconnect_bridge() -> bool:
+    controller = get_controller()
+    if not _bridged(controller):
+        return False
+    wrapped = controller.backend
+    controller.backend = wrapped.base
+    try:
+        wrapped.bridge.virtual(False)
+    except BryceError:
+        pass                                  # Bryce has gone; nothing is held
+    wrapped.bridge.close()
+    return True
 
 
 def _quiet(action: Callable[[BryceController], Any]) -> Any:
@@ -157,6 +217,29 @@ def list_commands() -> str:
     return json.dumps({name: vars(command) for name, command in COMMANDS.items()})
 
 
+@tool
+def bryce_connect_bridge(confirm: bool = False) -> str:
+    """Load the bridge DLL into the running Bryce 3D. It gives Bryce a virtual mouse
+    and keyboard (so the interface tools reach the Terrain, Materials, Sky and
+    Motion Labs without touching the user's own), shows whether Bryce has unsaved
+    changes, and helps follow renders. It loads code into the running program, so
+    pass confirm=true once the user agrees; advise saving work first. It only loads
+    into the supported Bryce 3D build and is gone when Bryce is closed. Security
+    software may block it."""
+    if not confirm:
+        raise BryceError("this loads a DLL into the running Bryce; pass confirm=true once "
+                         "the user has agreed (saving their work first is wise)")
+    with _lock:
+        return json.dumps(connect_bridge())
+
+
+@tool
+def bryce_disconnect_bridge() -> str:
+    """Stop using the bridge. The DLL stays loaded but idle until Bryce is closed."""
+    with _lock:
+        return json.dumps({"disconnected": disconnect_bridge()})
+
+
 # -- building -------------------------------------------------------------------
 @tool
 def create_object(kind: str, name: str | None = None, position: list[float] | None = None,
@@ -233,10 +316,11 @@ def render(mode: Literal["resume", "clear", "button"] = "clear", wait: bool = Tr
            dismiss_report: bool = False) -> list:
     """Start a render of whatever Bryce has open. clear (File/Clear and Render) and
     resume (File/Render) go through Bryce's menu by window message, without focus,
-    mouse or keyboard. button clicks the render sphere with the mouse. With wait=true
+    the bridge. button clicks the render sphere (bridge or real input). With wait=true
     this returns once the picture has not changed for settle_seconds; raise that for
     heavy scenes. For long renders use wait=false, then render_status.
-    dismiss_report CLICKS (uses the mouse) the Render Report's check mark."""
+    dismiss_report clicks the Render Report's check mark; like mode="button" it needs
+    the bridge (or real input)."""
     if not 10 <= timeout_seconds <= 3600:
         raise BryceError("timeout_seconds must be 10-3600")
     if not 3 <= settle_seconds <= 120:
@@ -251,10 +335,9 @@ def render(mode: Literal["resume", "clear", "button"] = "clear", wait: bool = Tr
             result = {"started": True}
         shot = Image(data=c.screenshot_png(), format="png")
         if dismiss_report and result.get("finished"):
-            c.backend.begin()
             c.backend.click(*layout.RENDER_REPORT_OK)
         return [json.dumps(result), shot]
-    return _ui(run) if mode == "button" else _quiet(run)
+    return _ui(run) if mode == "button" or dismiss_report else _quiet(run)
 
 
 @tool
@@ -278,20 +361,24 @@ def save_render_image(name: str) -> list:
 
 @tool
 def br3_render(path: str, confirm: bool = False, timeout_seconds: float = 600,
-               settle_seconds: float = 8) -> list:
-    """The real render of a scene file, with no focus, mouse or keyboard: opens it in
-    the running Bryce, runs Clear and Render from Bryce's menu, waits until the
-    picture is still and returns it. It replaces the scene open in Bryce, so pass
-    confirm=true once the user agrees. Bryce must be running and not minimized.
-    NEW and not yet tried on a running Bryce: check the picture against br3_preview.
-    A Render Report box may cover part of it."""
+               settle_seconds: float = 8, discard_changes: bool = False) -> list:
+    """The real render of a scene file, without the user's mouse or keyboard: opens it
+    in the running Bryce, runs Clear and Render from Bryce's menu (with the bridge,
+    falls back to the render button), follows the render and returns the picture. It
+    replaces the scene open in Bryce, so pass confirm=true once the user agrees.
+    Unsaved work in Bryce is never thrown away: with the bridge it is detected and
+    the tool stops unless discard_changes=true (only when the user says so); without
+    it, Bryce's own save question stops the tool. finished=false means check the
+    picture; a blank picture is never reported as finished. Bryce must not be
+    minimized. A Render Report box may cover part of the picture."""
     if not 10 <= timeout_seconds <= 3600:
         raise BryceError("timeout_seconds must be 10-3600")
     if not 3 <= settle_seconds <= 120:
         raise BryceError("settle_seconds must be 3-120")
 
     def run(c: BryceController):
-        result = c.open_and_render(path, confirm, timeout_seconds, settle_seconds)
+        result = c.open_and_render(path, confirm, timeout_seconds, settle_seconds,
+                                   discard_changes=discard_changes)
         return [json.dumps(result), _png(c.render_picture())]
     return _quiet(run)
 
@@ -514,6 +601,137 @@ def br3_edit(source_path: str, output_name: str, operations: list[dict],
 
 
 @tool
+def br3_animate(source_path: str, output_name: str, frames: int, tracks: list[dict],
+                fps: int = 12, easing: Literal["linear", "smooth", "ease"] = "smooth",
+                templates_path: str | None = None) -> list:
+    """Make an animation: one scene file per frame from keyframes and paths, plus a
+    preview GIF. (Bryce's own timeline is not used; render the frames with
+    br3_render_animation.) Each track is {"target": "camera"|"object"|"sun"|"sky",
+    "name": object name, "keys": [{"frame": 0, ...}], "path": {...}}.
+    Keys: camera position, look_at, heading, pitch, bank, fov; object position,
+    rotation, scale, size, material; sun azimuth, altitude, disc_color, halo_color;
+    sky settings. A camera or object may instead follow
+    "path": {"points": [[x,y,z],...], "closed": false, "follow": false,
+    "heading_offset": 0, "start": 0, "end": last} at a steady speed; follow turns it
+    to face the way it travels. A camera track may give "look_at_object": name.
+    Example: orbit is a camera track with a closed path and look_at_object."""
+    if not 1 <= fps <= 60:
+        raise BryceError("fps must be 1-60")
+    original = Br3.load(source_path)
+    where = {o["name"]: o["position"] for o in original.objects()}
+    steps = animation.plan(frames, tracks, easing, where.get)
+    library, install = _library(templates_path), _install_folder()
+    folder = _new_folder(output_name)
+    shown = sorted({round(i * (frames - 1) / (min(frames, 48) - 1))
+                    for i in range(min(frames, 48))})
+    pictures = []
+    for number, operations in enumerate(steps):
+        document = Br3.from_bytes(original.data)
+        try:
+            sceneops.apply(document, operations, library, install)
+        except BryceError as error:
+            raise BryceError(f"frame {number}: {error}") from error
+        with open(os.path.join(folder, f"frame_{number:04d}.br3"), "xb") as handle:
+            handle.write(document.data)
+        if number in shown:
+            pictures.append(preview.render(document, 320, 240)[0].convert("RGB"))
+    gif = os.path.join(folder, "preview.gif")
+    _save_gif(pictures, gif, round(1000 * frames / fps / len(pictures)))
+    with open(os.path.join(folder, "animation.json"), "x", encoding="utf-8") as handle:
+        json.dump({"frames": frames, "fps": fps}, handle)
+    sheet = _contact_sheet(pictures)
+    return [json.dumps({"folder": folder, "frames": frames, "fps": fps,
+                        "preview_gif": gif, "next": "br3_render_animation"}), _png(sheet)]
+
+
+@tool
+def br3_render_animation(folder: str, confirm: bool = False,
+                         discard_changes: bool = False, count: int = 5,
+                         timeout_seconds: float = 900) -> str:
+    """Render an animation's frames in the running Bryce, `count` per call so that
+    a call does not run for hours: call again until none remain. Finished frames are
+    kept, so it can be resumed. When every frame is rendered, render.gif and the PNG
+    frames are the result. Each frame replaces what Bryce has open (confirm=true).
+    Unsaved work stops it unless discard_changes. Connect the bridge first."""
+    if not confirm:
+        raise BryceError("rendering replaces the scene open in Bryce; pass confirm=true "
+                         "once the user has agreed")
+    if not 1 <= count <= 100:
+        raise BryceError("count must be 1-100")
+    try:
+        with open(os.path.join(folder, "animation.json"), encoding="utf-8") as handle:
+            about = json.load(handle)
+        total, fps = int(about["frames"]), int(about["fps"])
+    except (OSError, KeyError, TypeError, ValueError):
+        raise BryceError(f"{folder} is not a folder made by br3_animate") from None
+
+    def frame(number, extension):
+        return os.path.join(folder, f"frame_{number:04d}.{extension}")
+
+    waiting = [n for n in range(total) if not os.path.isfile(frame(n, "png"))]
+    done, problem = [], None
+    for index, number in enumerate(waiting[:count]):
+        def run(c, n=number, first=index == 0):
+            # After the first frame, "unsaved" means the frame just rendered.
+            discard = discard_changes if first else c.backend.unsaved_changes() is True
+            return c.render_to_file(frame(n, "br3"), frame(n, "png"),
+                                    timeout=timeout_seconds, discard_changes=discard)
+
+        try:
+            result = _quiet(run)
+        except BryceError as error:
+            result = {"finished": False, "reason": str(error)}
+        if not result.get("finished"):
+            problem = {"frame": number, **{k: v for k, v in result.items()
+                                           if k != "timeline"}}
+            break
+        done.append(number)
+    remaining = len(waiting) - len(done)
+    report: dict[str, Any] = {"rendered_now": done, "remaining": remaining}
+    if problem:
+        report["stopped"] = problem
+    if not remaining:
+        from PIL import Image as Picture
+        pictures = []
+        for number in range(total):
+            with Picture.open(frame(number, "png")) as handle:
+                pictures.append(handle.convert("RGB"))
+        report["gif"] = os.path.join(folder, "render.gif")
+        _save_gif(pictures, report["gif"], round(1000 / fps))
+    return json.dumps(report)
+
+
+def _new_folder(name: str) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9_\- ]{1,60}", name):
+        raise BryceError("name: 1-60 letters, digits, spaces, - or _")
+    stem = os.path.join(output_directory(), name)
+    path, number = stem, 2
+    while os.path.exists(path):  # never overwrite
+        path, number = f"{stem}-{number}", number + 1
+    os.makedirs(path)
+    return path
+
+
+def _save_gif(pictures, path: str, milliseconds: int) -> None:
+    pictures[0].save(path, save_all=True, append_images=pictures[1:],
+                     duration=max(20, milliseconds), loop=0)
+
+
+def _contact_sheet(pictures, columns: int = 4, rows: int = 2):
+    """A few frames side by side, so that motion can be reviewed in one picture."""
+    from PIL import Image as Picture
+    number = min(len(pictures), columns * rows)
+    chosen = [pictures[round(i * (len(pictures) - 1) / max(1, number - 1))]
+              for i in range(number)]
+    width, height = chosen[0].size
+    sheet = Picture.new("RGB", (width * min(columns, number),
+                                height * math.ceil(number / columns)), (0, 0, 0))
+    for index, picture in enumerate(chosen):
+        sheet.paste(picture, (width * (index % columns), height * (index // columns)))
+    return sheet
+
+
+@tool
 def br3_preview(path: str, width: int = 640, height: int = 480) -> list:
     """Draw an approximate picture of a scene without Bryce, with a report of where
     each object lands (in frame, out of frame, hidden). Shows shapes, flat colors,
@@ -544,12 +762,13 @@ def br3_export_obj(path: str, output_name: str) -> str:
 
 
 @tool
-def br3_open_in_bryce(path: str, confirm: bool = False) -> list:
+def br3_open_in_bryce(path: str, confirm: bool = False,
+                      discard_changes: bool = False) -> list:
     """Open a scene in the running Bryce, using the message a second copy of Bryce
     sends when it is launched with a file. No focus, mouse or keyboard. It can
-    replace the open scene, so pass confirm=true once the user agrees. If Bryce asks
-    a question, see bryce_dialogs or the returned picture."""
-    return _quiet_shot(lambda c: c.open_scene(path, confirm))
+    replace the open scene, so pass confirm=true once the user agrees. Unsaved work
+    stops it (see br3_render about discard_changes)."""
+    return _quiet_shot(lambda c: c.open_scene(path, confirm, discard_changes))
 
 
 @tool
@@ -660,6 +879,22 @@ def bryce_file_command(command: Literal["open", "merge", "import_object", "expor
 
 
 @tool
+def open_lab(lab: Literal["terrain", "materials", "sky", "motion"]) -> list:
+    """Open one of Bryce's editors and show it. Select the object in Bryce first
+    (a terrain for the Terrain Editor, any object for the Materials Lab). Work
+    inside it with hover, click and drag, which use the bridge's virtual mouse once
+    bryce_connect_bridge has been called, so the user's mouse stays free. Close it
+    with its own OK or Cancel button. The sky lab is opened with a key press and is
+    UNVERIFIED. Terrains, materials and most sky settings can also be edited in the
+    scene file with br3_edit, which needs no lab at all."""
+    if lab == "sky":
+        return _with_shot(lambda c: c.run_command("sky_lab"))
+    command = {"terrain": "edit_object", "materials": "edit_material",
+               "motion": "motion_lab"}[lab]
+    return _quiet_shot(lambda c: {"ran": c.command(command)})
+
+
+@tool
 def bryce_dialogs() -> str:
     """Standard Windows dialogs Bryce has open (file pickers, questions), with their
     text and buttons. Boxes that Bryce draws itself show only in screenshot."""
@@ -674,10 +909,32 @@ def press_dialog_button(button: str, confirm: bool = False) -> list:
 
 # -- files ----------------------------------------------------------------------
 @tool
-def save_scene(path: str | None = None, confirm: bool = False) -> list:
-    """Save the scene open in Bryce, by window message. Without a path it saves over
-    the scene's own file; with a path it uses Save As and refuses existing files."""
-    return _quiet_shot(lambda c: c.save_scene(path, confirm))
+def save_scene(path: str | None = None, confirm: bool = False,
+               overwrite: bool = False) -> list:
+    """Save the scene open in Bryce. Without a path it saves over the scene's own
+    file; with a path (.br3) it uses Save As, and waits until the file is really
+    written. Existing files are kept unless overwrite=true. By window message."""
+    return _quiet_shot(lambda c: c.save_scene(path, confirm, overwrite))
+
+
+@tool
+def load_file(path: str, how: Literal["open", "merge", "import_object"] = "open",
+              unsaved: Literal["stop", "save", "discard"] = "stop",
+              save_current_to: str | None = None, confirm: bool = False) -> list:
+    """Load a file into the running Bryce: open a .br3 scene, merge a scene into the
+    current one, or import a model (such as OBJ or DXF). When opening, `unsaved`
+    decides about unsaved work: stop (default), save it first (to save_current_to),
+    or discard it (only if the user said so). With the bridge connected, Bryce's
+    "save your changes?" question is prevented or answered."""
+    return _quiet_shot(lambda c: c.load_file(path, how, unsaved, save_current_to, confirm))
+
+
+@tool
+def answer_save_box(choice: Literal["dont_save", "cancel", "save"],
+                    confirm: bool = False) -> list:
+    """Answer Bryce's own "Do you want to save your changes?" box, which is not a
+    Windows dialog. dont_save and save need confirm=true. Uses the bridge's mouse."""
+    return _with_shot(lambda c: c.answer_save_box(choice, confirm))
 
 
 @tool
@@ -712,7 +969,8 @@ def generate_mesh(name: str, shape: Literal["extrude", "lathe", "custom"],
                   vertices: list[list[float]] | None = None,
                   faces: list[list[int]] | None = None,
                   file_format: Literal["obj", "dxf"] = "obj") -> str:
-    """Write a model file for import into Bryce, for shapes primitives cannot make.
+    """Write a model file for import into Bryce. (To put a new shape straight into a
+    scene file, use br3_edit's mesh operation instead.)
     extrude: outline [[x,z],...] and height. lathe: profile [[radius,y],...] bottom to
     top. custom: vertices and zero-based faces, counter-clockwise from outside."""
     if shape == "extrude":
@@ -762,7 +1020,39 @@ def check() -> int:
     return 0
 
 
+def check_bridge() -> int:
+    """Load the bridge into the running Bryce and report what it sees. Sends no
+    input and changes nothing in the scene."""
+    try:
+        print(json.dumps(connect_bridge()))
+        controller = get_controller()
+        client = controller.backend.bridge
+        report = {"hello": client.hello(), "state": client.state(),
+                  "windows": client.windows()}
+        samples = []
+        for _ in range(5):                         # idle activity, for tuning
+            controller.backend.sleep(1.0)
+            state = client.state()
+            samples.append({k: state[k] for k in ("ticks", "peeks", "checks", "blits",
+                                                   "cpu_ms")})
+        report["idle_samples"] = samples
+        path = _output_path("bridge-report", "json")
+        with open(path, "x", encoding="utf-8") as handle:
+            json.dump(report, handle, indent=1)
+        main_window = controller.backend._main_window()
+        picture = _output_path("bridge-capture", "png")
+        client.capture(main_window["window"]).save(picture)
+        disconnect_bridge()
+    except (BryceError, OSError) as exc:
+        print(f"BRIDGE CHECK FAILED: {exc}")
+        return 1
+    print(f"Bridge works. Report: {path}\nPicture: {picture}")
+    return 0
+
+
 def main() -> None:
+    if "--check-bridge" in sys.argv[1:]:
+        raise SystemExit(check_bridge())
     if "--check" in sys.argv[1:]:
         raise SystemExit(check())
     mcp.run()

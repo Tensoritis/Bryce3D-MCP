@@ -15,7 +15,8 @@ import numpy as np
 from PIL import Image
 
 from . import heightfield
-from .br3 import UNIT, Br3, rotation_matrix
+from .br3 import UNIT, Br3, camera_matrix, rotation_matrix
+from .errors import BryceError
 
 DEFAULT_SIZE = (480, 360)       # Bryce's default document
 _NEAR = 1.0
@@ -107,7 +108,13 @@ def _local_parts(scene: Br3, kind: str, ref) -> list:
         return [(_placed(points, transform), faces, colour, cuts)
                 for member_kind, member in scene._members(ref)
                 for points, faces, colour, cuts in _local_parts(scene, member_kind, member)]
-    if kind in ("terrain", "lattice"):
+    if kind == "mesh":
+        try:
+            points, faces = scene.mesh_geometry(ref)
+            points = np.array(points)
+        except BryceError:
+            points, faces = _SHAPES[kind]()      # a rough stand-in
+    elif kind in ("terrain", "lattice"):
         points, faces = _terrain(*heightfield.decode(scene._payload(ref)))
     elif kind in _SHAPES:
         points, faces = _SHAPES[kind]()
@@ -130,10 +137,8 @@ class _View:
     def __init__(self, camera: dict, width: int, height: int) -> None:
         h, p = math.radians(camera["heading"]), math.radians(camera["pitch"])
         self.eye = np.array(camera["position"], float)
-        self.forward = np.array((math.cos(p) * math.sin(h), math.sin(p),
-                                 math.cos(p) * math.cos(h)))
-        self.right = np.array((math.cos(h), 0.0, -math.sin(h)))
-        self.up = np.cross(self.forward, self.right)
+        rows = camera_matrix(-p, h, math.radians(camera.get("bank", 0.0)))
+        self.right, self.up, self.forward = (np.array(row) for row in rows)
         self.heading = h
         self.width, self.height = width, height
         # The field of view spans about the picture's diagonal. _LENS was measured

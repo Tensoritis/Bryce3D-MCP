@@ -9,12 +9,15 @@ from __future__ import annotations
 
 import io
 import os
+import struct
 from collections.abc import Sequence
 
+import numpy as np
 from PIL import Image, ImageChops
 
 from . import layout
 from .backend import Backend
+from .ccmf import CompositeFile
 from .commands import COMMANDS, is_blocked, is_destructive, normalize_keys
 from .errors import BryceError, ConfirmationRequired, UnexpectedScreen
 
@@ -206,19 +209,76 @@ class BryceController:
 
     def wait_for_still_picture(self, timeout: float = 600, settle: float = 6,
                                poll: float = 1.5) -> dict:
-        """Wait until the viewport stops changing for `settle` seconds."""
+        """Wait until the viewport stops changing for `settle` seconds. A blank
+        picture never counts: Bryce shows plain white before it has rendered."""
         elapsed, still = 0.0, 0.0
         previous = None
         while elapsed < timeout:
             self.backend.sleep(poll)
             elapsed += poll
             current = self.backend.grab(layout.VIEWPORT_BOX)
-            same = previous is not None and ImageChops.difference(previous, current).getbbox() is None
+            same = previous is not None and _same_picture(previous, current)
             still = still + poll if same else 0.0
             previous = current
-            if still >= settle:
+            if still >= settle and not is_blank(current):
                 return {"finished": True, "seconds": round(elapsed - still, 1)}
-        return {"finished": False, "seconds": round(elapsed, 1)}
+        result = {"finished": False, "seconds": round(elapsed, 1)}
+        if previous is not None and is_blank(previous):
+            result["reason"] = "the picture is blank, so nothing has been rendered"
+        return result
+
+    def watch_render(self, start, timeout: float = 600, settle: float = 8,
+                     poll: float = 2.0, start_wait: float = 30) -> dict:
+        """Call start() and follow the render. Done means: Bryce showed signs of
+        working, has been quiet for `settle` seconds, and the picture is not blank.
+        With the bridge, Bryce's own activity counters are used as well as the
+        picture, and a timeline is returned to help tune this."""
+        def activity():
+            state = self.backend.activity()
+            return None if state is None else (state["blits"], state["checks"])
+
+        first = activity()
+        self.backend.sleep(poll)
+        second = activity()
+        idle = (0, 0) if first is None else tuple(b - a for a, b in zip(first, second))
+        previous = self.backend.grab(layout.VIEWPORT_BOX)
+        windows = self.backend.window_ids()
+        start()
+        last_counts = second
+        elapsed, quiet, started = 0.0, 0.0, False
+        timeline: list[dict] = []
+        while elapsed < timeout:
+            self.backend.sleep(poll)
+            elapsed += poll
+            current = self.backend.grab(layout.VIEWPORT_BOX)
+            changed = not _same_picture(previous, current)
+            previous = current
+            counts = activity()
+            busy = changed
+            sample = {"t": round(elapsed, 1), "changed": changed, "blank": is_blank(current)}
+            if counts is not None:
+                blits, checks = (b - a for a, b in zip(last_counts, counts))
+                last_counts = counts
+                sample.update(blits=blits, checks=checks)
+                busy = busy or blits > idle[0] * 1.5 + 2 or checks > idle[1] * 1.5 + 5
+            new_box = bool(self.backend.window_ids() - windows)
+            sample["new_box"] = new_box
+            if len(timeline) < 60 or changed or new_box:
+                timeline.append(sample)
+            started = started or busy
+            quiet = 0.0 if busy else quiet + poll
+            result = {"seconds": round(elapsed - quiet, 1), "new_box": new_box,
+                      "idle_per_sample": list(idle), "timeline": timeline[-200:]}
+            if started and quiet >= settle and not is_blank(current):
+                return {"finished": True, "started": True, **result}
+            if not started and elapsed >= start_wait:
+                return {"finished": False, "started": False, **result,
+                        "reason": "Bryce showed no sign of rendering"}
+            if started and quiet >= max(settle * 4, 90):
+                return {"finished": False, "started": True, **result,
+                        "reason": "Bryce went quiet with a blank picture"}
+        return {"finished": False, "started": started, "seconds": round(elapsed, 1),
+                "timeline": timeline[-200:], "reason": "timed out"}
 
     def render(self, timeout: float = 600, settle: float = 6, poll: float = 1.5,
                mode: str = "button") -> dict:
@@ -288,8 +348,37 @@ class BryceController:
         self.backend.sleep(1.5)
         return {"submitted": path, "dialogs_still_open": self.dialogs()}
 
-    def open_scene(self, path: str, confirm: bool = False) -> dict:
-        """Hand Bryce a file the way a second launch of Bryce would."""
+    # -- saving and loading -------------------------------------------------------
+    def save_box(self) -> dict | None:
+        """Where the buttons of Bryce's "Do you want to save your changes?" box
+        are, or None. Bryce draws this box itself, so it is found in the picture."""
+        return find_save_box(self.backend.grab(layout.CAPTURE_BOX), layout.CAPTURE_BOX[:2])
+
+    def answer_save_box(self, choice: str, confirm: bool = False) -> dict:
+        """Press "dont_save", "cancel" or "save" on that box. Needs input: the
+        bridge's virtual mouse, so the user's own mouse is not used."""
+        if choice not in SAVE_BOX_CHOICES:
+            raise BryceError(f"choice must be one of {', '.join(SAVE_BOX_CHOICES)}")
+        if choice != "cancel" and not confirm:
+            raise ConfirmationRequired("this discards or overwrites work; pass "
+                                       "confirm=true once the user has agreed")
+        buttons = self.save_box()
+        if buttons is None:
+            raise UnexpectedScreen("Bryce's save question is not on screen; take a screenshot")
+        self.backend.begin()
+        try:
+            self.backend.click(*buttons[choice])
+            self.backend.sleep(1.5)
+        finally:
+            self.backend.end()
+        if self.save_box() is not None:
+            raise UnexpectedScreen("the box is still there after pressing the button")
+        return {"answered": choice, "dialogs": self.dialogs()}
+
+    def open_scene(self, path: str, confirm: bool = False,
+                   discard_changes: bool = False) -> dict:
+        """Hand Bryce a file the way a second launch of Bryce would. Unsaved work in
+        Bryce is never discarded unless discard_changes is set."""
         if not confirm:
             raise ConfirmationRequired("opening a scene can discard unsaved work; "
                                        "pass confirm=true once the user has agreed")
@@ -298,19 +387,121 @@ class BryceController:
             raise BryceError("only .br3 scenes can be opened this way")
         if not os.path.isfile(target):
             raise BryceError(f"file not found: {target}")
-        self.backend.open_file(target)
+        if self.save_box() is not None:
+            raise UnexpectedScreen("Bryce is already asking whether to save. Answer it first "
+                                   "(answer_save_box). Nothing was sent.")
+        unsaved = self.backend.unsaved_changes()
+        if unsaved and not discard_changes:
+            raise ConfirmationRequired(
+                "Bryce has unsaved changes. Save them first (save_scene), or pass "
+                "discard_changes=true once the user has agreed to lose them. Nothing "
+                "was opened.")
+        if discard_changes and unsaved is not None:
+            self.backend.forget_changes()
+        windows = self.backend.window_ids()
+        failure = None
+        try:
+            self.backend.open_file(target)
+        except BryceError as exc:          # a question box can keep Bryce from answering
+            failure = exc
         self.backend.sleep(1.5)
+        asking = self.save_box() is not None
+        if asking and discard_changes and self.backend.activity() is not None:
+            self.answer_save_box("dont_save", confirm=True)
+            asking, failure = False, None
+        if asking or self.backend.window_ids() - windows:
+            raise UnexpectedScreen(
+                "Bryce put up a box of its own instead of just opening the file, usually "
+                "'Do you want to save your changes?'. See screenshot. Answer it with "
+                "answer_save_box (needs the bridge) or in Bryce itself; Cancel keeps "
+                "everything as it was.")
+        if failure:
+            raise failure
         return {"sent": target, "dialogs": self.dialogs()}
 
-    def save_scene(self, path: str | None = None, confirm: bool = False) -> dict:
-        """Save over the scene's file, or with a path, Save As under a new name."""
+    def load_file(self, path: str, how: str = "open", unsaved: str = "stop",
+                  save_current_to: str | None = None, confirm: bool = False) -> dict:
+        """Load a file into Bryce: open a scene, merge one into the current scene,
+        or import a model. `unsaved` says what happens to unsaved work when opening."""
+        if how not in ("open", "merge", "import_object"):
+            raise BryceError("how must be open, merge or import_object")
+        if unsaved not in ("stop", "save", "discard"):
+            raise BryceError("unsaved must be stop, save or discard")
+        if not confirm:
+            raise ConfirmationRequired("loading changes the scene open in Bryce; pass "
+                                       "confirm=true once the user has agreed")
+        target = os.path.abspath(path)
+        if not os.path.isfile(target):
+            raise BryceError(f"file not found: {target}")
+        if how != "open":                     # adds to the scene, discards nothing
+            command = "File/" + how.replace("_", " ")
+            return {"how": how, **self.run_with_path(command, target)}
+        result: dict = {"how": "open"}
+        if unsaved == "save":
+            if self.backend.unsaved_changes() is False:
+                result["saved_first"] = "not needed: nothing was unsaved"
+            elif save_current_to is None:
+                raise BryceError("give save_current_to, the file to save the current scene "
+                                 "as before opening the other one")
+            else:
+                result["saved_first"] = self.save_scene(save_current_to, confirm=True)
+        # After a verified Save As, anything still marked unsaved is not user work.
+        discard = unsaved == "discard" or (
+            isinstance(result.get("saved_first"), dict)
+            and result["saved_first"].get("verified") is True)
+        result.update(self.open_scene(target, True, discard))
+        return result
+
+    def save_scene(self, path: str | None = None, confirm: bool = False,
+                   overwrite: bool = False, timeout: float = 120) -> dict:
+        """Save over the scene's file, or with a path, Save As under that name. The
+        written file is checked before this reports success."""
         if not confirm:
             raise ConfirmationRequired("saving writes files; pass confirm=true once the "
                                        "user has agreed")
+        if self.save_box() is not None:
+            raise UnexpectedScreen("Bryce is asking whether to save; use answer_save_box")
         if path is None:
             self.command("File/Save", confirm=True)
-            return {"saved": "File/Save", "dialogs": self.dialogs()}
-        return self.run_with_path("File/Save As", path, ".br3", new_file=True)
+            self.backend.sleep(1.0)
+            open_dialogs = self.dialogs()
+            if any(d.get("takes_path") for d in open_dialogs):
+                return {"saved": None, "verified": False, "dialogs": open_dialogs,
+                        "note": "this scene has no file yet, so Bryce asks for a name; "
+                                "use submit_file_dialog, or save_scene with a path"}
+            unsaved = self.backend.unsaved_changes()
+            return {"saved": "File/Save", "dialogs": open_dialogs,
+                    "verified": None if unsaved is None else not unsaved}
+        target = os.path.abspath(path)
+        if not os.path.splitext(target)[1]:
+            target += ".br3"
+        if os.path.splitext(target)[1].lower() != ".br3":
+            raise BryceError("scenes are saved as .br3 files")
+        if os.path.exists(target) and not overwrite:
+            raise BryceError(f"{target} already exists; choose a new name or pass "
+                             "overwrite=true once the user has agreed")
+        if not os.path.isdir(os.path.dirname(target)):
+            raise BryceError(f"folder does not exist: {os.path.dirname(target)}")
+        before = _stamp(target)
+        self.command("File/Save As", confirm=True)
+        self.fill_file_dialog(target)
+        waited, last = 0.0, None
+        while waited <= timeout:
+            if before is not None and overwrite:      # Windows asks "replace it?"
+                for dialog in self.backend.dialogs():
+                    for button in dialog["buttons"]:
+                        if button["label"].strip().lower() == "yes":
+                            self.backend.press_dialog_button(dialog["window"], button["id"])
+            now = _stamp(target)
+            if now is not None and now != before and now == last and _is_scene(target):
+                return {"saved": target, "bytes": now[0], "verified": True,
+                        "dialogs": self.dialogs()}
+            last = now
+            self.backend.sleep(1.0)
+            waited += 1.0
+        raise UnexpectedScreen(
+            f"Bryce did not write {target}. Dialogs open: {self.dialogs()}. Take a "
+            "screenshot to see why.")
 
     def run_with_path(self, command: str, path: str, extension: str = "",
                       new_file: bool = False) -> dict:
@@ -331,24 +522,112 @@ class BryceController:
 
     # -- rendering without input --------------------------------------------------
     def open_and_render(self, path: str, confirm: bool = False, timeout: float = 600,
-                        settle: float = 8, poll: float = 2) -> dict:
+                        settle: float = 8, poll: float = 2,
+                        discard_changes: bool = False) -> dict:
         """Open a scene in the running Bryce, render it from nothing and wait."""
-        before = self.backend.grab(layout.VIEWPORT_BOX)
-        opened = self.open_scene(path, confirm)
+        opened = self.open_scene(path, confirm, discard_changes)
         if opened["dialogs"]:
             raise UnexpectedScreen(f"Bryce asked a question while opening: {opened['dialogs']}. "
                                    "Answer it with press_dialog_button, then try again.")
-        loaded = self.wait_for_still_picture(timeout=60, settle=3, poll=1)
-        changed = ImageChops.difference(
-            before, self.backend.grab(layout.VIEWPORT_BOX)).getbbox() is not None
-        started = self.backend.grab(layout.VIEWPORT_BOX)
-        self.command("File/Clear and Render")
-        result = self.wait_for_still_picture(timeout, settle, poll)
-        result["picture_changed_on_open"] = changed and loaded["finished"]
-        result["picture_changed_on_render"] = ImageChops.difference(
-            started, self.backend.grab(layout.VIEWPORT_BOX)).getbbox() is not None
+        self.wait_for_still_picture(timeout=30, settle=3, poll=1)   # let it load
+        result = self.watch_render(lambda: self.command("File/Clear and Render"),
+                                   timeout, settle, poll)
+        result["started_by"] = "menu"
+        if not result["started"] and self.backend.activity() is not None:
+            # The bridge can press the render button without the user's mouse.
+            result = self.watch_render(self._press_render_button, timeout, settle, poll)
+            result["started_by"] = "render button (virtual mouse)"
         result["dialogs"] = self.dialogs()
         return result
+
+    def render_to_file(self, scene: str, picture: str, timeout: float = 600,
+                       discard_changes: bool = False, settle: float = 20,
+                       poll: float = 4) -> dict:
+        """One scene of a series: open, render, close the Render Report box and keep
+        the picture. The caller must already have the user's agreement."""
+        result = self.open_and_render(scene, confirm=True, timeout=timeout,
+                                      settle=settle, poll=poll,
+                                      discard_changes=discard_changes)
+        if result["finished"]:
+            if result.get("new_box") and self.backend.activity() is not None:
+                self.backend.begin()
+                try:
+                    self.backend.click(*layout.RENDER_REPORT_OK)
+                    self.backend.sleep(2)
+                finally:
+                    self.backend.end()
+            self.render_picture().save(picture)
+            result["picture"] = picture
+        return result
+
+    def _press_render_button(self) -> None:
+        self.backend.begin()
+        try:
+            self.backend.click(*layout.RENDER_BUTTON)
+        finally:
+            self.backend.end()
+
+
+SAVE_BOX_CHOICES = ("dont_save", "cancel", "save")
+# Button centres, measured from the top left corner of the dark "Save" button in a
+# picture of Bryce's box.
+_SAVE_BOX_BUTTONS = {"dont_save": (-146, 10), "cancel": (-41, 10), "save": (32, 10)}
+
+
+def find_save_box(picture: Image.Image, offset=(0, 0)) -> dict | None:
+    """Button centres of Bryce's save question in `picture`, or None. The box is
+    recognised by its dark default button and the two light ones beside it."""
+    grey = np.asarray(picture.convert("RGB"), dtype=np.int16)
+    dark = (np.abs(grey - 116) <= 3).all(axis=-1)
+    run = 40                                   # width of an unbroken stretch of button
+    if dark.shape[1] < run or dark.shape[0] < 4:
+        return None
+    totals = np.cumsum(np.pad(dark, ((0, 0), (1, 0))), axis=1)
+    starts = (totals[:, run:] - totals[:, :-run]) == run
+    height, width = dark.shape
+    for y, x in zip(*np.nonzero(starts)):
+        if (x and starts[y, x - 1]) or (y and starts[y - 1, x]):
+            continue                           # not the top left corner
+        if x < 190 or x + 62 > width or y < 25 or y + 22 > height:
+            continue
+
+        def light(dx, dy):
+            pixel = grey[y + dy, x + dx]
+            return bool(((pixel >= 226) & (pixel <= 242)).all()
+                        and pixel.max() - pixel.min() <= 3)
+
+        if (light(-64, 2) and light(-182, 2) and light(-100, -25)
+                and light(-190, -25) and dark[y + 2, x:x + 4].all()):
+            return {name: (int(x + dx + offset[0]), int(y + dy + offset[1]))
+                    for name, (dx, dy) in _SAVE_BOX_BUTTONS.items()}
+    return None
+
+
+def _stamp(path: str) -> tuple[int, int] | None:
+    try:
+        info = os.stat(path)
+    except OSError:
+        return None
+    return info.st_size, info.st_mtime_ns
+
+
+def _is_scene(path: str) -> bool:
+    try:
+        with open(path, "rb") as handle:
+            CompositeFile(handle.read())
+    except (OSError, BryceError, ValueError, struct.error, IndexError):
+        return False
+    return True
+
+
+def is_blank(picture: Image.Image) -> bool:
+    """One flat white or black: what Bryce shows when there is no render."""
+    extremes = picture.convert("RGB").getextrema()
+    return all(low == high and (high >= 250 or high <= 3) for low, high in extremes)
+
+
+def _same_picture(a: Image.Image, b: Image.Image) -> bool:
+    return a.size == b.size and ImageChops.difference(a, b).getbbox() is None
 
 
 # Items (as _menu_key leaf names) that can discard work, write files or end Bryce.

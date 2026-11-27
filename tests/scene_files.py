@@ -123,6 +123,25 @@ def template_scene() -> bytes:
     return b.build([("sphr3dob", ball), ("hfld3dob", terrain)])
 
 
+def mesh_record(name="Stone 1"):
+    """A one-triangle mesh object body."""
+    body = bytearray(860 + 24 * 4 + 76)
+    struct.pack_into("<5i", body, 640, 2, 3, 1, 1, 0)
+    for i, point in enumerate(((0, 0, 0), (1, 0, 0), (0, 1, 0))):
+        struct.pack_into("<3d", body, 860 + 24 * i, *point)
+    struct.pack_into("<6i", body, 860 + 96, 0, 1, 2, 0, 0, 0)
+    body[8:8 + len(name) + 1] = name.encode() + b"\0"
+    return body
+
+
+def mesh_scene() -> bytes:
+    """A scene holding one stone, to copy meshes from."""
+    b = Builder()
+    b.next_key = 0x0C000000
+    stone = b.solid("C3dTriMeshType2", "Stone 1", (0, 1, 0), payload=mesh_record())
+    return b.build([("tmsh3dob", stone)])
+
+
 def object_list(items):
     """The payload of a root or group object list, from (tag, id) pairs."""
     return struct.pack("<III", 1, 1, len(items)) + b"".join(
@@ -163,6 +182,7 @@ def material_library() -> bytes:
     b.record("CPresetDescr", description("Mirror\tx", "Reflects."), key=mirror)
     texture = bytearray(1588)
     texture[8:14] = b"checks"
+    struct.pack_into("<3d", texture, 276, 0.25, 0.25, 0.5)     # its scale
     texture_key = b.record("C3dTexture", texture)
     checker = flat_material((0.5, 0.5, 0.5))
     for block in (276, 716):                      # colour and reflection use it

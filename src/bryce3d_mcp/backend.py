@@ -40,6 +40,20 @@ class Backend(Protocol):
 
     def open_file(self, path: str) -> None: ...
 
+    def window_ids(self) -> set[int]:
+        """Bryce's visible top-level windows."""
+
+    def end(self) -> None:
+        """Finish one input action (the virtual input is handed back)."""
+
+    def activity(self) -> dict | None:
+        """The bridge's activity counters, or None without the bridge."""
+
+    def unsaved_changes(self) -> bool | None:
+        """Whether Bryce has unsaved changes, or None if it cannot be known."""
+
+    def forget_changes(self) -> bool | None: ...
+
     def dialogs(self) -> list[dict]:
         """Open Windows dialogs as {window, title, text, buttons, takes_path}."""
 

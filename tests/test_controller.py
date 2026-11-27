@@ -1,8 +1,10 @@
 import pytest
+from bryce_files import composite
+from PIL import Image, ImageDraw
 
 from bryce3d_mcp import layout, scene
 from bryce3d_mcp.commands import normalize_keys
-from bryce3d_mcp.controller import BryceController, format_number
+from bryce3d_mcp.controller import BryceController, find_save_box, format_number
 from bryce3d_mcp.errors import BryceError, ConfirmationRequired, FocusLost, UnexpectedScreen
 from fake import FakeBackend
 
@@ -154,8 +156,9 @@ def test_save_as_fills_the_dialog_by_message(bryce, tmp_path):
     controller, backend = bryce
     with_menu(backend)
     backend.on_menu = lambda item: backend.open_dialogs.append(a_file_dialog())
+    backend.on_fill = write_scene
     result = controller.save_scene(str(tmp_path / "a"), confirm=True)
-    assert result["submitted"].endswith("a.br3")
+    assert result["saved"].endswith("a.br3") and result["verified"]
     assert backend.log == [("menu", 5), ("fill_dialog", 55, str(tmp_path / "a.br3"))]
 
 
@@ -199,14 +202,97 @@ def test_render_modes(bryce, mode, event):
     assert backend.log == [event]
 
 
+@pytest.fixture(name="scene_file")
+def scene_file_fixture(tmp_path):
+    return scene_file(tmp_path)
+
+
+def scene_file(tmp_path):
+    scene = tmp_path / "s.br3"
+    scene.write_text("x")
+    return str(scene)
+
+
 def test_open_and_render_uses_only_messages(bryce, tmp_path):
     controller, backend = bryce
     with_menu(backend)
-    scene = tmp_path / "s.br3"
-    scene.write_text("x")
-    result = controller.open_and_render(str(scene), confirm=True, timeout=60)
-    assert result["finished"]
-    assert backend.log == [("open_file", str(scene)), ("menu", 7)]
+
+    def rendering(item):
+        backend.render_frames, backend._frame = 6, 0
+    backend.on_menu = rendering
+    scene = scene_file(tmp_path)
+    result = controller.open_and_render(scene, confirm=True, timeout=120)
+    assert result["finished"] and result["started_by"] == "menu"
+    assert backend.log == [("open_file", scene), ("menu", 7)]
+
+
+def test_a_render_that_never_starts_is_not_a_success(bryce, tmp_path):
+    controller, backend = bryce
+    with_menu(backend)
+    result = controller.open_and_render(scene_file(tmp_path), confirm=True, timeout=300)
+    assert result["finished"] is False and "no sign of rendering" in result["reason"]
+
+
+def test_a_blank_picture_never_counts_as_rendered(bryce):
+    controller, backend = bryce
+    backend.grab = lambda box: Image.new("RGB", (box[2] - box[0], box[3] - box[1]),
+                                         (255, 255, 255))
+    result = controller.wait_for_still_picture(timeout=30, settle=3, poll=1)
+    assert result["finished"] is False and "blank" in result["reason"]
+
+
+def test_a_box_from_bryce_stops_opening(bryce, tmp_path):
+    """What happened on the first live run: 'Do you want to save your changes?'."""
+    controller, backend = bryce
+    with_menu(backend)
+    backend.box_on_open = True
+    with pytest.raises(UnexpectedScreen, match="save your changes"):
+        controller.open_and_render(scene_file(tmp_path), confirm=True)
+    assert not any(event[0] == "menu" for event in backend.log)
+
+
+def test_unsaved_work_is_kept_unless_told_otherwise(bryce, tmp_path):
+    controller, backend = bryce
+    backend.unsaved = True
+    scene = scene_file(tmp_path)
+    with pytest.raises(ConfirmationRequired, match="unsaved changes"):
+        controller.open_scene(scene, confirm=True)
+    assert backend.log == []
+    controller.open_scene(scene, confirm=True, discard_changes=True)
+    assert backend.log == [("forget",), ("open_file", scene)]
+
+
+def test_bridge_counters_start_and_finish_a_render(bryce):
+    """The picture can stay still while Bryce is working: the counters show it."""
+    controller, backend = bryce
+    backend.counters = {"blits": 0, "checks": 0}
+    work = {"left": 0}
+    original = backend.sleep
+
+    def sleep(seconds):
+        if work["left"]:
+            work["left"] -= 1
+            backend.counters["checks"] += 500
+        original(seconds)
+    backend.sleep = sleep
+    result = controller.watch_render(lambda: work.update(left=10), timeout=200,
+                                     settle=6, poll=2)
+    assert result["finished"] and result["seconds"] == 20
+    assert result["timeline"][0]["checks"] == 500
+
+
+def test_the_render_button_is_the_fallback_with_the_bridge(bryce, tmp_path):
+    controller, backend = bryce
+    with_menu(backend)
+    backend.counters = {"blits": 0, "checks": 0}
+
+    def click(x, y, button="left", count=1):
+        backend.log.append(("click", (x, y), count))
+        backend.render_frames, backend._frame = 5, 0
+    backend.click = click
+    result = controller.open_and_render(scene_file(tmp_path), confirm=True, timeout=300)
+    assert result["finished"] and result["started_by"].startswith("render button")
+    assert ("click", layout.RENDER_BUTTON, 1) in backend.log and backend.log[-1] == ("end",)
 
 
 def test_render_refuses_while_a_dialog_is_open(bryce):
@@ -230,3 +316,114 @@ def test_render_waits_for_a_still_picture(bryce):
                                          (10.239, "10.24"), (-90, "-90"), (100, "100")])
 def test_number_format(value, text):
     assert format_number(value) == text
+
+
+def write_scene(path):
+    with open(path, "wb") as handle:
+        handle.write(composite({1: b"x" * 40}))
+
+
+def box_picture():
+    """The parts of Bryce's save question that the detector looks at."""
+    picture = Image.new("RGB", (704, 660), (255, 255, 255))
+    ImageDraw.Draw(picture).rectangle((50, 130, 337, 181), fill=(236, 236, 236))
+    ImageDraw.Draw(picture).rectangle((52, 160, 243, 181), fill=(233, 233, 233))
+    ImageDraw.Draw(picture).rectangle((244, 160, 305, 181), fill=(116, 116, 116))
+    return picture
+
+
+def test_save_box_is_found_in_a_picture():
+    found = find_save_box(box_picture(), (0, -20))
+    assert found == {"dont_save": (98, 150), "cancel": (203, 150), "save": (276, 150)}
+    assert find_save_box(Image.new("RGB", (704, 660), (116, 116, 116))) is None
+    assert find_save_box(Image.new("RGB", (704, 660), (236, 236, 236))) is None
+    assert find_save_box(Image.new("RGB", (20, 20), (116, 116, 116))) is None
+
+
+def test_a_save_that_writes_nothing_is_an_error(bryce, tmp_path):
+    controller, backend = bryce
+    with_menu(backend)
+    backend.on_menu = lambda item: backend.open_dialogs.append(a_file_dialog())
+    with pytest.raises(UnexpectedScreen, match="did not write"):
+        controller.save_scene(str(tmp_path / "a"), confirm=True, timeout=3)
+
+
+def test_a_half_written_file_is_not_called_saved(bryce, tmp_path):
+    controller, backend = bryce
+    with_menu(backend)
+    backend.on_menu = lambda item: backend.open_dialogs.append(a_file_dialog())
+
+    def partial(path):
+        with open(path, "wb") as handle:
+            handle.write(b"CCmF")
+
+    backend.on_fill = partial
+    with pytest.raises(UnexpectedScreen, match="did not write"):
+        controller.save_scene(str(tmp_path / "a"), confirm=True, timeout=3)
+
+
+def test_answering_the_save_box(bryce):
+    controller, backend = bryce
+    with pytest.raises(UnexpectedScreen, match="not on screen"):
+        controller.answer_save_box("cancel")
+    backend.capture = box_picture()
+    backend.box_closes_on_click = True
+    with pytest.raises(ConfirmationRequired):
+        controller.answer_save_box("dont_save")
+    assert backend.log == []
+    assert controller.answer_save_box("cancel")["answered"] == "cancel"
+    assert backend.log[0][:2] == ("click", (203, 150))
+    assert backend.log[-1] == ("end",)
+
+
+def test_nothing_is_sent_while_bryce_is_asking(bryce, scene_file):
+    controller, backend = bryce
+    backend.capture = box_picture()
+    with pytest.raises(UnexpectedScreen, match="already asking"):
+        controller.open_scene(scene_file, confirm=True)
+    assert backend.log == []
+
+
+def test_discarding_answers_a_box_that_appears_anyway(bryce, scene_file):
+    controller, backend = bryce
+    backend.counters, backend.box_closes_on_click = {}, True
+    backend.on_open = lambda path: setattr(backend, "capture", box_picture())
+    controller.open_scene(scene_file, confirm=True, discard_changes=True)
+    assert ("click", (98, 150), 1) in backend.log
+
+
+def test_a_box_is_left_alone_unless_discarding_was_asked(bryce, scene_file):
+    controller, backend = bryce
+    backend.counters = {}
+    backend.on_open = lambda path: setattr(backend, "capture", box_picture())
+    with pytest.raises(UnexpectedScreen, match="answer_save_box"):
+        controller.open_scene(scene_file, confirm=True)
+    assert not [e for e in backend.log if e[0] == "click"]
+
+
+def test_load_saves_first_when_asked(bryce, scene_file, tmp_path):
+    controller, backend = bryce
+    with_menu(backend)
+    backend.unsaved = True
+    backend.on_menu = lambda item: backend.open_dialogs.append(a_file_dialog())
+    backend.on_fill = write_scene
+    with pytest.raises(BryceError, match="save_current_to"):
+        controller.load_file(scene_file, unsaved="save", confirm=True)
+    with pytest.raises(ConfirmationRequired):
+        controller.load_file(scene_file, confirm=True)
+    assert backend.log == []
+    result = controller.load_file(scene_file, unsaved="save", confirm=True,
+                                  save_current_to=str(tmp_path / "keep"))
+    assert result["saved_first"]["verified"]
+    steps = [e[0] for e in backend.log]
+    assert steps.index("fill_dialog") < steps.index("open_file")
+
+
+def test_load_does_not_open_if_the_save_fails(bryce, scene_file, tmp_path):
+    controller, backend = bryce
+    with_menu(backend)
+    backend.unsaved = True
+    with pytest.raises(BryceError):
+        controller.load_file(scene_file, unsaved="save", confirm=True,
+                             save_current_to=str(tmp_path / "keep"))
+    assert not [e for e in backend.log if e[0] in ("open_file", "forget")]

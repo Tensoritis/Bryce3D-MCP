@@ -15,7 +15,7 @@ from __future__ import annotations
 import math
 import struct
 
-from . import heightfield
+from . import heightfield, trimesh
 from .ccmf import CompositeFile
 from .errors import BryceError
 
@@ -45,7 +45,8 @@ SKY_CACHE = {
     "MaxIllScl": 720, "LinkColBl": 728, "LinkValBl": 736, "RingInt": 744,
     "RingPriWid": 752, "RingSecWid": 760, "RBowVisi": 776, "RBowPriWid": 784,
     "RBowSecWid": 792, "VisiAirDen": 832, "WindDir": 840, "WindSpeed": 848,
-    "WindTurb": 856,
+    "WindTurb": 856, "MoonPhAng": 680, "MoonPhES": 688, "MoonPhTA": 696,
+    "MoonPhHard": 704,
 }
 SUN_CACHE = {"DiscClr": 836, "HaloClr": 848, "SunVctr": 860}
 
@@ -110,6 +111,7 @@ MATERIAL_COLOURS = {name: spec[2] for name, spec in MATERIAL_CHANNELS.items()
 MATERIAL_VALUES = {name: spec[2] for name, spec in MATERIAL_CHANNELS.items()
                    if not name.endswith("color")}
 _TEXTURED_FLAG = 0x10000000
+_TEXTURE_SCALE = 276          # three doubles in a texture record, one per axis
 _SHOWN = ("color", "diffuse", "ambient", "specular", "transparency", "reflection",
           "bump", "refraction")
 
@@ -181,10 +183,15 @@ def world_centre(position, origin, scale, rotation) -> list[float]:
     return [position[j] + sum(local[i] * matrix[i][j] for i in range(3)) for j in range(3)]
 
 
-def camera_matrix(pitch: float, heading: float) -> list[list[float]]:
-    """The camera record's cached matrix, from its stored angles in radians."""
+def camera_matrix(pitch: float, heading: float, bank: float = 0.0) -> list[list[float]]:
+    """The camera record's cached matrix, from its stored angles in radians. Its rows
+    are the camera's right, up and forward directions; bank rolls the first two."""
     cp, sp, cy, sy = math.cos(pitch), math.sin(pitch), math.cos(heading), math.sin(heading)
-    return [[cy, 0.0, -sy], [sp * sy, cp, sp * cy], [cp * sy, -sp, cp * cy]]
+    right, up = [cy, 0.0, -sy], [sp * sy, cp, sp * cy]
+    cb, sb = math.cos(bank), math.sin(bank)
+    return [[cb * r + sb * u for r, u in zip(right, up)],
+            [cb * u - sb * r for r, u in zip(right, up)],
+            [cp * sy, -sp, cp * cy]]
 
 
 def quaternion_from_matrix(m) -> tuple[float, float, float, float]:
@@ -468,11 +475,50 @@ class Br3:
                         f"{round(max(0.0, min(1.0, v)) * 255):02x}" for v in value)
             elif math.isfinite(value) and abs(value) < 1000:
                 out[label] = round(value, 4)
-        textured = {name: self._texture_name(ref)
-                    for name, ref in self._textures(material).items()}
+        used = self._textures(material)
+        textured = {name: self._texture_name(ref) for name, ref in used.items()}
         if textured:
             out["textures"] = textured
+            scales = {self._texture_name(ref): self.texture_scale_of(ref)
+                      for ref in used.values()}
+            if any(value is not None for value in scales.values()):
+                out["texture_scales"] = scales
         return out
+
+    def texture_scale_of(self, ref: Ref) -> list[float] | None:
+        """The three scale numbers of a texture record, if it has plausible ones."""
+        if ref[0] != "C3dTexture":
+            return None
+        payload = self._payload(ref)
+        if len(payload) < _TEXTURE_SCALE + 24:
+            return None
+        values = struct.unpack_from("<3d", payload, _TEXTURE_SCALE)
+        if not all(math.isfinite(v) and 1e-6 < abs(v) < 1e6 for v in values):
+            return None
+        return [round(v, 5) for v in values]
+
+    def scale_texture(self, name: str, factor, channels: list[str] | None = None) -> dict:
+        """Multiply the scale numbers of the textures on an object's material."""
+        factors = ([_number(factor, "factor")] * 3
+                   if isinstance(factor, (int, float)) and not isinstance(factor, bool)
+                   else list(_triple(factor, "factor")))
+        if not all(1e-3 <= f <= 1e3 for f in factors):
+            raise BryceError("texture scale factors must be between 0.001 and 1000")
+        material = self._own_material(name)
+        used = self._textures(material)
+        wanted = list(used) if channels is None else channels
+        missing = [c for c in wanted if c not in used]
+        if missing or not wanted:
+            raise BryceError(f"no texture on {', '.join(missing) or 'any channel'} of "
+                             f"{name!r}; textured channels: {', '.join(used) or 'none'}")
+        for ref in {used[c] for c in wanted}:
+            if self.texture_scale_of(ref) is None:
+                raise BryceError(f"the scale of {self._texture_name(ref)!r} cannot be "
+                                 "changed (it is not a procedural 3D texture)")
+            values = struct.unpack_from("<3d", self._payload(ref), _TEXTURE_SCALE)
+            self._write(ref, _TEXTURE_SCALE, struct.pack(
+                "<3d", *(v * f for v, f in zip(values, factors))))
+        return self.material(self.find(name)[1])
 
     def _texture_name(self, ref: Ref) -> str:
         return self._payload(ref)[8:40].split(b"\0")[0].decode("latin-1") or ref[0]
@@ -635,13 +681,28 @@ class Br3:
         flags = struct.unpack_from("<I", self._payload(ref), _FLAGS)[0]
         self._write(ref, _FLAGS, struct.pack("<I", (flags & ~0x38) | BOOLEAN_BITS[mode]))
 
+    def _local_extent(self, kind: str, key: Ref) -> list[float]:
+        """How big an object is in its own space. Bryce's shapes span -1 to 1; a
+        mesh has whatever its points span."""
+        if kind == "mesh":
+            try:
+                points = trimesh.decode(self._payload(key))[0]
+            except BryceError:
+                points = []
+            if points:
+                spans = [max(p[a] for p in points) - min(p[a] for p in points)
+                         for a in range(3)]
+                return [span if span > 1e-9 else 2.0 for span in spans]
+        return [2.0] * 3
+
     def describe(self, kind: str, key: Ref) -> dict:
         info = {"name": self._name(key), "kind": kind}
         position, origin, scale, rotation = self.transform(key)
         info["position"] = [round(v * UNIT, 3) + 0.0
                             for v in world_centre(position, origin, scale, rotation)]
         info["scale"] = [round(v, 4) for v in scale]
-        info["size"] = [round(v * PRIMITIVE_SIZE, 2) for v in scale]
+        info["size"] = [round(v * extent * UNIT, 2)
+                        for v, extent in zip(scale, self._local_extent(kind, key))]
         info["rotation"] = [round(v, 2) + 0.0 for v in euler_from_quaternion(rotation)]
         if self.boolean_of(key) != "neutral":
             info["boolean"] = self.boolean_of(key)
@@ -663,7 +724,8 @@ class Br3:
         if scale is not None and size is not None:
             raise BryceError("give scale or size, not both")
         if size is not None:
-            scale = [v / PRIMITIVE_SIZE for v in _triple(size, "size")]
+            scale = [v / (extent * UNIT) for v, extent in
+                     zip(_triple(size, "size"), self._local_extent(kind, key))]
         if scale is not None:
             scale = _triple(scale, "scale")
             if min(scale) <= 0:
@@ -791,6 +853,65 @@ class Br3:
         if material:
             self.set_material(final, material, library)
         return self.set_object(final, library=library, **settings)
+
+    def add_mesh(self, vertices, faces, *, name: str | None = None,
+                 library: "Br3 | None" = None, position=None, scale=None, size=None,
+                 rotation=None, material: dict | None = None,
+                 smooth_angle: float = trimesh.DEFAULT_CREASE) -> dict:
+        """Create a new mesh object from points (Bryce units) and faces listed
+        counter-clockwise from outside. Without a position it stays where its points
+        are. An existing mesh (a stone) supplies everything but the geometry."""
+        if scale is not None and size is not None:
+            raise BryceError("give scale or size, not both")
+        points, triangles = trimesh.prepare(vertices, faces)
+        low = [min(p[a] for p in points) for a in range(3)]
+        high = [max(p[a] for p in points) for a in range(3)]
+        middle = [(lo + hi) / 2 for lo, hi in zip(low, high)]
+        half = max(hi - lo for lo, hi in zip(low, high)) / 2
+        if not half > 0:
+            raise BryceError("the mesh has no size")
+        # Like Bryce's own shapes, keep the geometry within -1..1 and let the
+        # object's scale give it its size.
+        local = [[(p[a] - middle[a]) / half for a in range(3)] for p in points]
+        if size is not None:
+            wanted = _triple(size, "size")
+            extent = [hi - lo for lo, hi in zip(low, high)]
+            scale = [w / e if e > 1e-9 else 1.0 for w, e in zip(wanted, extent)]
+        factors = [1.0] * 3 if scale is None else _triple(scale, "scale")
+        if min(factors) <= 0:
+            raise BryceError("scale and size must be positive")
+        kind = "mesh"
+        for source in (library, self):
+            if source is None:
+                continue
+            donor = next((k for found, k in source._objects() if found == kind), None)
+            if donor is not None:
+                break
+        else:
+            raise BryceError("no mesh to copy. In Bryce, add a stone (or import any model) "
+                             "to your template scene and save it.")
+        payload = trimesh.encode(source._payload(donor), local, triangles, smooth_angle)
+        self.add_object(kind, name=name if name is not None else self._unique_name("Mesh"),
+                        library=library, template=source._name(donor), position=[0, 0, 0])
+        final = self._name(self._objects()[-1][1])
+        ref = self.find(final)[1]
+        current = self._payload(ref)
+        self.file.replace(self._entry(ref),
+                          current[:trimesh.HEADER] + payload[trimesh.HEADER:])
+        centre = middle if position is None else _triple(position, "position")
+        self.place(ref, [c / UNIT for c in centre],
+                   [f * half / UNIT for f in factors],
+                   quaternion_from_euler(rotation or (0, 0, 0)), library)
+        if material:
+            self.set_material(final, material, library)
+        info = self.describe(kind, ref)
+        info["triangles"] = len(triangles)
+        return info
+
+    def mesh_geometry(self, ref: Ref) -> tuple[list, list]:
+        """A mesh object's points (in its own space) and outward triangles."""
+        points, _, triangles = trimesh.decode(self._payload(ref))
+        return points, [(t[0], t[2], t[1]) for t in triangles]
 
     def _resting_position(self, source: "Br3", key: Ref, settings: dict):
         """When a resized solid has no position, keep it standing on the ground."""
@@ -1094,7 +1215,20 @@ class Br3:
             raise BryceError(f"unknown sky settings {unknown}; use {sorted(tracks)}")
         for label, value in settings.items():
             self._set_setting(tracks[label], value, label)
+            self._cache_setting("C3dBaseSky", SKY_CACHE.get(label), tracks[label])
         return self.sky()
+
+    def _cache_setting(self, owner_class: str, offset: int | None, track: Ref) -> None:
+        """Copy a setting record's value into its owner's cached copy, which is
+        what Bryce draws from when it opens a scene."""
+        if offset is None:
+            return
+        _, form, value = self._setting(track)
+        if form is None:
+            return
+        shape = {"colour": "<3f", "vector": "<3d"}.get(form, "<d")
+        values = value if form in ("colour", "vector") else (value,)
+        self._write(self._first(owner_class), offset, struct.pack(shape, *values))
 
     def sun(self) -> dict:
         tracks = self._scene_settings("C3dSunLight", "SunL_e")
@@ -1122,6 +1256,7 @@ class Br3:
         for label, value in (("DiscClr", disc_color), ("HaloClr", halo_color)):
             if value is not None:
                 self._set_setting(tracks[label], value, label)
+                self._cache_setting("C3dSunLight", SUN_CACHE[label], tracks[label])
         return self.sun()
 
     # The camera stores x and z negated and its heading turned by half a circle
@@ -1157,7 +1292,7 @@ class Br3:
                 "fov": round(math.degrees(fov), 2)}
 
     def set_camera(self, position=None, heading=None, pitch=None, fov=None,
-                   look_at=None) -> dict:
+                   look_at=None, bank=None) -> dict:
         """Move both the Director's View and the Camera View, so the render is the
         same whichever of the two Bryce is showing. Anything not given is taken from
         the Director's View."""
@@ -1174,15 +1309,18 @@ class Br3:
         heading = current["heading"] if heading is None else _number(heading, "heading")
         pitch = current["pitch"] if pitch is None else _number(pitch, "pitch")
         fov = current["fov"] if fov is None else _number(fov, "fov")
+        bank = current["bank"] if bank is None else _number(bank, "bank")
+        if not -180 <= bank <= 180:
+            raise BryceError("bank must be -180 to 180 degrees")
         if not -90 <= pitch <= 90:
             raise BryceError("pitch must be -90 to 90 degrees")
         if not 1 <= fov <= 170:
             raise BryceError("fov must be 1-170 degrees")
 
         turn = math.radians((heading + 180) % 360 - 180)
-        tilt, lens = math.radians(-pitch), math.radians(fov)
+        tilt, lens, roll = math.radians(-pitch), math.radians(fov), math.radians(bank)
         stored = [v / UNIT for v in position]
-        matrix = [v for row in camera_matrix(tilt, turn) for v in row]
+        matrix = [v for row in camera_matrix(tilt, turn, roll) for v in row]
         keys = [k for k in (self._camera_key("perspective"), self._camera_key("director"))
                 if k is not None] or [self._first(_CAMERA)]
         for key in keys:
@@ -1190,13 +1328,12 @@ class Br3:
                 self._set_vector(key, "Obj_ePosition", stored)
                 if self._linked(key, "Obj_eOrigin") is not None:
                     self._set_vector(key, "Obj_eOrigin", [0.0, 0.0, 0.0])
-                angles = list(self._vector(key, "Cam_eCraOrient"))
-                self._set_vector(key, "Cam_eCraOrient", [tilt, turn, angles[2]])
+                self._set_vector(key, "Cam_eCraOrient", [tilt, turn, roll])
                 self._set_vector(key, "Cam_eFOV", [lens])
             self._write(key, _CAMERA_OFFSET, struct.pack("<3d", 0.0, 0.0, 0.0))
             self._write(key, _CAMERA_MATRIX, struct.pack("<9d", *matrix))
             self._write(key, _CAMERA_TRANSLATION, struct.pack("<3d", *stored))
-            self._write(key, _CAMERA_ANGLES, struct.pack("<2d", tilt, turn))
+            self._write(key, _CAMERA_ANGLES, struct.pack("<3d", tilt, turn, roll))
             self._write(key, _CAMERA_FOV, struct.pack("<d", lens))
         return self.camera()
 

@@ -75,8 +75,46 @@ def sky(preset, azimuth, altitude):
             {"op": "sun", "azimuth": azimuth, "altitude": altitude}]
 
 
-def camera(position, look_at, fov=60):
-    return {"op": "camera", "position": position, "look_at": look_at, "fov": fov}
+def camera(position, look_at, fov=60, bank=0):
+    return {"op": "camera", "position": position, "look_at": look_at, "fov": fov,
+            "bank": bank}
+
+
+def jagged_arch(centre, radius, thickness, seed=11, along=72, around=18):
+    """A craggy stone arch bristling with spikes, made as one new mesh. It runs a
+    little below the ground at both feet."""
+    rng = random.Random(seed)
+    start, end = math.radians(-14), math.radians(194)
+    vertices, faces = [], []
+    for i in range(along + 1):
+        angle = start + (end - start) * i / along
+        out = (math.cos(angle), math.sin(angle), 0.0)
+        swell = 1 + 0.35 * abs(math.cos(angle)) ** 2          # heavier toward the feet
+        for j in range(around):
+            turn = math.tau * j / around
+            rough = rng.uniform(0.74, 1.22)
+            across = thickness * swell * rough
+            # Spikes grow from the outer side.
+            if math.cos(turn) > 0.2 and 3 < i < along - 3 and rng.random() < 0.075:
+                across += thickness * rng.uniform(0.9, 2.1)
+            lift = math.cos(turn) * across
+            vertices.append([centre[0] + out[0] * (radius + lift),
+                             centre[1] + out[1] * (radius + lift),
+                             centre[2] + math.sin(turn) * thickness * swell * rough])
+    for i in range(along):
+        for j in range(around):
+            a, b = i * around + j, i * around + (j + 1) % around
+            c, d = b + around, a + around
+            faces += [[a, b, c], [a, c, d]]
+    for ring, flip in ((0, True), (along, False)):             # close both ends
+        hub = len(vertices)
+        points = vertices[ring * around:(ring + 1) * around]
+        vertices.append([sum(p[k] for p in points) / around for k in range(3)])
+        for j in range(around):
+            a, b = ring * around + j, ring * around + (j + 1) % around
+            faces.append([hub, b, a] if flip else [hub, a, b])
+    return {"op": "mesh", "shape": "custom", "name": "Arch", "vertices": vertices,
+            "faces": faces, "smooth_angle": 25}
 
 
 # 1 -------------------------------------------------------------------------------
@@ -155,7 +193,7 @@ def dream_sea():
 # 2 -------------------------------------------------------------------------------
 def silver_drops():
     ops = [*sky("Arctic Horizon", 300, 32), *sea("Still Water", "#4f8fe8", 0.62, 0.09),
-           camera([0, 46, -170], [0, 34, -50], 64)]
+           camera([0, 46, -170], [0, 34, -50], 64, bank=-9)]
     for name, position, diameter in (("Drop Giant", (-34, 67, -78), 36),
                                      ("Drop", (5, 14, -62), 27),
                                      ("Drop High", (34, 66, -48), 15)):
@@ -224,23 +262,9 @@ def far_world():
            add("sphere", "Giant Planet", [-330, 250, 620], [520, 520, 520]),
            paint("Giant Planet", "Flat White", color="#e3a6b8", ambient=0.72, diffuse=0.35,
                  transparency=0.12, refraction=1.0)]
-    # The arch: a standing torus half sunk in the ground, bristling with spires.
-    ops += [add("torus", "Arch", [42, 12, 40], [92, 96, 34]), *rocky("Arch", color="#3f3a38")]
+    # The arch: one new mesh, craggy and bristling with spikes.
     rng = random.Random(11)
-    for n in range(26):
-        angle = math.pi * (n + 0.5) / 26
-        reach = rng.uniform(38, 47)
-        height = rng.uniform(9, 24)
-        spot = [42 + reach * math.cos(angle), 12 + reach * math.sin(angle) + height * 0.2,
-                40 + rng.uniform(-7, 7)]
-        name = f"Spire {n}"
-        lean = [0, 0, round(math.degrees(angle) - 90) * 0.45]
-        if n == 0:
-            ops += [add("cone", name, spot, [8, height, 8], rotation=lean),
-                    *rocky(name, color="#3f3a38")]
-        else:
-            ops.append(copy("Spire 0", name, spot, size=[rng.uniform(5, 10), height, 8],
-                            rotation=lean))
+    ops += [jagged_arch((42, 8, 40), 42, 9), *rocky("Arch", color="#3f3a38")]
     for n, (preset, x, z, width, height) in enumerate((
             ("Stalagmites", 80, 52, 62, 34), ("Mt. Baldy", 0, 56, 56, 24),
             ("Mt. Baldy", 104, 70, 70, 20))):
@@ -277,7 +301,7 @@ def far_world():
 # 5 -------------------------------------------------------------------------------
 def colour_generation():
     ops = [*sky("Cold Storm Coming", 250, 30), *sea("Violet Sea", "#28307a", 0.4, 0.26),
-           camera([0, 52, -192], [0, 40, -40])]
+           camera([0, 52, -192], [0, 40, -40], bank=11)]
 
     def glass(name, colour, see_through=0.55):
         return wear(name, "Mirror", color=colour, diffuse=0.55, ambient=0.18, reflection=0.22,
@@ -335,28 +359,72 @@ def build(names, templates_path=None, install=None, out=None) -> list[str]:
     return written
 
 
-def render(names, timeout=1800) -> None:
-    """Open and render each scene in the running Bryce using window messages."""
+def prepare(ask=input) -> bool:
+    """Offer the bridge and settle what happens to unsaved work, before anything
+    in Bryce is touched. Returns False if the user stops here."""
+    print("The bridge is a small DLL from this project, loaded into the running Bryce. It")
+    print("detects unsaved work, follows renders and can press Render with a virtual")
+    print("mouse. It is gone when you close Bryce.")
+    if ask("Load the bridge? [Y/n] ").strip().lower() in ("", "y", "yes"):
+        try:
+            print(json.dumps(server.connect_bridge()))
+        except Exception as error:
+            print(f"The bridge could not be loaded: {error}")
+            if ask("Continue without it? [y/N] ").strip().lower() not in ("y", "yes"):
+                return False
+    unsaved = server.get_controller().backend.unsaved_changes()
+    if unsaved:
+        print("Bryce has UNSAVED CHANGES. Save them in Bryce now, or type DISCARD.")
+        if ask("Press Enter after saving, or type DISCARD: ").strip() == "DISCARD":
+            server.get_controller().backend.forget_changes()
+        elif server.get_controller().backend.unsaved_changes():
+            print("There are still unsaved changes, so nothing was opened.")
+            return False
+    elif unsaved is None:
+        print("Without the bridge, save your work in Bryce now.")
+        ask("Press Enter when it is saved: ")
+    return True
+
+
+def render(names, timeout=1800) -> bool:
+    """Open and render each scene in the running Bryce. Stops at the first problem,
+    so that one failed step cannot upset the following ones."""
     results = {}
-    for name in names:
+    log = os.path.join(folder(), "render_log.json")
+    for number, name in enumerate(names):
         scene = os.path.join(folder(), name + ".br3")
         if not os.path.isfile(scene):
             build([name])
         print(f"rendering {name} (this can take several minutes)...", flush=True)
         controller = server.get_controller()
         try:
-            result = controller.open_and_render(scene, confirm=True, timeout=timeout,
-                                                settle=20, poll=4)
+            # After the first scene, what is "unsaved" is the render of the one
+            # this script opened itself.
             picture = os.path.join(folder(), name + "_render.png")
-            controller.render_picture().save(picture)
-            result["picture"] = picture
-        except Exception as error:                      # report and carry on
-            result = {"error": f"{type(error).__name__}: {error}"}
+            result = controller.render_to_file(
+                scene, picture, timeout=timeout,
+                discard_changes=number > 0 and controller.backend.unsaved_changes() is True)
+            if not result["finished"]:
+                controller.render_picture().save(picture)
+                result["picture"] = picture
+        except Exception as error:
+            result = {"finished": False, "error": f"{type(error).__name__}: {error}"}
+            try:
+                picture = os.path.join(folder(), name + "_problem.png")
+                with open(picture, "wb") as handle:
+                    handle.write(controller.screenshot_png())
+                result["picture"] = picture
+            except Exception:
+                pass
         results[name] = result
-        print(json.dumps(result), flush=True)
-        with open(os.path.join(folder(), "render_log.json"), "w", encoding="utf-8") as handle:
+        print(json.dumps({k: v for k, v in result.items() if k != "timeline"}), flush=True)
+        with open(log, "w", encoding="utf-8") as handle:
             json.dump(results, handle, indent=1)
+        if not result.get("finished"):
+            print(f"Stopped at {name}. Send {log} and the pictures in {folder()}.")
+            return False
     print(f"Done. Pictures and render_log.json are in {folder()}")
+    return True
 
 
 def main(argv) -> None:
@@ -365,7 +433,10 @@ def main(argv) -> None:
     unknown = [n for n in names if n not in SCENES]
     if action not in ("build", "render") or unknown:
         raise SystemExit(f"usage: gallery.py build|render [{' '.join(SCENES)}]")
-    (build if action == "build" else render)(names)
+    if action == "build":
+        build(names)
+    elif prepare():
+        render(names)
 
 
 if __name__ == "__main__":

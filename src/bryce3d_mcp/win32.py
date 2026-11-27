@@ -243,6 +243,28 @@ class Win32Backend:
         self.user32.GetClassNameW(hwnd, name, len(name))
         return name.value
 
+    def window_ids(self) -> set[int]:
+        """Bryce's visible top-level windows: a new one is a box Bryce has put up."""
+        return set(self._windows())
+
+    def process_id(self) -> int:
+        return self._pid(self._find_window(_MAIN_WINDOW_CLASS))
+
+    def end(self) -> None:
+        """Nothing to hand back: SendInput leaves no state behind."""
+
+    def activity(self) -> None:
+        """Only the bridge can see how busy Bryce is."""
+        return None
+
+    def unsaved_changes(self) -> None:
+        """Only the bridge can tell."""
+        return None
+
+    def forget_changes(self) -> None:
+        raise BryceError("only the bridge can discard Bryce's unsaved changes; call "
+                         "bryce_connect_bridge, or save or answer the question in Bryce")
+
     def begin(self) -> None:
         self.hwnd = self._find_window()
         if not self._is_bryce(self.user32.GetForegroundWindow()):

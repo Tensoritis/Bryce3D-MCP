@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from . import heightfield, presets, terrain
+import os
+
+from . import heightfield, meshes, presets, terrain, trimesh
 from .br3 import BOOLEAN_BITS, KINDS, MATERIAL_COLOURS, MATERIAL_VALUES, Br3
 from .errors import BryceError
 
@@ -13,6 +15,14 @@ _PLACEMENT = ("position", "scale", "size", "rotation", "material", "boolean")
 OPERATIONS = {
     "add": (("kind",), ("name", "template", *_PLACEMENT),
             "Add an object copied from the template file."),
+    "mesh": (("shape",), ("name", "outline", "height", "profile", "segments", "vertices",
+                          "faces", "obj_path", "smooth_angle", "position", "scale", "size",
+                          "rotation", "material", "boolean"),
+             "Create a NEW 3D shape. shape extrude (outline [[x,z],...] and height), lathe "
+             "(profile [[radius,y],...] bottom to top, segments), custom (vertices and "
+             "zero-based faces, counter-clockwise from outside) or obj (obj_path). Numbers "
+             "are Bryce units. Edges sharper than smooth_angle degrees (40) stay crisp. "
+             "Needs one mesh, such as a stone, in the template scene."),
     "set": (("name",), ("new_name", *_PLACEMENT), "Change an existing object."),
     "duplicate": (("name",), ("new_name", *_PLACEMENT), "Copy an object in this scene."),
     "delete": (("name",), (), "Remove an object or a whole group."),
@@ -29,14 +39,20 @@ OPERATIONS = {
     "texture": (("name", "texture", "channels"), ("strength",),
                 "Drive material channels (for example bump) with a Bryce texture, found "
                 "by name. BasicSin24 on bump makes ripples."),
+    "texture_scale": (("name", "factor"), ("channels",),
+                      "Multiply a procedural texture's scale numbers (one factor, or [x, "
+                      "y, z]) to change the size of its pattern, for example ripples or a "
+                      "checkerboard. br3_info lists the current numbers. Preview does not "
+                      "show it: render once to see which way a factor goes."),
     "sky_preset": (("preset",), ("library",),
                    "Take the sky and sun of one of Bryce's sky presets."),
     "terrain": (("name",), ("operations", "heightmap_path"),
                 "Reshape a terrain object: start from its heights or a picture, then apply "
                 "terrain_operations."),
-    "camera": ((), ("position", "heading", "pitch", "look_at", "fov"),
+    "camera": ((), ("position", "heading", "pitch", "bank", "look_at", "fov"),
                "Move or aim the render camera. heading 0 looks along +z, 90 along +x; "
-               "pitch is positive upwards; fov is in degrees across the picture's diagonal."),
+               "pitch is positive upwards; bank tilts the picture (positive makes the "
+               "horizon drop on the right); fov is in degrees across the picture's diagonal."),
     "sun": ((), ("azimuth", "altitude", "disc_color", "halo_color"),
             "Aim the sun. Bryce stores it relative to the camera: azimuth 0 is ahead of "
             "the camera, 90 to its right, 180 behind it."),
@@ -139,10 +155,14 @@ def _run(scene: Br3, op: str, fields: dict, sources: _Sources):
                   sources.donor("Tutorial.obp"), sources.donor("Simple&Fast.mat")]
         return scene.set_texture(fields["name"], fields["texture"], fields["channels"],
                                  others, fields.get("strength"))
+    if op == "texture_scale":
+        return scene.scale_texture(fields["name"], fields["factor"], fields.get("channels"))
     if op == "sky_preset":
         found, source = sources.preset("skies", fields)
         scene.apply_sky_preset(source, found.key)
         return {"sky_preset": found.name, "sun": scene.sun()}
+    if op == "mesh":
+        return _mesh(scene, library, fields)
     if op == "add":
         material, boolean = fields.pop("material", None), fields.pop("boolean", None)
         info = scene.add_object(fields.pop("kind"), library=library, **fields)
@@ -188,3 +208,28 @@ def _run(scene: Br3, op: str, fields: dict, sources: _Sources):
         return {"sun": scene.set_sun(**fields)}
     scene.set_sky(fields["settings"])
     return {"sky_changed": sorted(fields["settings"])}
+
+
+def _mesh(scene: Br3, library: Br3 | None, fields: dict) -> dict:
+    shape, boolean = fields.pop("shape"), fields.pop("boolean", None)
+    outline, height = fields.pop("outline", None), fields.pop("height", None)
+    profile, segments = fields.pop("profile", None), fields.pop("segments", 32)
+    vertices, faces = fields.pop("vertices", None), fields.pop("faces", None)
+    obj_path = fields.pop("obj_path", None)
+    if shape == "extrude" and outline is not None and height is not None:
+        vertices, faces = meshes.extrude(outline, height)
+    elif shape == "lathe" and profile is not None:
+        vertices, faces = meshes.lathe(profile, segments)
+    elif shape == "obj" and obj_path is not None:
+        if os.path.getsize(obj_path) > 20_000_000:
+            raise BryceError("the OBJ file is larger than 20 MB")
+        with open(obj_path, encoding="utf-8", errors="replace") as handle:
+            vertices, faces = trimesh.parse_obj(handle.read())
+    elif not (shape == "custom" and vertices is not None and faces is not None):
+        raise BryceError("shape needs: extrude with outline and height, lathe with "
+                         "profile, custom with vertices and faces, or obj with obj_path")
+    info = scene.add_mesh(vertices, faces, library=library, **fields)
+    if boolean:
+        scene.set_boolean(scene.find(info["name"])[1], boolean)
+        info["boolean"] = boolean
+    return info

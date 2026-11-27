@@ -13,6 +13,7 @@ def backend(monkeypatch, tmp_path):
     fake = FakeBackend()
     monkeypatch.setattr(server, "_controller", BryceController(fake))
     monkeypatch.setenv("BRYCE3D_OUTPUT_DIR", str(tmp_path))
+    monkeypatch.setenv("BRYCE3D_REAL_INPUT", "1")
     return fake
 
 
@@ -27,7 +28,22 @@ def test_tool_list(backend):
     assert {"br3_render", "bryce_command", "bryce_file_command", "bryce_dialogs",
             "press_dialog_button"} <= names
     assert "br3_presets" in names
-    assert len(names) == 46
+    assert {"bryce_connect_bridge", "bryce_disconnect_bridge", "load_file", "save_scene",
+            "answer_save_box", "open_lab", "br3_animate", "br3_render_animation"} <= names
+    assert len(names) == 53
+
+
+def test_the_real_mouse_is_never_used_unasked(backend, monkeypatch):
+    monkeypatch.delenv("BRYCE3D_REAL_INPUT")
+    for call in (lambda: server.click(1, 1), lambda: server.hover(1, 1),
+                 lambda: server.press_keys("escape"), lambda: server.create_object("cube"),
+                 lambda: server.render(mode="button"),
+                 lambda: server.render(dismiss_report=True)):
+        with pytest.raises(server.ToolError, match="bryce_connect_bridge"):
+            call()
+    assert backend.log == []
+    with pytest.raises(server.ToolError, match="confirm=true"):
+        server.bryce_connect_bridge()
 
 
 def test_build_through_tool_function(backend):
@@ -58,3 +74,12 @@ def test_error_text_reaches_the_agent(backend):
     with pytest.raises(server.ToolError, match="one non-modifier key"):
         backend.focused = True
         server.press_keys("ctrl")
+
+
+@pytest.mark.parametrize("lab, item", [("terrain", "Edit/Edit Object..."),
+                                       ("materials", "Edit/Edit Material..."),
+                                       ("motion", "Objects/Motion Lab...")])
+def test_labs_open_by_menu_message(backend, lab, item):
+    backend.menu_items = [{"path": item, "id": 42, "menu": 1, "enabled": True}]
+    server.open_lab(lab)
+    assert [e for e in backend.log if e[0] != "end"] == [("menu", 42)]

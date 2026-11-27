@@ -1,12 +1,16 @@
 """Groups, booleans, materials, textures and Bryce-style preset libraries, all
 against synthetic files."""
 
+import math
 import os
+import struct
 
+import numpy as np
 import pytest
 
 from bryce3d_mcp import presets, preview, sceneops
-from bryce3d_mcp.br3 import Br3, quaternion_from_euler, quaternion_from_matrix, rotation_matrix
+from bryce3d_mcp.br3 import (SKY_CACHE, Br3, camera_matrix, quaternion_from_euler,
+                             quaternion_from_matrix, rotation_matrix)
 from bryce3d_mcp.errors import BryceError
 from scene_files import (basic_scene, group_donor, material_library, sky_library,
                          template_scene)
@@ -188,3 +192,81 @@ def test_every_real_preset_applies():
             else:
                 scene.apply_sky_preset(source, found.key)
             reread(scene).summary()
+
+
+# -- camera tilt, sky caches, texture scale ---------------------------------------
+@pytest.mark.parametrize("bank", [-90, -12.5, 0, 12.5, 180])
+def test_banked_camera_matrix_stays_a_rotation(bank):
+    rows = camera_matrix(0.3, -1.1, math.radians(bank))
+    for i in range(3):
+        for j in range(3):
+            assert sum(a * b for a, b in zip(rows[i], rows[j])) == pytest.approx(
+                float(i == j), abs=1e-12)
+    assert rows[2] == camera_matrix(0.3, -1.1)[2]       # it rolls about the view axis
+
+
+def test_bank_is_written_to_the_cache_and_both_views(scene):
+    scene.set_camera(bank=15)
+    again = reread(scene)
+    for view in ("director", "perspective"):
+        assert again.camera(view)["bank"] == 15
+    key = again._camera_key("perspective")
+    assert struct.unpack_from("<9d", again._payload(key), 380)[1] == pytest.approx(
+        math.sin(math.radians(15)))
+    again.set_camera(fov=50)                            # kept unless given
+    assert again.camera()["bank"] == 15
+    with pytest.raises(BryceError, match="bank"):
+        again.set_camera(bank=400)
+
+
+def test_positive_bank_drops_the_right_end_of_the_horizon(scene):
+    def horizon(bank):
+        scene.set_camera(position=[0, 30, -140], heading=0, pitch=0, bank=bank)
+        view = preview._View(scene.camera(), 400, 300)
+        far = np.array([[-50000.0, 30, 100000], [50000.0, 30, 100000]])
+        return view.to_pixels(view.to_camera(far))[:, 1]
+
+    left, right = horizon(0)
+    assert left == pytest.approx(right)
+    left, right = horizon(10)
+    assert right > left + 20                            # picture rows count downwards
+    picture, _ = preview.render(scene, 200, 150)
+    assert picture.size == (200, 150)
+
+
+def test_sky_and_sun_changes_reach_the_cached_copies(scene):
+    scene.set_sky({"BaseC": [0.9, 0.1, 0.2], "ShadowInt": 0.6})
+    sky = reread(scene)._payload(scene._first("C3dBaseSky"))
+    assert struct.unpack_from("<3f", sky, SKY_CACHE["BaseC"]) == pytest.approx((0.9, 0.1, 0.2))
+    assert struct.unpack_from("<d", sky, SKY_CACHE["ShadowInt"])[0] == pytest.approx(0.6)
+
+
+def test_moon_phase_settings_have_cache_places():
+    assert [SKY_CACHE[n] for n in ("MoonPhAng", "MoonPhES", "MoonPhTA", "MoonPhHard")] \
+        == [680, 688, 696, 704]
+
+
+def textured_scene(scene, library, install):
+    return run(scene, library, install,
+               {"op": "material_preset", "name": "Cube 1", "preset": "Checker"})
+
+
+def test_texture_scale(scene, library, install):
+    scene = textured_scene(scene, library, install)
+    assert named(scene)["Cube 1"]["material"]["texture_scales"] == {
+        "checks": [0.25, 0.25, 0.5]}
+    scene = run(scene, library, install,
+                {"op": "texture_scale", "name": "Cube 1", "factor": 2})
+    assert named(scene)["Cube 1"]["material"]["texture_scales"]["checks"] == [0.5, 0.5, 1.0]
+    scene = run(scene, library, install, {"op": "texture_scale", "name": "Cube 1",
+                                          "factor": [1, 3, 0.5], "channels": ["color"]})
+    assert named(scene)["Cube 1"]["material"]["texture_scales"]["checks"] == [0.5, 1.5, 0.5]
+
+
+@pytest.mark.parametrize("change, message", [
+    ({"factor": 0}, "between"), ({"factor": 2, "channels": ["bump"]}, "no texture on bump")])
+def test_texture_scale_refusals(scene, library, install, change, message):
+    scene = textured_scene(scene, library, install)
+    with pytest.raises(BryceError, match=message):
+        sceneops.apply(scene, [{"op": "texture_scale", "name": "Cube 1", **change}],
+                       library, install)
