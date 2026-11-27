@@ -249,6 +249,20 @@ class BryceController:
         self.backend.key("ctrl+o")
         self.fill_file_dialog(os.path.abspath(path))
 
+    def open_by_message(self, path: str, confirm: bool = False) -> dict:
+        """Hand Bryce a file the way a second launch of Bryce would, without input."""
+        if not confirm:
+            raise ConfirmationRequired("opening a scene can discard unsaved work; "
+                                       "pass confirm=true once the user has agreed")
+        target = os.path.abspath(path)
+        if os.path.splitext(target)[1].lower() != ".br3":
+            raise BryceError("only .br3 scenes can be opened this way")
+        if not os.path.isfile(target):
+            raise BryceError(f"file not found: {target}")
+        self.backend.open_file(target)
+        return {"sent": target,
+                "note": "message delivered to Bryce's window; check that the scene opened"}
+
     def save_scene(self, path: str | None = None, confirm: bool = False) -> str | None:
         """Press Save (Ctrl+S). Bryce 3D has no shortcut for Save As: a scene that
         already has a file is saved over it, and only an unnamed one asks for a path."""

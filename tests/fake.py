@@ -85,6 +85,9 @@ class FakeBackend:
     def sleep(self, seconds):
         pass
 
+    def open_file(self, path):
+        self.log.append(("open_file", path))
+
     def foreground_class(self):
         return self.window_class
 

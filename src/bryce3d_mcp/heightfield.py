@@ -91,7 +91,8 @@ def uses_11_bits(payload: bytes) -> bool:
     return struct.unpack_from("<I", payload, 272)[0] == 8
 
 
-def encode(payload: bytes, heights: list[int], name: str | None = None) -> bytes:
+def encode(payload: bytes, heights: list[int], name: str | None = None,
+           raw_only: bool = False) -> bytes:
     """A copy of `payload` carrying new heights (same grid size)."""
     size = _check(payload)
     if len(heights) != size * size:
@@ -109,7 +110,7 @@ def encode(payload: bytes, heights: list[int], name: str | None = None) -> bytes
     body = raw.tobytes()
     packed = _run_length(heights)
     # Keep whichever is smaller, as the bundled files do.
-    if len(packed) < len(body):
+    if not raw_only and len(packed) < len(body):
         body = packed
         header[744:748] = _RLE_MARK
         struct.pack_into("<I", header, 748, len(body))

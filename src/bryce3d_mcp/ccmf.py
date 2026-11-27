@@ -22,6 +22,10 @@ from .errors import BryceError
 
 SIGNATURE = b"CCmF"
 _DIRECTORY_SIZE, _DIRECTORY_OFFSET = 0x24C, 0x250
+_DIRECTORY_CAPACITY, _DIRECTORY_USED, _DIRECTORY_STEP = 0x260, 0x264, 0x268
+_ENTRY_FLAGS = b"\x01\0\0\0"
+_CLASS_LIST, _CLASS_LIST_DESCRIPTOR = 16, 17
+CLASS_RECORD = 32
 MAX_FILE = 256 * 1024 * 1024
 
 
@@ -112,6 +116,68 @@ class CompositeFile:
         self.data += struct.pack(">III", len(payload), len(payload), 0) + payload
         struct.pack_into(">II", directory, entry * 12 + 4, len(payload), new_offset)
         self._write_spans(self._directory_spans(), bytes(directory))
+
+    def add_entry(self, payload: bytes = b"") -> int:
+        """Add a directory entry holding `payload` and return its number."""
+        used = self._u32(_DIRECTORY_USED)
+        capacity = self._u32(_DIRECTORY_CAPACITY)
+        directory = bytearray(self._directory())
+        if capacity * 12 != len(directory) or used > capacity:
+            raise BryceError("unsupported file: unexpected directory header")
+        grown = used == capacity
+        if grown:
+            step = self._u32(_DIRECTORY_STEP) or 128
+            capacity += step
+            directory += bytes(step * 12)
+        offset = 0
+        if payload:
+            offset = len(self.data)
+            self.data += struct.pack(">III", len(payload), len(payload), 0) + payload
+        struct.pack_into(">4sII", directory, used * 12, _ENTRY_FLAGS, len(payload), offset)
+        if grown:
+            moved = len(self.data)
+            self.data += struct.pack(">III", len(directory), len(directory), 0) + directory
+            struct.pack_into(">II", self.data, _DIRECTORY_SIZE, len(directory), moved)
+            struct.pack_into(">I", self.data, _DIRECTORY_CAPACITY, capacity)
+        else:
+            self._write_spans(self._directory_spans(), bytes(directory))
+        struct.pack_into(">I", self.data, _DIRECTORY_USED, used + 1)
+        return used
+
+    def set_table(self, data_entry: int, descriptor_entry: int, rows: list[bytes]) -> None:
+        """Replace all rows of a table, growing its capacity in Bryce's own steps."""
+        descriptor = bytearray(self.read(descriptor_entry))
+        if len(descriptor) < 16:
+            raise BryceError("corrupt file: bad table descriptor")
+        size, capacity, step, _ = struct.unpack_from(">4I", descriptor, 0)
+        if any(len(row) != size for row in rows):
+            raise BryceError("table rows have the wrong size")
+        while capacity < len(rows):
+            capacity += step or 32
+        payload = b"".join(rows).ljust(capacity * size, b"\0")
+        struct.pack_into(">4I", descriptor, 0, size, capacity, step, len(rows))
+        self.replace(data_entry, payload)
+        self.replace(descriptor_entry, bytes(descriptor))
+
+    def add_class(self, name: str, row_size: int, after: list[str] | None = None) -> tuple[int, int]:
+        """Create an empty class table. `after` lists class names it should follow."""
+        existing = self.classes()
+        if name in existing:
+            return existing[name]
+        if not 0 < len(name) < 16:
+            raise BryceError(f"bad class name {name!r}")
+        data_entry = self.add_entry(bytes(32 * row_size))
+        descriptor_entry = self.add_entry(struct.pack(">4I", row_size, 32, 32, 0) + bytes(16))
+        record = name.encode().ljust(16, b"\0") + struct.pack(">II", data_entry, descriptor_entry)
+        rows = [r.raw for r in self.table(_CLASS_LIST, _CLASS_LIST_DESCRIPTOR)]
+        names = [r.split(b"\0")[0].decode("latin-1") for r in (row[:16] for row in rows)]
+        position = 0 if after is not None else len(rows)
+        for earlier in after or []:
+            if earlier in names:
+                position = max(position, names.index(earlier) + 1)
+        rows.insert(position, record.ljust(CLASS_RECORD, b"\0"))
+        self.set_table(_CLASS_LIST, _CLASS_LIST_DESCRIPTOR, rows)
+        return data_entry, descriptor_entry
 
     def table(self, data_entry: int, descriptor_entry: int) -> list[Record]:
         data, descriptor = self.read(data_entry), self.read(descriptor_entry)

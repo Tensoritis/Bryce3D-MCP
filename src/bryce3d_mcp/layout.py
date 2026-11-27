@@ -6,7 +6,7 @@ values past 640/480 are valid.
 
 The points were measured on a running copy of Bryce 3D, on a 1920x1080 display
 captured at 1456x819. They are stored in that capture frame and converted here,
-so each one can be checked against docs/UI_MAP.md.
+so each one can be compared with a screenshot taken at that size.
 """
 
 from __future__ import annotations

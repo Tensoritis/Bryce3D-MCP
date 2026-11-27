@@ -4,7 +4,7 @@ source="tested"     : pressed on a real copy of Bryce 3D and the effect observed
 source="menu_table" : read from the menu definitions in Bryce's Data/menus.dat,
                       which give each item's label, shortcut and command code.
 source="unverified" : taken from shortcut lists for later versions of Bryce.
-See docs/REVERSE_ENGINEERING.md.
+See "How the files work" in README.md.
 """
 
 from __future__ import annotations

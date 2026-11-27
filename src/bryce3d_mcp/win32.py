@@ -50,6 +50,30 @@ def detect_ui_origin(image: Image.Image, threshold: int = 24) -> tuple[int, int]
     return None
 
 
+_WM_COPYDATA = 0x004A
+_MAIN_WINDOW_CLASS = "CWinAppl"
+
+
+def open_request(path: str, encoding: str = "mbcs") -> bytes:
+    """The text Bryce expects in WM_COPYDATA: the quoted path in the Windows ANSI code
+    page, ending with a NUL. Bryce takes what is between the quotes."""
+    if '"' in path or "\0" in path:
+        raise BryceError("the path contains a character Windows file names cannot have")
+    try:
+        encoded = f'"{path}"'.encode(encoding)
+    except UnicodeError as exc:
+        raise BryceError("Bryce cannot take this path: it has characters outside the "
+                         "Windows ANSI code page. Use a simpler folder or file name.") from exc
+    if len(encoded) > 259:                      # Bryce copies it into a 260-byte buffer
+        raise BryceError("the path is too long for Bryce; use a shorter one")
+    return encoded + b"\0"
+
+
+class _COPYDATASTRUCT(ctypes.Structure):
+    _fields_ = [("dwData", ctypes.c_size_t), ("cbData", ctypes.c_uint32),
+                ("lpData", ctypes.c_void_p)]
+
+
 class _MOUSEINPUT(ctypes.Structure):
     _fields_ = [("dx", wintypes.LONG), ("dy", wintypes.LONG), ("mouseData", wintypes.DWORD),
                 ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD),
@@ -119,6 +143,8 @@ class Win32Backend:
             (u.GetMenuStringW, I, [H, U, wintypes.LPWSTR, I, U]),
             (u.GetMenuState, U, [H, U, U]),
             (u.PostMessageW, B, [H, U, wintypes.WPARAM, wintypes.LPARAM]),
+            (u.SendMessageTimeoutW, ctypes.c_ssize_t,
+             [H, U, wintypes.WPARAM, wintypes.LPARAM, U, U, ctypes.POINTER(ctypes.c_size_t)]),
             (k.OpenProcess, H, [D, B, D]),
             (k.CloseHandle, B, [H]),
             (k.QueryFullProcessImageNameW, B, [H, D, wintypes.LPWSTR, ctypes.POINTER(D)]),
@@ -147,7 +173,7 @@ class Win32Backend:
     def _is_bryce(self, hwnd) -> bool:
         return bool(hwnd) and self._exe_of(hwnd) == self.exe_name
 
-    def _find_window(self):
+    def _find_window(self, window_class: str | None = None):
         found: list[int] = []
         proc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
 
@@ -160,8 +186,19 @@ class Win32Backend:
         if not found:
             raise BryceNotFound(f"no visible window from {self.exe_name!r}. Start Bryce 3D, "
                                 "or set BRYCE3D_EXE to its executable name.")
+        if window_class:
+            matching = [h for h in found if self._class_of(h) == window_class]
+            if not matching:
+                raise BryceNotFound(f"Bryce is running but no window of class {window_class} "
+                                    "was found")
+            return matching[0]
         with_menu = [h for h in found if self.user32.GetMenu(h)]
         return (with_menu or found)[0]
+
+    def _class_of(self, hwnd) -> str:
+        name = ctypes.create_unicode_buffer(256)
+        self.user32.GetClassNameW(hwnd, name, len(name))
+        return name.value
 
     def begin(self) -> None:
         self.hwnd = self._find_window()
@@ -191,6 +228,23 @@ class Win32Backend:
         finally:
             if attached:
                 self.user32.AttachThreadInput(ours, theirs, False)
+
+    # -- opening files without input ---------------------------------------------
+    def open_file(self, path: str) -> None:
+        """Send Bryce the message a second copy of Bryce sends when it is launched
+        with a file. No focus, mouse or keyboard is involved."""
+        data = open_request(path)
+        window = self._find_window(_MAIN_WINDOW_CLASS)
+        buffer = ctypes.create_string_buffer(data, len(data))
+        request = _COPYDATASTRUCT(0, len(data), ctypes.cast(buffer, ctypes.c_void_p))
+        answer = ctypes.c_size_t()
+        # SMTO_ABORTIFHUNG; Windows copies the text into Bryce's memory.
+        sent = self.user32.SendMessageTimeoutW(window, _WM_COPYDATA, 0, ctypes.addressof(request),
+                                               0x0002, 15000, ctypes.byref(answer))
+        if not sent:
+            raise BryceError("Bryce did not accept the message. It may be busy or showing a "
+                             "question. If it runs as administrator, run this server the "
+                             "same way.")
 
     # -- coordinates and capture -------------------------------------------------
     def set_origin(self, x: int, y: int) -> None:

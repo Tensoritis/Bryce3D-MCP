@@ -8,6 +8,7 @@ import json
 import os
 import re
 import struct
+import sys
 import threading
 from typing import Any, Callable, Literal
 
@@ -19,15 +20,29 @@ except ImportError:  # mcp 1.x
     from mcp.server.fastmcp import Image
     from mcp.server.fastmcp.exceptions import ToolError
 
-from . import heightfield, layout, meshes, scene, terrain
+from . import heightfield, layout, meshes, preview, scene, sceneops, terrain
+from .br3 import Br3
 from .ccmf import CompositeFile
 from .commands import COMMANDS
 from .controller import BryceController
 from .errors import BryceError
 
 INSTRUCTIONS = """\
-Controls MetaCreations Bryce 3D by driving its real interface on this Windows PC.
-Bryce has no scripting API, so look before and after acting:
+Builds and edits MetaCreations Bryce 3D scenes.
+
+PREFERRED - work on scene files with the br3_ tools. They do not use the mouse,
+keyboard or screen:
+1. br3_new starts a scene from the user's template file (br3_status explains it).
+2. br3_edit applies a batch of changes and writes a NEW file, returning a preview
+   picture and a report of what is in frame. Feed the returned path back in to keep
+   building. br3_info lists everything in a scene.
+3. br3_preview is approximate (no textures, clouds or reflections). For the real
+   picture: br3_open_in_bryce, have Bryce render, then br3_render_result.
+Units are Bryce units, Y is up, position is the object's center, a cube of scale 1
+is 20.48 on a side and rests on the ground at y=10.24.
+
+FALLBACK - the other tools drive Bryce's real interface and take over the mouse
+and keyboard while they run. Use them only when the user wants that. Then:
 - Call bryce_status then screenshot first.
 - Prefer build_scene / create_object / set_attributes: they take exact numbers.
   Units are Bryce units, Y is up, position is the object's center, a default cube
@@ -309,7 +324,7 @@ def terrain_edit(source_path: str, output_name: str, operations: list[dict] | No
     See terrain_operations. The grid size stays that of terrain number `index`, so
     pick one with the detail you want (terrain_preview shows it). source_path can be
     one of Bryce's Presets/*.obp libraries or a saved .br3 scene.
-    NOT YET CONFIRMED: loading the written file into a running Bryce."""
+    For terrains inside scenes you build, br3_edit's "terrain" operation is simpler."""
     extension = os.path.splitext(source_path)[1].lower()
     if extension not in (".obp", ".br3"):
         raise BryceError("source_path must be an .obp library or a .br3 scene")
@@ -323,6 +338,8 @@ def terrain_edit(source_path: str, output_name: str, operations: list[dict] | No
             grid = terrain.grid_from_image(picture, size)
     grid = terrain.apply(size, grid, operations or [])
     terrain.write_grid(document, chosen, grid, terrain_name, description)
+    if extension == ".br3":
+        Br3(document).sync_terrain_copy(chosen.entry)
     with open(target, "xb") as handle:
         handle.write(document.data)
     next_step = ("In Bryce: open the object library (the arrow beside Create), choose Import, "
@@ -330,6 +347,164 @@ def terrain_edit(source_path: str, output_name: str, operations: list[dict] | No
                  else "Open it in Bryce with open_scene (this discards unsaved work).")
     result = {"path": target, "index": index, "grid": size, "next": next_step}
     return [json.dumps(result), _png(_enlarged(terrain.preview(size, grid)))]
+
+
+# -- scene files: no mouse, keyboard or screen needed ----------------------------
+def _templates_path(given: str | None) -> str:
+    return (given or os.environ.get("BRYCE3D_TEMPLATES")
+            or os.path.join(output_directory(), "templates.br3"))
+
+
+def _library(given: str | None) -> Br3 | None:
+    path = _templates_path(given)
+    if os.path.isfile(path):
+        return Br3.load(path)
+    if given:
+        raise BryceError(f"template file not found: {path}")
+    return None
+
+
+def _write_scene(document: Br3, output_name: str) -> str:
+    target = _output_path(output_name, "br3")
+    with open(target, "xb") as handle:
+        handle.write(document.data)
+    return target
+
+
+def _preview_result(document: Br3, info: dict, width: int = 480, height: int = 360) -> list:
+    picture, report = preview.render(document, width, height)
+    info["in_preview"] = report
+    return [json.dumps(info), _png(picture)]
+
+
+@tool
+def br3_status(templates_path: str | None = None) -> str:
+    """Report where scene files are written, and whether the template file exists
+    and which object kinds it can supply. The template file is any .br3 saved by
+    the user's own Bryce that contains one object of each kind they want to add."""
+    path = _templates_path(templates_path)
+    info: dict[str, Any] = {"output_folder": output_directory(), "templates_path": path,
+                            "templates_found": os.path.isfile(path)}
+    if info["templates_found"]:
+        have = sorted({o["kind"] for o in Br3.load(path).objects()})
+        info["can_add"] = have
+        info["missing"] = sorted(set(sceneops.KINDS) - set(have))
+    else:
+        info["how_to_make_templates"] = (
+            "In Bryce, create one of each object from the Create palette, then save the "
+            "scene as templates.br3 in the output folder.")
+    return json.dumps(info)
+
+
+@tool
+def br3_operations() -> str:
+    """The operations br3_edit accepts, with their fields."""
+    return json.dumps(sceneops.describe())
+
+
+@tool
+def br3_info(path: str) -> str:
+    """Everything editable in a scene: objects (exact position, size, rotation,
+    material), camera, sun and sky settings."""
+    document = Br3.load(path)
+    return json.dumps({**document.summary(), "sky": document.sky()})
+
+
+@tool
+def br3_new(output_name: str, keep: list[str] | None = None,
+            templates_path: str | None = None, operations: list[dict] | None = None) -> list:
+    """Start a new scene: the template file with every object removed except those
+    named in `keep` (default: the ground, "Plane 1"). Optionally apply br3_edit
+    operations at once. Camera, sun and sky come from the template file."""
+    library = _library(templates_path)
+    if library is None:
+        raise BryceError(f"no template file at {_templates_path(templates_path)}; "
+                         "see br3_status")
+    document = Br3.from_bytes(library.data)
+    document.remove_all_except(set(["Plane 1"] if keep is None else keep))
+    results = sceneops.apply(document, operations or [], library)
+    path = _write_scene(document, output_name)
+    return _preview_result(document, {"path": path, "results": results})
+
+
+@tool
+def br3_edit(source_path: str, output_name: str, operations: list[dict],
+             templates_path: str | None = None) -> list:
+    """Apply a batch of changes to a scene and write the result as a NEW .br3 file
+    (the source is never changed). Either every operation succeeds or nothing is
+    written. See br3_operations. Example:
+    [{"op":"add","kind":"sphere","name":"Moon","position":[0,60,40],
+      "scale":[2,2,2],"material":{"color":"#d8d8c8"}},
+     {"op":"camera","position":[0,45,-160],"look_at":[0,25,0]},
+     {"op":"sun","azimuth":220,"altitude":35}]"""
+    document = Br3.load(source_path)
+    results = sceneops.apply(document, operations, _library(templates_path))
+    path = _write_scene(document, output_name)
+    return _preview_result(document, {"path": path, "results": results})
+
+
+@tool
+def br3_preview(path: str, width: int = 640, height: int = 480) -> list:
+    """Draw an approximate picture of a scene without Bryce, with a report of where
+    each object lands (in frame, out of frame, hidden). Shows shapes, flat colors,
+    the sun and ground shadows; not textures, clouds, reflections or lights."""
+    return _preview_result(Br3.load(path), {"path": path, "approximate": True}, width, height)
+
+
+@tool
+def br3_terrain_picture(path: str, name: str) -> list:
+    """Show the heights of one terrain object in a scene."""
+    size, values = Br3.load(path).terrain_heights(name)
+    grid = [v / heightfield.FULL for v in values]
+    return [json.dumps({"name": name, "grid": size}),
+            _png(_enlarged(terrain.preview(size, grid)))]
+
+
+@tool
+def br3_export_obj(path: str, output_name: str) -> str:
+    """Export a scene's shapes and terrains as a Wavefront OBJ file for use in other
+    software (geometry only; planes, lights and exact mesh objects are not exact)."""
+    text, count = preview.to_obj(Br3.load(path))
+    if not count:
+        raise BryceError("the scene has nothing with a surface to export")
+    target = _output_path(output_name, "obj")
+    with open(target, "x", encoding="utf-8") as handle:
+        handle.write(text)
+    return json.dumps({"path": target, "objects": count})
+
+
+@tool
+def br3_open_in_bryce(path: str, confirm: bool = False) -> str:
+    """Ask the running Bryce to open a scene, using the message a second copy of
+    Bryce sends when it is launched with a file. This does not move the mouse, type
+    or take focus. It can replace the open scene, so pass confirm=true once the user
+    agrees. Bryce may then ask on screen whether to save changes. NOT YET TRIED on a
+    running Bryce: both ends were found in Bryce's code. If nothing happens, the user
+    can open the file by hand."""
+    with _lock:
+        return json.dumps(get_controller().open_by_message(path, confirm))
+
+
+@tool
+def br3_render_result(scene_path: str, export_name: str | None = None) -> list:
+    """Return the picture Bryce wrote next to a scene (same name, .bmp): a
+    full-resolution real render, read from disk with no screen capture. Bryce has
+    been seen writing it around the end of a render or on save. With export_name,
+    also save it as a PNG."""
+    from PIL import Image as Picture
+    bitmap = os.path.splitext(scene_path)[0] + ".bmp"
+    if not os.path.isfile(bitmap):
+        raise BryceError(f"{bitmap} does not exist yet: open the scene in Bryce, render, "
+                         "and if it still does not appear, save in Bryce")
+    with Picture.open(bitmap) as handle:
+        picture = handle.convert("RGB")
+    info: dict[str, Any] = {"bitmap": bitmap, "size": picture.size}
+    if os.path.isfile(scene_path) and os.path.getmtime(bitmap) < os.path.getmtime(scene_path):
+        info["warning"] = "the picture is older than the scene file; render again"
+    if export_name:
+        info["exported"] = _output_path(export_name, "png")
+        picture.save(info["exported"])
+    return [json.dumps(info), _png(picture)]
 
 
 # -- raw interaction: reaches everything else ------------------------------------
@@ -479,7 +654,26 @@ def generate_heightmap(name: str, shape: str, size: int = 256, seed: int = 0,
     return [json.dumps({"path": path}), Image(data=preview.getvalue(), format="png")]
 
 
+def check() -> int:
+    """Find the running Bryce and save a screenshot: a test of the Windows layer."""
+    try:
+        controller = get_controller()
+        controller.backend.begin()
+        print(json.dumps(controller.backend.info(), indent=2))
+        path = _output_path("check-screenshot", "png")
+        with open(path, "wb") as handle:
+            handle.write(controller.screenshot_png())
+    except (BryceError, OSError) as exc:
+        print(f"CHECK FAILED: {exc}")
+        return 1
+    print(f"Screenshot saved to {path}")
+    print("OK if it shows the whole Bryce interface and nothing else.")
+    return 0
+
+
 def main() -> None:
+    if "--check" in sys.argv[1:]:
+        raise SystemExit(check())
     mcp.run()
 
 

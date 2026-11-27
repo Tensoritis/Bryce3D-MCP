@@ -26,6 +26,7 @@ def composite(payloads: dict[int, bytes], entries: int = 64, split: int | None =
         struct.pack_into(">4sII", directory, number * 12, b"\1\0\0\0", len(payload), offset)
     data[directory_offset + 12:directory_offset + 12 + len(directory)] = directory
     struct.pack_into(">II", data, 0x24C, len(directory), directory_offset)
+    struct.pack_into(">III", data, 0x260, entries, max(payloads, default=-1) + 1, 16)
     return bytes(data)
 
 

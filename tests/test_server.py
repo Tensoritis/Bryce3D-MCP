@@ -21,7 +21,10 @@ def test_tool_list(backend):
     assert {"screenshot", "build_scene", "create_object", "render", "hover", "click",
             "drag", "press_keys", "generate_mesh", "generate_heightmap",
             "terrain_list", "terrain_edit", "render_status", "save_render_image"} <= names
-    assert len(names) == 32
+    assert {"br3_new", "br3_edit", "br3_preview", "br3_info", "br3_status", "br3_operations",
+            "br3_render_result", "br3_open_in_bryce", "br3_export_obj",
+            "br3_terrain_picture"} <= names
+    assert len(names) == 42
 
 
 def test_build_through_tool_function(backend):
