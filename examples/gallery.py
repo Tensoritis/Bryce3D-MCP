@@ -1,4 +1,5 @@
-"""Five example scenes made only with the same operations br3_edit takes.
+"""Five example scenes made only with the same operations br3_edit takes: textured
+materials, eroded terrains, preset skies and new meshes built by the code below.
 
     python examples/gallery.py build     writes the scenes and previews
     python examples/gallery.py render    renders them in the running Bryce
@@ -80,27 +81,247 @@ def camera(position, look_at, fov=60, bank=0):
             "bank": bank}
 
 
-def jagged_arch(centre, radius, thickness, seed=11, along=72, around=18):
-    """A craggy stone arch bristling with spikes, made as one new mesh. It runs a
+# Geometry builders ----------------------------------------------------------------
+# Everything the primitives cannot say is made as a new mesh.
+def _sub(a, b):
+    return [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+
+
+def _cross(a, b):
+    return [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0]]
+
+
+def _unit(v):
+    length = math.sqrt(sum(c * c for c in v)) or 1.0
+    return [c / length for c in v]
+
+
+def mesh(name, vertices, faces, smooth_angle=40, material=None):
+    step = {"op": "mesh", "shape": "custom", "name": name,
+            "vertices": [[round(c, 3) for c in v] for v in vertices],
+            "faces": faces, "smooth_angle": smooth_angle}
+    if material:
+        step["material"] = material
+    return step
+
+
+def sweep(points, section, up=(0.0, 0.0, 1.0)):
+    """Run a closed cross-section of (side, up) points along a path, with end caps.
+    `section` may be a function of the position along the path, from 0 to 1."""
+    vertices, faces = [], []
+    last = len(points) - 1
+    for i, point in enumerate(points):
+        along = _unit(_sub(points[min(i + 1, last)], points[max(i - 1, 0)]))
+        across = _cross(along, list(up))
+        if sum(c * c for c in across) < 1e-4:                 # the path runs along `up`
+            across = _cross(along, [0.0, 1.0, 0.0])
+        side = _unit(across)
+        rise = _cross(side, along)
+        shape = section(i / last) if callable(section) else section
+        vertices += [[point[k] + side[k] * a + rise[k] * b for k in range(3)]
+                     for a, b in shape]
+    count = len(vertices) // len(points)
+    for i in range(last):
+        for j in range(count):
+            a, b = i * count + j, i * count + (j + 1) % count
+            faces += [[a, b, b + count], [a, b + count, a + count]]
+    for end, flip in ((0, True), (last, False)):
+        ring = [end * count + j for j in range(count)]
+        faces.append(ring[::-1] if flip else ring)
+    return vertices, faces
+
+
+def circle(radius, sides=10):
+    return [(radius * math.cos(math.tau * j / sides), radius * math.sin(math.tau * j / sides))
+            for j in range(sides)]
+
+
+def tube(name, points, radius, sides=10, material=None):
+    return mesh(name, *sweep(points, circle(radius, sides)), 70, material)
+
+
+def hoop(name, centre, radius, thickness, turn=(0, 0, 0), along=72, sides=14):
+    """A thin ring, tilted by turning about x, then y, then z (degrees)."""
+    def rotate(v):
+        x, y, z = v
+        for axis, degrees in enumerate(turn):
+            c, s = math.cos(math.radians(degrees)), math.sin(math.radians(degrees))
+            if axis == 0:
+                y, z = c * y - s * z, s * y + c * z
+            elif axis == 1:
+                x, z = c * x + s * z, -s * x + c * z
+            else:
+                x, y = c * x - s * y, s * x + c * y
+        return [x, y, z]
+
+    vertices, faces = [], []
+    for i in range(along):
+        a = math.tau * i / along
+        for j in range(sides):
+            b = math.tau * j / sides
+            reach = radius + thickness * math.cos(b)
+            offset = rotate([reach * math.cos(a), thickness * math.sin(b),
+                             reach * math.sin(a)])
+            vertices.append([centre[k] + offset[k] for k in range(3)])
+    for i in range(along):
+        for j in range(sides):
+            p, q = i * sides + j, i * sides + (j + 1) % sides
+            r, t = ((i + 1) % along) * sides + (j + 1) % sides, ((i + 1) % along) * sides + j
+            faces += [[p, q, r], [p, r, t]]
+    return mesh(name, vertices, faces, 70)
+
+
+def turned(name, profile, base, lean=0.0, sides=48, flutes=0, depth=0.0):
+    """A shape turned on a lathe from (radius, height) pairs, optionally fluted,
+    then leaned sideways by `lean` degrees about its foot."""
+    c, s = math.cos(math.radians(lean)), math.sin(math.radians(lean))
+    vertices, faces = [], []
+    for radius, height in profile:
+        for j in range(sides):
+            angle = math.tau * j / sides
+            cut = 1 - depth * abs(math.sin(flutes * angle / 2)) if flutes else 1
+            x, y, z = radius * cut * math.cos(angle), height, radius * cut * math.sin(angle)
+            vertices.append([base[0] + c * x + s * y, base[1] - s * x + c * y, base[2] + z])
+    for i in range(len(profile) - 1):
+        for j in range(sides):
+            a, b = i * sides + j, i * sides + (j + 1) % sides
+            faces += [[a, b + sides, b], [a, a + sides, b + sides]]
+    faces.append(list(range(sides)))
+    faces.append([(len(profile) - 1) * sides + j for j in range(sides)][::-1])
+    return mesh(name, vertices, faces, 32)
+
+
+def catmull(points, steps):
+    """A smooth curve through the points."""
+    out = []
+    for i in range(len(points) - 1):
+        p0, p1 = points[max(i - 1, 0)], points[i]
+        p2, p3 = points[i + 1], points[min(i + 2, len(points) - 1)]
+        for n in range(steps):
+            t = n / steps
+            out.append([0.5 * (2 * p1[k] + (p2[k] - p0[k]) * t
+                               + (2 * p0[k] - 5 * p1[k] + 4 * p2[k] - p3[k]) * t * t
+                               + (3 * p1[k] - p0[k] - 3 * p2[k] + p3[k]) * t ** 3)
+                        for k in range(3)])
+    return out + [list(points[-1])]
+
+
+_PHI = (1 + 5 ** 0.5) / 2
+
+
+def _icosphere(levels):
+    points = [_unit(p) for p in (
+        (-1, _PHI, 0), (1, _PHI, 0), (-1, -_PHI, 0), (1, -_PHI, 0),
+        (0, -1, _PHI), (0, 1, _PHI), (0, -1, -_PHI), (0, 1, -_PHI),
+        (_PHI, 0, -1), (_PHI, 0, 1), (-_PHI, 0, -1), (-_PHI, 0, 1))]
+    faces = [(0, 11, 5), (0, 5, 1), (0, 1, 7), (0, 7, 10), (0, 10, 11), (1, 5, 9),
+             (5, 11, 4), (11, 10, 2), (10, 7, 6), (7, 1, 8), (3, 9, 4), (3, 4, 2),
+             (3, 2, 6), (3, 6, 8), (3, 8, 9), (4, 9, 5), (2, 4, 11), (6, 2, 10),
+             (8, 6, 7), (9, 8, 1)]
+    for _ in range(levels):
+        middle = {}
+
+        def half(a, b):
+            key = (min(a, b), max(a, b))
+            if key not in middle:
+                middle[key] = len(points)
+                points.append(_unit([(points[a][k] + points[b][k]) / 2 for k in range(3)]))
+            return middle[key]
+
+        finer = []
+        for a, b, c in faces:
+            ab, bc, ca = half(a, b), half(b, c), half(c, a)
+            finer += [(a, ab, ca), (b, bc, ab), (c, ca, bc), (ab, bc, ca)]
+        faces = finer
+    return points, faces
+
+
+def rock(name, centre, size, seed, levels=4, rough=0.34):
+    """A craggy boulder: a finely divided ball pushed in and out by layered bumps."""
+    rng = random.Random(seed)
+    waves = []
+    for octave, count in enumerate((4, 6, 10, 14)):
+        for _ in range(count):
+            direction = _unit([rng.gauss(0, 1) for _ in range(3)])
+            waves.append((direction, 2.2 * 1.9 ** octave, rng.uniform(0, math.tau),
+                          rough * 0.55 ** octave / count ** 0.5))
+    points, faces = _icosphere(levels)
+    vertices = []
+    for p in points:
+        push = 1.0
+        for direction, frequency, phase, height in waves:
+            wave = math.sin(frequency * sum(p[k] * direction[k] for k in range(3)) + phase)
+            push += height * (1 - 2 * abs(wave))              # sharp creases
+        vertices.append([centre[k] + p[k] * size[k] / 2 * max(0.35, push) for k in range(3)])
+    return mesh(name, vertices, [list(f) for f in faces], 30)
+
+
+_SPECK = ((1, 1, 1), (1, -1, -1), (-1, 1, -1), (-1, -1, 1))
+_SPECK_FACES = ((0, 1, 2), (0, 3, 1), (0, 2, 3), (1, 3, 2))
+
+
+def confetti(path, count=6000, bands=12, seed=7):
+    """A rainbow cloud of tiny solid flecks along a curve: one mesh per colour."""
+    rng = random.Random(seed)
+    curve = catmull(path, 60)
+    parts = [([], []) for _ in range(bands)]
+    for n in range(count):
+        t = n / count
+        base = curve[int(t * (len(curve) - 1))]
+        spread = 6.8 * (1 - 0.72 * t)
+        off = [rng.gauss(0, spread * w) for w in (0.5, 0.62, 0.5)]
+        band = min(bands - 1, max(0, int((off[1] / (spread * 2.2) + 0.5
+                                          + rng.gauss(0, 0.05)) * bands)))
+        size = rng.uniform(0.13, 0.42) * (1.15 - 0.5 * t)
+        vertices, faces = parts[band]
+        first = len(vertices)
+        turn = rng.uniform(0, math.tau)
+        c, s = math.cos(turn), math.sin(turn)
+        for x, y, z in _SPECK:
+            vertices.append([base[0] + off[0] + size * (c * x - s * y),
+                             base[1] + off[1] + size * (s * x + c * y),
+                             base[2] + off[2] + size * z])
+        faces += [[first + i for i in face] for face in _SPECK_FACES]
+    ops = []
+    for band, (vertices, faces) in enumerate(parts):
+        if not faces:
+            continue
+        red, green, blue = colorsys.hsv_to_rgb(0.82 * band / (bands - 1), 0.88, 1.0)
+        colour = "#%02x%02x%02x" % (int(red * 255), int(green * 255), int(blue * 255))
+        name = f"Confetti {band}"
+        ops += [mesh(name, vertices, faces, 1),
+                paint(name, "Flat White", color=colour, ambient=0.8, diffuse=0.55)]
+    return ops
+
+
+def jagged_arch(centre, radius, thickness, seed=11, along=130, around=28):
+    """A craggy stone arch bristling with spines, made as one new mesh. It runs a
     little below the ground at both feet."""
     rng = random.Random(seed)
+    waves = [(rng.uniform(5, 34), rng.randint(2, 11), rng.uniform(0, math.tau),
+              rng.uniform(0.05, 0.15)) for _ in range(11)]
     start, end = math.radians(-14), math.radians(194)
     vertices, faces = [], []
     for i in range(along + 1):
         angle = start + (end - start) * i / along
         out = (math.cos(angle), math.sin(angle), 0.0)
-        swell = 1 + 0.35 * abs(math.cos(angle)) ** 2          # heavier toward the feet
+        swell = 1 + 0.5 * abs(math.cos(angle)) ** 2           # heavier toward the feet
         for j in range(around):
             turn = math.tau * j / around
-            rough = rng.uniform(0.74, 1.22)
-            across = thickness * swell * rough
-            # Spikes grow from the outer side.
-            if math.cos(turn) > 0.2 and 3 < i < along - 3 and rng.random() < 0.075:
-                across += thickness * rng.uniform(0.9, 2.1)
+            rough = rng.uniform(0.9, 1.1)
+            for along_f, around_f, phase, height in waves:
+                rough += height * (1 - 2 * abs(math.sin(along_f * angle + around_f * turn
+                                                         + phase)))
+            across = thickness * swell * max(0.5, rough)
+            # Spines grow from the outer side.
+            if math.cos(turn) > 0.35 and 3 < i < along - 3 and rng.random() < 0.07:
+                across += thickness * rng.uniform(0.7, 2.0)
             lift = math.cos(turn) * across
             vertices.append([centre[0] + out[0] * (radius + lift),
                              centre[1] + out[1] * (radius + lift),
-                             centre[2] + math.sin(turn) * thickness * swell * rough])
+                             centre[2] + math.sin(turn) * thickness * swell
+                             * max(0.5, rough)])
     for i in range(along):
         for j in range(around):
             a, b = i * around + j, i * around + (j + 1) % around
@@ -113,15 +334,37 @@ def jagged_arch(centre, radius, thickness, seed=11, along=72, around=18):
         for j in range(around):
             a, b = ring * around + j, ring * around + (j + 1) % around
             faces.append([hub, b, a] if flip else [hub, a, b])
-    return {"op": "mesh", "shape": "custom", "name": "Arch", "vertices": vertices,
-            "faces": faces, "smooth_angle": 25}
+    return mesh("Arch", vertices, faces, 25)
+
+
+def texture(name, texture_name, channels, strength=None):
+    step = {"op": "texture", "name": name, "texture": texture_name, "channels": channels}
+    if strength is not None:
+        step["strength"] = strength
+    return step
+
+
+COLOURED = ["color", "ambient_color"]
+
+
+def land(name, centre, size, seed, shape="mountain", sharp=0.34, falloff=True):
+    """A terrain with its own eroded shape. `centre` is the middle of its base."""
+    steps = [{"op": "generate", "shape": shape, "seed": seed, "roughness": 0.62},
+             {"op": "ridges", "amount": sharp, "cells": 6, "octaves": 5, "seed": seed + 1},
+             {"op": "hydraulic_erosion", "droplets": 14000, "seed": seed + 2},
+             {"op": "sharpen", "amount": 0.7, "radius": 2}]
+    if falloff:
+        steps.append({"op": "edge_falloff", "width": 0.16})
+    steps.append({"op": "normalize"})
+    return [add("terrain", name, [centre[0], centre[1] + size[1] / 2, centre[2]], size),
+            {"op": "terrain", "name": name, "operations": steps}]
 
 
 # 1 -------------------------------------------------------------------------------
 def dream_sea():
     ops = [*sky("The Big Sky", 235, 38),
            add("plane", "Checker Sea", [0, 0, 0], [20.48] * 3),
-           wear("Checker Sea", "Mirrored Checkerboard", reflection=0.55),
+           wear("Checker Sea", "Mirrored Checkerboard", reflection=0.58),
            ripples("Checker Sea", 0.05),
            camera([0, 25, -180], [0, 38, -40])]
     for name, position, diameter in (("Orb Near", (30, 22, -76), 36),
@@ -129,64 +372,82 @@ def dream_sea():
                                      ("Orb Far", (40, 78, -8), 15),
                                      ("Orb Farthest", (49, 100, 18), 11)):
         ops += chrome(name, position, diameter)
-    # A stairway that leaves the water and keeps climbing.
-    ops += [add("cube", "Step 0", [-52, 3, -46], [15, 1.5, 4.5], rotation=[0, -24, 0]),
-            wear("Step 0", "White Metal", color="#e8e4ff", reflection=0.35)]
-    for i in range(1, 46):
-        t = i / 45
-        ops.append(copy("Step 0", f"Step {i}", [-52 + 52 * t ** 1.35, 3 + 108 * t,
-                                                  -46 + 74 * t]))
-    # A leaning column with a carved-looking head.
-    stone = {"color": "#9a96b4", "ambient": 0.25, "diffuse": 0.9, "specular": 0.1}
-    ops += [add("cylinder", "Column", [4, 9, -88], [6, 26, 6], rotation=[0, 0, -24]),
-            paint("Column", "Flat Gray", **stone),
-            add("sphere", "Column Head", [10.6, 23.8, -88], [10, 9, 10]),
-            paint("Column Head", "Flat Gray", **stone),
-            add("torus", "Handle", [5.5, 28.5, -88], [6, 6, 6]),
-            paint("Handle", "Flat Gray", **stone)]
+    # A glassy stairway that leaves the water and keeps climbing.
+    ops += [add("cube", "Step 0", [-52, 1.2, -50], [15, 1.5, 4.2], rotation=[0, -24, 0]),
+            wear("Step 0", "White Metal", color="#dcd8ff", reflection=0.5,
+                 transparency=0.22, specular=1.0)]
+    for i in range(1, 64):
+        t = i / 63
+        ops.append(copy("Step 0", f"Step {i}", [-52 + 52 * t ** 1.35, 1.2 + 112 * t,
+                                                  -50 + 80 * t]))
+    # A leaning fluted column carrying a carved jar.
+    lean, foot = 23.0, (-7.0, -3.0, -88.0)
+
+    def up(height, across=0.0, forward=0.0):
+        c, s = math.cos(math.radians(lean)), math.sin(math.radians(lean))
+        return [foot[0] + c * across + s * height, foot[1] - s * across + c * height,
+                foot[2] + forward]
+
+    ops += [turned("Column", [(3.6, 0), (3.6, 2.5), (3.0, 3.2), (2.8, 22), (2.55, 24.5)],
+                   foot, lean, sides=64, flutes=18, depth=0.13),
+            turned("Capital", [(2.6, 24.3), (3.7, 24.9), (3.7, 25.9), (3.0, 26.4),
+                               (3.9, 27.0), (3.9, 27.5), (2.4, 28.0)], foot, lean),
+            turned("Jar", [(2.4, 27.9), (4.3, 29.2), (5.4, 31.2), (4.9, 31.8), (5.6, 32.6),
+                           (5.2, 35.0), (4.0, 36.3), (4.4, 36.9), (4.4, 38.4), (3.4, 38.9),
+                           (1.0, 39.3)], foot, lean)]
+    for name, height, radius in (("Band Low", 31.5, 5.25), ("Band Neck", 36.6, 4.35),
+                                 ("Band Top", 38.5, 4.3)):
+        ops.append(hoop(name, up(height), radius, 0.36, (0, 0, -lean)))
+    ops += [hoop("Handle", up(40.9), 1.7, 0.5, (90, 0, -lean)),
+            tube("Brow", [up(34.9, a, -5.0 - 0.5 * math.cos(a / 3)) for a in
+                          (-3.2, -1.6, 0, 1.6, 3.2)], 0.55),
+            tube("Grin", [up(32.9 - 1.1 * math.cos(a / 2.2), a, -5.35) for a in
+                          (-2.8, -1.7, -0.6, 0.6, 1.7, 2.8)], 0.45)]
+    for n, across in enumerate((-1.9, 1.9)):
+        ops += [add("sphere", f"Eye {n}", up(34.0, across, -4.9), [1.9, 1.9, 1.9]),
+                hoop(f"Lid {n}", up(34.0, across, -5.2), 1.15, 0.28, (90, 0, 0))]
+    stone = ["Column", "Capital", "Jar", "Band Low", "Band Neck", "Band Top", "Handle",
+             "Brow", "Grin", "Eye 0", "Eye 1", "Lid 0", "Lid 1"]
+    for name in stone:
+        ops += [paint(name, "Flat Gray", color="#9a96b4", ambient=0.24, diffuse=0.9,
+                      specular=0.25),
+                texture(name, "Sand1", ["bump"], 0.3)]
     # A playground slide standing in the sea.
+    grey = {"color": "#b4b0cc", "specular": 0.5, "reflection": 0.12}
+    parts = []
     for n, (dx, dz) in enumerate(((-4, -4), (4, -4), (-4, 4), (4, 4))):
-        ops.append(add("cylinder", f"Leg {n}", [-20 + dx, 15, -52 + dz], [0.9, 30, 0.9]))
-        ops.append(paint(f"Leg {n}", "Flat Gray", color="#b8b4d0"))
-    ops += [add("cube", "Deck", [-20, 30, -52], [10, 1.4, 10]),
-            paint("Deck", "Flat Gray", color="#b8b4d0"),
-            add("pyramid", "Slide Roof", [-20, 41.5, -52], [13, 6, 13]),
-            paint("Slide Roof", "Flat Gray", color="#8f8ab0")]
-    for n, (dx, dz) in enumerate(((-4, -4), (4, -4), (-4, 4), (4, 4))):
-        ops.append(add("cylinder", f"Post {n}", [-20 + dx, 34.5, -52 + dz], [0.8, 8, 0.8]))
-        ops.append(paint(f"Post {n}", "Flat Gray", color="#b8b4d0"))
-    ops += [add("cube", "Chute", [-8.5, 22.5, -52], [20, 1.1, 6], rotation=[0, 0, -38]),
-            wear("Chute", "White Metal", color="#c9c6e0", reflection=0.3)]
-    # A ribbon of rainbow confetti: thousands in spirit, a few hundred in fact.
-    rng = random.Random(7)
-    path = [(-68, 82, -72), (-34, 34, -66), (-14, 26, -50), (16, 22, -18), (46, 25, 14)]
-    first = None
-    for i in range(240):
-        t = (i / 240) * (len(path) - 1)
-        k = min(int(t), len(path) - 2)
-        f = t - k
-        base = [a + (b - a) * f for a, b in zip(path[k], path[k + 1])]
-        spread = 6.5 * (1 - i / 300)
-        position = [v + rng.gauss(0, spread * w) for v, w in zip(base, (0.55, 0.75, 0.55))]
-        band = (position[1] - base[1]) / (spread * 2.4) + 0.5
-        red, green, blue = colorsys.hsv_to_rgb(0.82 * min(1, max(0, band)), 0.85, 1.0)
-        colour = "#%02x%02x%02x" % (int(red * 255), int(green * 255), int(blue * 255))
-        edge = rng.uniform(0.45, 1.1)
-        name = f"Spark {i}"
-        turn = [rng.uniform(0, 90), rng.uniform(0, 90), 0]
-        material = {"color": colour, "ambient": 0.75, "diffuse": 0.6}
-        if first is None:
-            first = name
-            ops += [add("cube", name, position, [edge] * 3, rotation=turn),
-                    paint(name, "Flat White", **material)]
-        else:
-            ops.append(copy(first, name, position, size=[round(edge, 2)] * 3,
-                            rotation=turn, material=material))
-    # Pink peaks behind the camera, there for the mirrors to find.
-    for n, x in enumerate((-190, 20, 210)):
-        ops += [{"op": "insert_preset", "preset": "Iceberg Terrain", "name": f"Pink Peaks {n}",
-                 "position": [x, 20, -430], "scale": 0.55},
-                paint(f"Pink Peaks {n}", "Flat White", color="#c88ac8", ambient=0.35)]
+        parts += [tube(f"Leg {n}", [[-20 + dx, -1, -52 + dz], [-20 + dx, 41, -52 + dz]], 0.42,
+                       8)]
+    parts += [add("cube", "Deck", [-20, 30, -52], [10, 1.2, 10]),
+              mesh("Slide Roof", *sweep([[-20, 41, -58], [-20, 41, -46]],
+                                        [(-6.4, 0), (6.4, 0), (0, 5.6)], up=(0, 1, 0)), 10)]
+    for n, z in enumerate((-56, -48)):
+        parts += [tube(f"Rail {n}", [[-24, 35.5, z], [-16, 35.5, z]], 0.35, 8),
+                  tube(f"Ladder {n}", [[-33, -1, -52 + (z + 52) * 0.6],
+                                       [-24.5, 30.5, -52 + (z + 52) * 0.6]], 0.35, 8)]
+    for n in range(9):
+        t = (n + 1) / 10
+        parts.append(tube(f"Rung {n}", [[-33 + 8.5 * t, -1 + 31.5 * t, -54.4],
+                                        [-33 + 8.5 * t, -1 + 31.5 * t, -49.6]], 0.3, 6))
+    trough = [(-3.4, 2.1), (-3.0, 0.2), (-2.0, -0.55), (0, -0.8), (2.0, -0.55), (3.0, 0.2),
+              (3.4, 2.1), (2.8, 2.1), (2.4, 0.55), (0, 0.05), (-2.4, 0.55), (-2.8, 2.1)]
+    chute = catmull([[-15.5, 30.4, -52], [-9, 27.5, -53], [-3, 20, -56], [2, 14.5, -60],
+                     [8, 12.5, -63], [12.5, 12.8, -64]], 12)
+    parts.append(mesh("Chute", *sweep(chute, trough, up=(0, 0, 1)), 55))
+    ops += parts
+    for step in parts:
+        ops.append(paint(step["name"], "White Metal", **grey))
+    # A ribbon of rainbow confetti: thousands of flecks, one mesh per colour.
+    ops += confetti([(-78, 90, -72), (-52, 52, -66), (-34, 31, -62), (-14, 27, -48),
+                     (16, 22, -18), (46, 26, 14), (84, 24, 36)])
+    # Jagged pink peaks behind the camera, there for the mirrors to find.
+    for n, (x, z, wide, tall) in enumerate(((-230, -420, 260, 130), (-30, -470, 300, 100),
+                                            (200, -430, 280, 150), (390, -250, 220, 90),
+                                            (-400, -220, 230, 110))):
+        name = f"Pink Peaks {n}"
+        ops += [*land(name, (x, -3, z), [wide, tall, wide * 0.8], 20 + n * 7, "mountain", 0.45),
+                paint(name, "Flat White", color="#c592cf", ambient=0.3, diffuse=0.85),
+                texture(name, "Sand1", ["bump"], 0.5)]
     return ops
 
 
@@ -212,89 +473,140 @@ def orrery():
     ops = [*sky("Wisp o'the Will", 245, 28), *sea("Ocean", "#1d4f93", 0.45, 0.2),
            camera([0, 30, -186], [0, 40, -40])]
     centre = (26, 48, -52)
-    for n, (turn, across) in enumerate((([78, 0, -14], 56), ([90, 0, 32], 53),
-                                        ([8, 62, 8], 52), ([6, -58, -6], 50))):
-        name = f"Ring {n}"
-        ops += [add("torus", name, centre, [across, across, across * 0.34], rotation=turn),
-                wear(name, "Metallic Chrome", color="#b8c4d8", diffuse=0.2, reflection=0.75)]
+
+    def metal(name, tint="#b8c4d8", shine=0.72):
+        return wear(name, "Metallic Chrome", color=tint, diffuse=0.22, reflection=shine,
+                    specular=1.0)
+
+    for n, (radius, turn) in enumerate(((29, (9, 0, -9)), (28, (-17, 0, 19)),
+                                        (27, (68, 0, -24)), (25.5, (-52, 34, 14)),
+                                        (23.5, (84, -26, 6)))):
+        ops += [hoop(f"Ring {n}", centre, radius, 1.35 if n < 3 else 1.0, turn, 96),
+                metal(f"Ring {n}")]
+    ops += [tube("Spindle", [[centre[0] - 29, centre[1], centre[2]],
+                             [centre[0] + 29, centre[1], centre[2]]], 0.55), metal("Spindle")]
+    for side, x in (("Left", -28.5), ("Right", 28.5)):
+        ops += chrome(f"Hub {side}", (centre[0] + x, centre[1], centre[2]), 6.2)
+        ops += [hoop(f"Collar {side}", (centre[0] + x * 0.86, centre[1], centre[2]), 2.3, 0.7,
+                     (0, 0, 90)), metal(f"Collar {side}")]
     for n in range(8):
         angle = math.tau * n / 8
-        ops += chrome(f"Bead {n}", (centre[0] + 13 * math.cos(angle),
-                                    centre[1] + 4.5 * math.sin(angle * 2),
-                                    centre[2] + 13 * math.sin(angle)), 5.6, "#c8d4e8")
-    ops += chrome("Axle Left", (centre[0] - 27, centre[1], centre[2]), 5)
-    ops += chrome("Axle Right", (centre[0] + 27, centre[1], centre[2]), 5)
-    # The glass citadel on its island.
-    for n, (x, z, width, height) in enumerate(((-114, 150, 118, 76), (-62, 172, 74, 40),
-                                               (-176, 162, 90, 52))):
-        ops += [*mountain("Apex", f"Crag {n}", x, z, width, height),
-                wear(f"Crag {n}", "White Metal", color="#8aa4c8", reflection=0.18,
-                     ambient=0.2)]
-    crown = (-114, 78, 148)
+        spot = (centre[0] + 12.5 * math.cos(angle), centre[1] + 4.5 * math.sin(angle * 2),
+                centre[2] + 12.5 * math.sin(angle))
+        ops += chrome(f"Bead {n}", spot, 5.6, "#c8d4e8")
+        ops += [tube(f"Spoke {n}", [list(centre), list(spot)], 0.28, 6), metal(f"Spoke {n}")]
+    ops += chrome("Core", centre, 4.2)
+    # The glass citadel on a cluster of eroded crags.
+    for n, (x, z, wide, tall) in enumerate(((-114, 150, 124, 82), (-60, 176, 84, 44),
+                                            (-182, 164, 100, 58), (-128, 118, 70, 30),
+                                            (-86, 134, 52, 38))):
+        name = f"Crag {n}"
+        ops += [*land(name, (x, -2, z), [wide, tall, wide * 0.75], 40 + n * 5, "mountain", 0.5),
+                paint(name, "Flat Gray", color="#7f93b4", ambient=0.24, diffuse=0.9,
+                      reflection=0.16, specular=0.7),
+                texture(name, "Sand1", ["bump"], 0.55)]
+    crown = (-114, 90, 148)
     ops += chrome("Crown Pearl", crown, 30, "#e8f4ff")
+
+    def crystal(name):
+        return wear(name, "White Metal", color="#dcefff", reflection=0.6, transparency=0.24,
+                    specular=1.0)
+
     for n in range(4):
-        name = f"Crown Arch {n}"
-        ops += [add("torus", name, crown, [62, 62, 13], rotation=[0, 45 * n, 0]),
-                wear(name, "White Metal", color="#dcefff", reflection=0.55, transparency=0.2)]
-    for n in range(10):
-        angle = math.tau * n / 10
-        spot = (crown[0] + 31 * math.cos(angle), crown[1] + 14 + 7 * math.sin(2 * angle),
-                crown[2] + 31 * math.sin(angle))
-        for ring, turn in enumerate(([0, 0, 0], [0, 90, 0])):
+        ops += [hoop(f"Crown Arch {n}", crown, 28, 2.2, (90, 45 * n, 0), 80),
+                crystal(f"Crown Arch {n}")]
+    ops += [hoop("Crown Girdle", (crown[0], crown[1] - 6, crown[2]), 29, 1.5),
+            crystal("Crown Girdle")]
+    for n in range(14):
+        angle = math.tau * n / 14
+        high = 1 if n % 2 else 0
+        spot = (crown[0] + (32 - 9 * high) * math.cos(angle), crown[1] + 8 + 16 * high,
+                crown[2] + (32 - 9 * high) * math.sin(angle))
+        for ring, turn in enumerate(((90, 0, 0), (90, 90, 0), (0, 0, 0))):
             name = f"Charm {n}-{ring}"
-            ops += [add("torus", name, spot, [11, 11, 3], rotation=turn),
-                    wear(name, "White Metal", color="#e4f2ff", reflection=0.6)]
+            ops += [hoop(name, spot, 5.2, 0.55, turn, 32, 8), crystal(name)]
+        ops += chrome(f"Charm Pearl {n}", spot, 3.4, "#f0f8ff")
+    ops += [add("plane", "Sea Haze", [0, 3.2, 700], [20.48] * 3),
+            paint("Sea Haze", "Flat White", color="#cfe6ff", ambient=0.6, diffuse=0.35,
+                  transparency=0.86, refraction=1.0)]
     return ops
 
 
 # 4 -------------------------------------------------------------------------------
 def far_world():
-    rock = {"color": "#5d5348", "ambient": 0.16, "diffuse": 0.95, "specular": 0.05}
-
-    def rocky(name, **over):
-        return [paint(name, "Flat Gray", **{**rock, **over}),
-                {"op": "texture", "name": name, "texture": "Sand1", "channels": ["bump"],
-                 "strength": 0.6}]
+    def rocky(name, colour="#5d5348", ground="SandRiver1", bump=0.75, ambient=0.16):
+        return [paint(name, "Flat Gray", color=colour, ambient=ambient, diffuse=0.95,
+                      specular=0.08),
+                texture(name, ground, ["bump"], bump)]
 
     ops = [*sky("Caribbean Clear", 285, 24),
-           add("plane", "Ground", [0, 0, 0], [20.48] * 3), *rocky("Ground", color="#6f6755"),
            camera([0, 34, -190], [0, 40, -40], 62),
            add("sphere", "Giant Planet", [-330, 250, 620], [520, 520, 520]),
-           paint("Giant Planet", "Flat White", color="#e3a6b8", ambient=0.72, diffuse=0.35,
-                 transparency=0.12, refraction=1.0)]
-    # The arch: one new mesh, craggy and bristling with spikes.
+           paint("Giant Planet", "Flat White", color="#e3a6b8", ambient=0.62, diffuse=0.5,
+                 transparency=0.1, refraction=1.0),
+           texture("Giant Planet", "Sin Layers1", ["bump"], 0.35),
+           # Bryce's own use of this texture: colour, ambient and transparency together.
+           add("sphere", "Planet Clouds", [-330, 250, 620], [524, 524, 524]),
+           paint("Planet Clouds", "Flat White", ambient=0.55, diffuse=0.5, refraction=1.0),
+           texture("Planet Clouds", "Athmospher1", [*COLOURED, "transparency"])]
+    # Rough ground made of overlapping terrains: knolls break through the mist.
+    ops += [add("plane", "Bedrock", [0, -1.5, 0], [20.48] * 3), *rocky("Bedrock", "#6f6755")]
+    for n, (x, z, wide, tall, seed) in enumerate(((-92, -128, 190, 15, 3),
+                                                  (96, -122, 190, 13, 9),
+                                                  (-6, -176, 150, 17, 15),
+                                                  (-150, 40, 260, 20, 21),
+                                                  (160, 30, 260, 17, 27),
+                                                  (10, 140, 320, 14, 33),
+                                                  (0, -30, 240, 9, 39))):
+        name = f"Ground {n}"
+        ops += [*land(name, (x, -2.5, z), [wide, tall, wide * 0.9], seed, "dunes", 0.62),
+                *rocky(name, "#716850" if n % 2 else "#675d47", "DesertBump", 0.8, 0.2),
+                texture(name, "DesertBump", COLOURED)]
+    # The arch: one new mesh, craggy and bristling with spines.
     rng = random.Random(11)
-    ops += [jagged_arch((42, 8, 40), 42, 9), *rocky("Arch", color="#3f3a38")]
-    for n, (preset, x, z, width, height) in enumerate((
-            ("Stalagmites", 80, 52, 62, 34), ("Mt. Baldy", 0, 56, 56, 24),
-            ("Mt. Baldy", 104, 70, 70, 20))):
-        ops += [*mountain(preset, f"Footing {n}", x, z, width, height),
-                *rocky(f"Footing {n}", color="#48423c")]
-    for n, (x, z, width, height) in enumerate(((-300, 330, 250, 78), (-130, 440, 190, 52),
-                                               (260, 470, 280, 88), (460, 300, 220, 66))):
-        ops += [*mountain("Sharpies" if n < 2 else "Mt. Baldy", f"Range {n}", x, z, width,
-                          height),
-                paint(f"Range {n}", "Flat Gray", color="#5f6f92", ambient=0.3)]
-    for n in range(34):
-        if n < 4:
-            x, z, wide = ((-48, -120, 25), (-14, -96, 13), (60, -128, 30), (8, -140, 11))[n]
-        else:
-            x, z, wide = rng.uniform(-150, 150), rng.uniform(-100, 190), rng.uniform(3, 13)
-        size = [wide, wide * rng.uniform(0.45, 0.7), wide * rng.uniform(0.7, 1.1)]
-        turn = [0, rng.uniform(0, 180), rng.uniform(-14, 14)]
-        if n == 0:
-            ops += [add("sphere", "Boulder 0", [x, size[1] * 0.3, z], size, rotation=turn),
-                    *rocky("Boulder 0")]
-        else:
-            ops.append(copy("Boulder 0", f"Boulder {n}", [x, size[1] * 0.3, z], size=size,
-                            rotation=turn))
+    ops += [jagged_arch((42, 6, 40), 40, 9), *rocky("Arch", "#403a38", "Sand1", 0.8)]
+    for n, (x, z, wide, tall) in enumerate(((84, 50, 74, 42), (2, 56, 70, 30),
+                                            (112, 66, 80, 24), (-24, 66, 56, 15))):
+        name = f"Footing {n}"
+        ops += [*land(name, (x, -2, z), [wide, tall, wide * 0.6], 60 + n, "mountain", 0.55),
+                *rocky(name, "#46403a", "Sand1")]
+    for n in range(22):
+        x = 42 + rng.choice((-1, 1)) * rng.uniform(34, 68)
+        tall = rng.uniform(5, 19) * (1.2 - abs(x - 42) / 90)
+        name = f"Spire {n}"
+        ops += [turned(name, [(tall * 0.2, 0), (tall * 0.11, tall * 0.45),
+                              (tall * 0.07, tall * 0.52), (0.12, tall)],
+                       (x, 3, 40 + rng.uniform(-9, 9)), rng.uniform(-14, 14), sides=7),
+                *rocky(name, "#3c3735", "Sand1")]
+    # Blue ranges along the horizon.
+    for n, (x, z, wide, tall) in enumerate(((-330, 330, 260, 80), (-160, 460, 220, 56),
+                                            (250, 470, 300, 92), (480, 300, 230, 70),
+                                            (40, 560, 300, 38))):
+        name = f"Range {n}"
+        ops += [*land(name, (x, -3, z), [wide, tall, wide * 0.6], 80 + n * 3, "mountain", 0.5),
+                paint(name, "Flat Gray", color="#5f6f92", ambient=0.34),
+                texture(name, "Sand1", ["bump"], 0.4)]
+    # Boulders in the foreground and rubble beyond.
+    for n, (x, y, z, wide) in enumerate(((-47, 8, -122, 25), (-13, 8, -98, 13),
+                                         (58, 8, -130, 28), (10, 9, -142, 11),
+                                         (28, 6, -66, 9), (-70, 7, -40, 15))):
+        ops += [rock(f"Boulder {n}", (x, y, z), (wide, wide * 0.62, wide * 0.86), 100 + n),
+                *rocky(f"Boulder {n}", "#6a563c", "DesertBump", 0.85),
+                texture(f"Boulder {n}", "DesertBump", COLOURED)]
+    for n in range(46):
+        wide = rng.uniform(2, 8)
+        x, z = rng.uniform(-150, 150), rng.uniform(-90, 190)
+        name = f"Rubble {n}"
+        ops += [rock(name, (x, 4.2, z), (wide, wide * 0.7, wide * 0.9), 200 + n, 2, 0.4),
+                *rocky(name, "#58503f")]
     for n, (position, wide) in enumerate((((6, 98, -20), 17), ((-36, 62, 10), 14),
                                           ((14, 56, 110), 8))):
-        ops.append(copy("Boulder 0", f"Asteroid {n}", position, size=[wide, wide * 0.82, wide],
-                        rotation=[25 * n, 40, 15], material={"color": "#8f8a86"}))
-    ops += [add("plane", "Low Mist", [0, 2.4, 0], [20.48] * 3),
-            paint("Low Mist", "Flat White", color="#a8e0d8", ambient=0.65, diffuse=0.35,
-                  transparency=0.68, refraction=1.0)]
+        ops += [rock(f"Asteroid {n}", position, (wide, wide * 0.85, wide), 300 + n, 4, 0.26),
+                *rocky(f"Asteroid {n}", "#98928c", "Sand1", 0.9, 0.2)]
+    for n, (height, clear) in enumerate(((3.6, 0.62), (5.4, 0.86))):
+        ops += [add("plane", f"Mist {n}", [0, height, 0], [20.48] * 3),
+                paint(f"Mist {n}", "Flat White", color="#a8e0d8", ambient=0.65, diffuse=0.35,
+                      transparency=clear, refraction=1.0)]
     return ops
 
 
@@ -312,7 +624,8 @@ def colour_generation():
             ("Teal", (-37, 36, -62), 23, [8, 20, -10], "#10868c"),
             ("Crimson", (-14, 56, -4), 23, [4, -28, 6], "#c01868"),
             ("Olive", (10, 26, -66), 18, [24, 34, 8], "#98a818")):
-        ops += [add("cube", name, position, [edge] * 3, rotation=turn), glass(name, colour)]
+        ops += [add("cube", name, position, [edge] * 3, rotation=turn), glass(name, colour),
+                texture(name, "Sand1", ["bump"], 0.06)]
     # A glass cube hollowed out by a boolean: the sphere is cut from the cube.
     ops += [add("cube", "Shell", [34, 56, -50], [30] * 3, rotation=[28, 38, 14]),
             glass("Shell", "#8088d0", 0.5),
@@ -323,8 +636,10 @@ def colour_generation():
     return ops
 
 
-SCENES = {"01_dream_sea": dream_sea, "02_silver_drops": silver_drops, "03_orrery": orrery,
-          "04_far_world": far_world, "05_colour_generation": colour_generation}
+# In the order they are rendered: textures and booleans on plain shapes first, then
+# the scenes that rely on new meshes, so a problem shows up as early as possible.
+SCENES = {"02_silver_drops": silver_drops, "05_colour_generation": colour_generation,
+          "03_orrery": orrery, "04_far_world": far_world, "01_dream_sea": dream_sea}
 
 
 def folder() -> str:

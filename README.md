@@ -148,10 +148,19 @@ It writes `bridge-report.json` and `bridge-capture.png` to the output folder.
 ## Examples
 
 [examples/gallery.py](examples/gallery.py) holds five scenes written only with the
-operations above: a mirrored checkerboard sea with a stairway and a rainbow ribbon (308
-objects), silver orbs over still water under a tilted horizon, a gyroscope beside a glass
-citadel, an alien plain with a craggy spiked arch (one new mesh) under a giant planet, and
-tilted floating glass cubes, one carved by a boolean.
+operations above, using textured materials, eroded terrains, preset skies and new meshes
+that the script builds itself:
+
+- **dream_sea** - mirrored checkerboard water, a glass stairway, a fluted column with a
+  carved jar, a curved slide, jagged pink peaks and a ribbon of 6,000 rainbow flecks
+- **silver_drops** - chrome spheres over rippled water under a tilted horizon
+- **orrery** - a gyroscope of thin chrome rings beside a crystal citadel on eroded crags
+- **far_world** - rough textured ground breaking through mist, a spined arch, craggy
+  boulders and asteroids, and a clouded pink planet
+- **colour_generation** - tilted glass cubes, one carved by a boolean
+
+They are rendered in the order that tests plain shapes first and new meshes last. The
+larger scenes are 10 to 15 MB each.
 
 On Windows, start Bryce and double-click `render-gallery.bat`. Your template needs a stone.
 It asks whether to load the bridge, never discards unsaved work unless you type `DISCARD`,
@@ -162,7 +171,7 @@ blank pictures as renders. Expect to tune colors, ripples and sun angles.
 
 ## Status - read this first
 
-Version 0.5.0. The Python code has automated tests, run on Linux. The bridge DLL is tested
+Version 0.5.1. The Python code has automated tests, run on Linux. The bridge DLL is tested
 in a harness that loads your real `Bryce 3D.exe` and `Axiom.dll` on Linux with stand-ins for
 Windows. **Most new features have not run on Windows yet.**
 
@@ -176,6 +185,7 @@ Windows. **Most new features have not run on Windows yet.**
 | New mesh shapes | Re-encoding a stone made by Bryce gives the same size, identical header and geometry equal to 1e-12. **A new mesh has not been rendered** |
 | Sky and sun settings | **Fixed in 0.5.0:** earlier versions did not write the copy Bryce draws from. All 38 cached positions agree with the settings in four Bryce-saved scenes. Not rendered |
 | Camera including bank | Reading matches a real render within 1.7 pixels. **Writing, and the direction of bank, not rendered** |
+| Textures from the `texture` operation | **Fixed in 0.5.1:** earlier versions left out the type marker in front of the texture link, so Bryce could probably not have followed it. All 127 textured channels in Bryce's own preset and template files have the marker, and all those written here now do. Not rendered |
 | Texture scale | The three numbers were identified from Bryce's presets. **Whether a larger number makes a pattern larger or smaller is not confirmed** |
 | Groups, booleans, preset models, materials, textures and skies, rotation about Z, other object kinds | Layouts read from Bryce's own files; all 154 bundled presets load with every link intact. **Not opened in Bryce yet** |
 | Animation | Frames and previews tested here. Rendering a series is tested against a stand-in only |
@@ -192,7 +202,8 @@ shadows in about a second, and says for each object whether it is in frame, off 
 behind the camera or hidden. Against Bryce's render of a test scene, object outlines lined
 up within about 2 pixels. It does **not** show textures, ripples, Bryce's skies and clouds,
 atmosphere, reflections, transparency, boolean cuts, object-on-object shadows or lights.
-It draws new meshes and camera tilt. Use it for layout, and `br3_render` for the look.
+It draws new meshes and camera tilt. Use it for layout, and `br3_render` for the look: a
+textured, reflective scene looks flat and plain in the preview.
 
 ## Install (Windows)
 
@@ -368,7 +379,9 @@ objects, an item in the root object list.
   record, which is what Bryce draws from, so both are written. 35 sky offsets (the four moon
   phase values at 680-704) and 3 sun offsets agree with Bryce-saved scenes. The Sky Lab's
   on/off switches live in a flag word whose bits have not been identified.
-- **Textures:** a procedural texture record keeps three scale numbers (doubles at 276).
+- **Textures:** in a material, each textured channel block is preceded by a four-byte type
+  (`brtx` procedural, `pctx` picture), then the texture's id; bit `0x40` of the word at 268
+  is set. A procedural texture record keeps three scale numbers (doubles at 276).
 - **Terrain:** a scene keeps heights twice: in the terrain record, and as big-endian u16 in
   a second record (`HF_eHFMem`, from offset 208). Both are written.
 

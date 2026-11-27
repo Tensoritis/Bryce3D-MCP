@@ -165,6 +165,53 @@ def test_texture_by_name(scene, library, install):
             {"op": "texture", "name": "Cube 1", "texture": "nope", "channels": ["bump"]})
 
 
+def texture_links(scene, name):
+    """(type tag, link, textured flag) for the material channels of one object."""
+    from bryce3d_mcp.br3 import MATERIAL_CHANNELS
+    payload = scene._payload(scene._own_material(name))
+    found = {channel: (bytes(payload[block - 4:block]),
+                       struct.unpack_from("<I", payload, block)[0],
+                       struct.unpack_from("<I", payload, block + 20)[0])
+             for channel, (block, _, _) in MATERIAL_CHANNELS.items() if block}
+    return found, struct.unpack_from("<I", payload, 268)[0]
+
+
+def test_an_applied_texture_names_its_type_and_removing_it_clears_that(scene, library,
+                                                                       install):
+    after = run(scene, library, install,
+                {"op": "texture", "name": "Cube 1", "texture": "checks",
+                 "channels": ["color", "bump"]})
+    links, flags = texture_links(after, "Cube 1")
+    for channel in ("color", "bump"):
+        tag, link, textured = links[channel]
+        assert tag == b"xtrb" and link and textured == 0x10000000
+    assert links["diffuse"][:2] == (bytes(4), 0) and flags & 0x40
+    plain = run(after, library, install,
+                {"op": "set", "name": "Cube 1", "material": {"bump": 0.1}})
+    links, _ = texture_links(plain, "Cube 1")
+    assert links["bump"] == (bytes(4), 0, 0) and links["color"][0] == b"xtrb"
+
+
+@pytest.mark.skipif(not os.environ.get("BRYCE3D_INSTALL"),
+                    reason="set BRYCE3D_INSTALL to test against real preset files")
+def test_every_textured_channel_in_real_presets_names_its_type():
+    from bryce3d_mcp import presets
+    from bryce3d_mcp.br3 import _TEXTURE_TAGS, MATERIAL_CHANNELS
+    folder = presets.folder(os.environ["BRYCE3D_INSTALL"])
+    checked = 0
+    for file_name in os.listdir(folder):
+        source = presets.donor(folder, file_name)
+        for row in source._rows.get("C3dBaseMaterial", []):
+            ref = ("C3dBaseMaterial", struct.unpack_from(">I", row)[0])
+            payload, links = source._payload(ref), dict(source._links(ref))
+            for channel in source._textures(ref):
+                block = MATERIAL_CHANNELS[channel][0]
+                assert payload[block - 4:block] == _TEXTURE_TAGS[links[block][0]]
+                assert struct.unpack_from("<I", payload, 268)[0] & 0x40
+                checked += 1
+    assert checked > 100
+
+
 def test_sky_preset_writes_the_scenes_own_records(scene, library, install):
     tracks = set(scene._scene_settings("C3dBaseSky", "Sky_e"))
     after = run(scene, library, install, {"op": "sky_preset", "preset": "Sunset"})

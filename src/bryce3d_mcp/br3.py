@@ -112,6 +112,12 @@ MATERIAL_VALUES = {name: spec[2] for name, spec in MATERIAL_CHANNELS.items()
                    if not name.endswith("color")}
 _TEXTURED_FLAG = 0x10000000
 _TEXTURE_SCALE = 276          # three doubles in a texture record, one per axis
+# Four bytes in front of a channel's texture link name the kind of texture it
+# points at. Without them the link cannot be followed. Every textured channel in
+# Bryce's own files has them, with this bit also set in the material's flag word.
+_TEXTURE_TAGS = {"C3dTexture": b"xtrb", "CPictTexture": b"xtcp"}      # 'brtx', 'pctx'
+_MATERIAL_FLAGS = 268
+_USES_TEXTURES = 0x40
 _SHOWN = ("color", "diffuse", "ambient", "specular", "transparency", "reflection",
           "bump", "refraction")
 
@@ -554,6 +560,7 @@ class Br3:
                 data = struct.pack("<f", _number(value, label))
             texture = self._textures(material).get(label)
             if texture is not None:                  # a plain value replaces a texture
+                self._write(material, block - 4, bytes(4))
                 self._write(material, block, bytes(4))
                 self._write(material, block + 20, bytes(4))
                 released.add(texture)
@@ -584,8 +591,11 @@ class Br3:
             raise BryceError(f"no texture named {texture!r}; available: {', '.join(available)}")
         copy = self._copy(source, ref)
         material = self._own_material(name)
+        flags = struct.unpack_from("<I", self._payload(material), _MATERIAL_FLAGS)[0]
+        self._write(material, _MATERIAL_FLAGS, struct.pack("<I", flags | _USES_TEXTURES))
         for channel in channels:
             block = MATERIAL_CHANNELS[channel][0]
+            self._write(material, block - 4, _TEXTURE_TAGS[copy[0]])
             self._write(material, block, struct.pack("<I", copy[1]))
             self._write(material, block + 20, struct.pack("<I", _TEXTURED_FLAG))
         if strength is not None:

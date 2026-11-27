@@ -186,8 +186,10 @@ def material_library() -> bytes:
     texture_key = b.record("C3dTexture", texture)
     checker = flat_material((0.5, 0.5, 0.5))
     for block in (276, 716):                      # colour and reflection use it
+        checker[block - 4:block] = b"xtrb"
         struct.pack_into("<I", checker, block, texture_key)
         struct.pack_into("<I", checker, block + 20, 0x10000000)
+    struct.pack_into("<I", checker, 268, 0x40)
     key = b.record("C3dBaseMaterial", checker)
     b.record("CPresetDescr", description("Checker"), key=key)
     return b.pack(0)
