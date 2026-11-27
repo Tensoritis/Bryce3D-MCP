@@ -8,8 +8,9 @@ server works four ways:
 
 1. **Scene files (preferred).** The agent builds and edits `.br3` scenes directly: objects,
    new 3D shapes, groups and booleans, materials, textures, Bryce's own preset models,
-   materials and skies, terrain heights, camera, sun, sky and moon, keyframes on Bryce's
-   own timeline, plus animations as a series of scenes. Each edit returns a preview picture.
+   materials and skies, terrain heights, camera, sun, sky and moon, keyframes and time
+   curves on Bryce's own timeline, motion paths, plus animations as a series of scenes.
+   Each edit returns a preview picture.
 2. **Window messages.** To render, run menu commands, load, save, answer Windows file
    dialogs and take pictures, the server talks to Bryce's window directly. Bryce can stay
    behind your other windows.
@@ -67,7 +68,9 @@ applies completely or writes nothing.
 | `mesh` | A **new 3D shape** written straight into the scene: `extrude` an outline, `lathe` a profile, `custom` points and faces, or an `obj` file. Edges sharper than `smooth_angle` (40) stay crisp |
 | `texture_scale` | Multiply a procedural texture's three scale numbers. They count how often the pattern repeats, so 2 makes it half as big |
 | `texture_edit` | How a procedural texture wraps (`mapping`: object_space, world_space, parametric, parametric_scaled, world_top, spherical, cylindrical, reflection_map, random, object_top, object_front), its `scale`, `offset` and `rotation`, and its colors: `replace_colors` swaps one color for another, `color_sets` sets any of its four sets of three |
-| `keyframes` | **Animate an object on Bryce's own timeline**: keys with a `frame` or `time` and any of `position`, `rotation` and `scale` (see [Animation](#animation)) |
+| `keyframes` | **Animate on Bryce's own timeline**: objects, the camera, sun, sky, materials and lamps, with a `curve` that shapes the timing (see [Animation](#animation)) |
+| `path` | A new Bryce path object through your points, open or closed |
+| `follow_path` | Move an object or the camera along a path: one in the scene, one of Bryce's 30, or a list of points |
 | `time_marker` | Move Bryce's time marker, so the scene opens, previews and renders at that moment |
 | `camera` | Position, heading, pitch or `look_at`, `bank` (tilt: positive drops the right end of the horizon), field of view |
 | `sun` | Azimuth (relative to the camera: 0 ahead, 90 right, 180 behind), altitude, colors |
@@ -106,19 +109,80 @@ change and render in Bryce:
 ]
 ```
 
-- A `keyframes` operation replaces the keys of the channels it names (`position`,
-  `rotation`, `scale`). A channel given only one key stops being animated.
+- A `keyframes` operation replaces the keys of the channels it names. A channel given only
+  one key stops being animated.
 - The length always reaches the last key; `duration` can make it longer. Frames run at the
   scene's own rate (15 a second in Bryce's new scenes).
-- `br3_info` lists each animated object's keys. To look at any moment, use `time_marker`,
-  then preview or render. On a key this is exact. **Between two keys the server places the
-  object on a straight line**, while Bryce draws its own curve, and the result says so.
+- `br3_info` lists what is animated, with its keys and curves. To look at any moment, use
+  `time_marker`, then preview or render.
 - `set` with a new `position` moves the **whole motion**. An animated rotation or scale is
-  changed with `keyframes`. Animated objects cannot be grouped or ungrouped. `duplicate`
-  keeps the motion; an object newly added from a template starts still.
+  changed with `keyframes`. The `camera`, `sun`, `sky`, `material` and light operations
+  refuse to overwrite an animated setting. Animated objects cannot be grouped or
+  ungrouped. `duplicate` keeps the motion; an object newly added from a template starts
+  still.
 - Put rotation keys less than 180 degrees apart: each turn takes the short way.
-- Only objects can be keyed. Camera, sun, sky, material and light keys, motion paths and
-  the easing of Bryce's curves are not covered.
+
+### What can be keyed
+
+| `target` | Settings a key may set |
+| --- | --- |
+| `object` (default, with `name`) | `position`, `rotation`, `scale` |
+| `camera` | `position`, `heading`, `pitch`, `bank`, `look_at`, `fov`. Heading, pitch and bank share one Bryce track. Headings are taken literally (0 to 360 is one full turn); `look_at` turns the short way |
+| `sun` | `azimuth`, `altitude`, `disc_color`, `halo_color` |
+| `sky` | Bryce's sky values by name, the same ones the `sky` operation takes. On/off switches cannot be keyed |
+| `material` (with `name`) | `color`, `ambient_color`, `diffuse`, `ambient`, `transparency`, `reflection`, `bump` and the other material numbers and colors |
+| `light` (with `name`) | `color`, `intensity`. Bryce had saved no such records on its lamps in the scenes seen, so they are built here |
+
+A scene saved by Bryce already holds these records with one key each, so use a scene or
+template that came from your Bryce.
+
+### The shape of Bryce's curves
+
+`curve` shapes the **timing** of a channel: how far along its keys it has got at each
+moment, from its first key to its last. This is the curve Bryce stores on a track; the
+values still blend from key to key in order.
+
+```json
+[
+  {"op": "keyframes", "name": "Ball", "curve": "ease",
+   "keys": [{"frame": 0, "position": [-40, 10, 0]}, {"frame": 60, "position": [40, 10, 0]}]},
+  {"op": "keyframes", "target": "camera", "curve": {"fov": "hold"},
+   "keys": [{"frame": 0, "fov": 60}, {"frame": 60, "fov": 30}]},
+  {"op": "keyframes", "name": "Ball", "curve": [[0, 0], [0.3, 0.8, "smooth"], [1, 1]]}
+]
+```
+
+- Named shapes: `linear` (removes the curve), `ease`, `ease_in`, `ease_out` and `hold`.
+- Or give your own points `[time, progress, "smooth" or "straight"]`, from `[0, 0]` to
+  `[1, 1]`. The word says whether the stretch **starting** at that point is curved.
+- One curve for every channel, or an object naming channels. `curve` without `keys`
+  reshapes motion that is already there.
+- The handles of the curve are built by rules read from Bryce's code. They agreed with
+  Bryce's own routine, run in an emulator, on 20,000 random curve stretches.
+- The curve spans the whole motion, from first key to last, not each gap between keys. To
+  slow down at a middle key, put curve points around that key's time.
+
+### Motion paths
+
+```json
+[
+  {"op": "path", "name": "Track", "closed": true,
+   "points": [[60, 15, 0], [0, 25, 60], [-60, 15, 0], [0, 8, -60]]},
+  {"op": "follow_path", "name": "Ball", "path": "Track", "end": 90, "face": true},
+  {"op": "follow_path", "target": "camera", "preset": "Horse Shoe", "centre": [0, 40, 0],
+   "scale": 1.5, "end": 90, "look_at": [0, 10, 0], "curve": "ease"}
+]
+```
+
+- `path` makes a real Bryce path object. Bryce's 30 ready-made ones can be added with
+  `insert_preset` and `"library": "Paths"`. A path can be moved, but not resized or turned.
+- `follow_path` writes ordinary position keys along the route at a steady speed (a `curve`
+  changes the speed). `face` turns the follower the way it travels; `look_at` keeps the
+  camera on one spot; `centre`, `scale` and `turn` refit the route.
+- **It is not Bryce's own path link.** How Bryce ties a follower to a path is not decoded,
+  so editing the path in Bryce afterwards will not move the follower. The route between
+  points is a centripetal Catmull-Rom spline. Bryce's path points also hold tension,
+  continuity, bias and twist, which are read past and written as zero.
 
 **One scene per frame** works for everything, including the camera and sky. `br3_animate` takes keyframes and paths and writes **one ordinary scene per frame**, with a
 preview GIF. `br3_render_animation` renders the frames in Bryce a few at a time (it can be
@@ -208,7 +272,7 @@ half the stated height, plus a missing boolean part. All three are fixed in 0.6.
 
 ## Status - read this first
 
-Version 0.11.0. The Python code has automated tests, run on Linux. The bridge DLL is tested
+Version 0.13.0. The Python code has automated tests, run on Linux. The bridge DLL is tested
 in a harness that loads your real `Bryce 3D.exe` and `Axiom.dll` on Linux with stand-ins for
 Windows. **Parts of it have not run on Windows yet; see the table.**
 
@@ -232,8 +296,10 @@ Windows. **Parts of it have not run on Windows yet; see the table.**
 | Preset materials and skies, rotation about Z | **Rendered** |
 | Booleans | In the first render the carved cube was missing. 0.6.0 writes the extra flags Bryce's own boolean parts have. **Not rendered since** |
 | Preset models, plain groups, lights, disk, lattice | Layouts read from Bryce's own files; all 154 bundled presets load with every link intact. **Not opened in Bryce yet** |
-| Position keyframes | New in 0.12.0. Starting from a scene saved before animating, adding the same keys rebuilds the five two-key records Bryce saved **byte for byte**, and all of its document settings. **A scene keyed here has not been played in Bryce** |
-| Rotation and scale keyframes | New in 0.12.0. They follow the same record layout, but no scene in which Bryce saved two of these keys has been seen. **Untested in Bryce** |
+| Position, rotation and scale keyframes | **Confirmed moving in Bryce** with a test scene that animates one object each way. Rebuilding two-key position records that Bryce saved matches them **byte for byte** |
+| Time curves | New in 0.13.0. Layout and handle rules read from Bryce's code, and the rules match its own curve routine. That Bryce blends values evenly between keys was read for some kinds of track, not traced for the ordinary object ones. **Not played in Bryce** |
+| Camera, sun, sky, material and lamp keys | New in 0.13.0. Written into the records Bryce itself keeps for them (lamp records are built here). **Not played in Bryce** |
+| Path objects and `follow_path` | New in 0.13.0. The record was read from Bryce's 30 path presets, which all load and can be followed. **A path made here has not been opened in Bryce**, and that its drawn line lines up with the follower is unconfirmed |
 | Frame-by-frame animation | Frames and previews tested here. Rendering a series is tested against a stand-in only |
 | Saving and loading | Save-box detection works on real pictures. The Save As and load steps are **not tried live** |
 | The bridge | **Loaded on Windows.** Opening scenes, starting renders from the menu, noticing when each finished and capturing the picture worked for all five gallery scenes |
@@ -472,10 +538,22 @@ objects, an item in the root object list.
 
 **Keyframes.** Every setting record is a 148-byte header, whose third u32 is the key count,
 then keys of equal size: the time in seconds (double), a u32 that is 2, and the value at
-+44. A one-key record is an ordinary setting. An object also keeps the pose at the time
++44 (+72 in material records). A one-key record is an ordinary setting. An object also keeps the pose at the time
 marker in its own record, which is what Bryce draws. In the document settings (big-endian
 floats, seconds) the duration is at 60, frames per second at 64, the time marker at 68 and
-the working range at 72 and 76. See `src/bryce3d_mcp/keyframes.py`.
+the working range at 72 and 76. See `src/bryce3d_mcp/keyframes.py`. The independent
+[bryce3d-re](https://github.com/bhuaysan/bryce3d-re) notes on this version of Bryce agree
+on the header, the key sizes and the order of the material channels.
+
+**Time curves.** A track's curve follows its keys, and the u32 at 16 in the track header
+is its length: a 44-byte header (1, 1, point count) and 28 bytes per point, of which the
+first 12 are used: time and progress as fractions (floats) and a flag whose bit `0x2`
+curves the stretch that starts there. See `src/bryce3d_mcp/curve.py`.
+
+**Paths (`C3dPath`).** At 640: 1, 2, the point count; at 652 the bounding box; from 700,
+100 bytes a point: position (doubles), then tension, continuity, bias and twist (floats).
+Points are saved already resized and turned, measured from the object's center. See
+`src/bryce3d_mcp/motion.py`.
 
 **Meshes (`C3dTriMeshType2`).** After the 640-byte object header: `2, points, normals,
 triangles, 0`; at 660 a bounding box padded by 1% per side; from 860 the points and then
@@ -558,8 +636,14 @@ Nothing here uses your mouse or keyboard. Keep a saved copy of any scene you car
 
 Not everything in Bryce 3D is covered by the file tools:
 
-- On Bryce's own timeline only object position, rotation and scale can be keyed. Motion
-  path objects, camera and sky keys and the shape of Bryce's curves are not covered.
+- Not every Bryce 3D feature can be driven from files. Known gaps: Bryce's own link from
+  a follower to a path, and path tension, continuity, bias and twist; keys on sky switches,
+  texture settings and light settings other than color and intensity; linking one object
+  to another, tracking, and Object Attributes options such as locking, hiding and families;
+  adding new 2D faces and slabs; light gels; the 360 panorama render type. Some of these
+  can be reached by clicking through the bridge, which is untried in the Labs. This list
+  may not be complete.
+- Object presets saved on a Mac (all 31 in `Rocks&Trees.obp`) cannot be inserted yet.
 - A procedural texture's noise types, filters and the way its parts are combined cannot
   be edited.
 - Inside the Labs, the agent works by looking and clicking; there are no per-control tools.

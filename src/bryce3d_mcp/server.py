@@ -40,7 +40,10 @@ BUILD with the br3_ tools. They work on scene files:
    Bryce's real picture of a scene.
 br3_edit can also make NEW 3D shapes (op mesh: extrude, lathe, custom, OBJ), tilt
 the camera (bank), put picture files on objects, place and recolor procedural
-textures, set lights and moon phase. br3_animate makes
+textures, set lights and moon phase. On Bryce's own timeline, op keyframes animates
+objects, the camera, sun, sky, materials and lamps, with a curve for the timing; op
+path draws a Bryce path and op follow_path moves an object or the camera along one
+(br3_operations has the fields). br3_animate makes
 keyframe and path animations as one scene per frame; br3_render_animation renders
 them and joins the pictures.
 
