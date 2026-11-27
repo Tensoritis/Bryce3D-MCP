@@ -2,9 +2,11 @@
 
 It lets an agent check layout, framing and colours without running or touching
 the program. The camera model and the object transform rule were checked against
-Bryce renders (shape outlines agree to within a few pixels). Textures, clouds,
-reflections, transparency and object-to-object shadows are not drawn, so judge
-the final look from a real Bryce render.
+Bryce renders (shape outlines agree to within a few pixels). Surfaces are lit
+from their color, ambient color, diffuse and ambient settings. Textures, clouds,
+reflections, object-to-object shadows and see-through objects are not drawn (a
+see-through plane below the camera is a flat tint), so judge the final look from
+a real Bryce render.
 """
 
 from __future__ import annotations
@@ -104,15 +106,16 @@ def _placed(points, transform):
     return ((points + origin) * scale) @ np.array(rotation_matrix(rotation)) + position
 
 
-def _local_parts(scene: Br3, kind: str, ref) -> list:
+def _local_parts(scene: Br3, kind: str, ref, detail: int = 64) -> list:
     """The surfaces of one object in its parent's coordinates (file units) as
-    (vertices, triangles, "#rrggbb" or None, cuts). A group gives one part per
+    (vertices, triangles, material settings, cuts). A group gives one part per
     member; `cuts` marks a boolean negative, which has no surface of its own."""
     if kind == "group":
         transform = scene.transform(ref)
-        return [(_placed(points, transform), faces, colour, cuts)
+        return [(_placed(points, transform), faces, material, cuts)
                 for member_kind, member in scene._members(ref)
-                for points, faces, colour, cuts in _local_parts(scene, member_kind, member)]
+                for points, faces, material, cuts
+                in _local_parts(scene, member_kind, member, detail)]
     if kind == "mesh":
         try:
             points, faces = scene.mesh_geometry(ref)
@@ -120,20 +123,31 @@ def _local_parts(scene: Br3, kind: str, ref) -> list:
         except BryceError:
             points, faces = _SHAPES[kind]()      # a rough stand-in
     elif kind in ("terrain", "lattice"):
-        points, faces = _terrain(*heightfield.decode(scene._payload(ref)),
+        size, heights = heightfield.decode(scene._payload(ref))
+        points, faces = _terrain(size, heights, detail if size > 128 else 64,
                                  mirrored=kind == "lattice")
     elif kind in _SHAPES:
         points, faces = _SHAPES[kind]()
     else:
         return []
     return [(_placed(points, scene.transform(ref)), faces,
-             scene.material(ref).get("color"), scene.boolean_of(ref) == "negative")]
+             scene.material(ref), scene.boolean_of(ref) == "negative")]
 
 
-def object_parts(scene: Br3, kind: str, ref) -> list:
-    """_local_parts with the vertices in Bryce units."""
-    return [(points * UNIT, faces, colour, cuts)
-            for points, faces, colour, cuts in _local_parts(scene, kind, ref)]
+def object_parts(scene: Br3, kind: str, ref, detail: int = 64) -> list:
+    """_local_parts with the vertices in Bryce units. `detail` is how many samples
+    a side to draw of a terrain finer than 128."""
+    return [(points * UNIT, faces, material, cuts)
+            for points, faces, material, cuts in _local_parts(scene, kind, ref, detail)]
+
+
+def _fine_detail(scene: Br3) -> int:
+    """Samples a side for fine terrains: more when there are few of them, so that
+    a preview of many stays quick."""
+    fine = sum(1 for kind, key in scene._objects()
+               if kind == "terrain"
+               and heightfield.decode(scene._payload(key))[0] > 128)
+    return int(max(64, min(160, math.sqrt(120_000 / max(fine, 1)))))
 
 
 _LENS = 1.037
@@ -186,6 +200,32 @@ def _clip_near(triangle):
     return [(out[0], out[i], out[i + 1]) for i in range(1, len(out) - 1)]
 
 
+def _on_screen(view: "_View", triangles):
+    """Of N camera-space triangles (N x 3 x 3), those that could colour a pixel, as
+    (screen corners, depths, which of the N), in their original order."""
+    if len(triangles) == 0:
+        return
+    behind = triangles[:, :, 2] < _NEAR
+    whole = np.nonzero(~behind.any(1))[0]
+    found = []
+    if len(whole):
+        pixels = view.to_pixels(triangles[whole])
+        # Pixel centres lie at half steps: a box holding none covers nothing.
+        first = np.maximum(np.floor(pixels.min(1)), 0)
+        last = np.minimum(np.ceil(pixels.max(1)), (view.width - 1, view.height - 1))
+        some = (np.ceil(pixels.min(1) - 0.5 - 1e-3)
+                <= np.floor(pixels.max(1) - 0.5 + 1e-3)).all(1)
+        for i in np.nonzero(some & (first <= last).all(1))[0]:
+            found.append((whole[i], pixels[i], triangles[whole[i], :, 2]))
+    for i in np.nonzero(behind.any(1) & ~behind.all(1))[0]:
+        for part in _clip_near(triangles[i]):    # crossing the near plane
+            part = np.array(part)
+            found.append((i, view.to_pixels(part), part[:, 2]))
+    found.sort(key=lambda item: item[0])
+    for which, pixels, depths in found:
+        yield pixels, depths, which
+
+
 def _covered(points, width, height):
     """Pixels inside a screen triangle: (rows, columns, barycentric weights)."""
     low = np.maximum(np.floor(points.min(0)).astype(int), 0)
@@ -215,6 +255,21 @@ def _rgb(text: str | None):
     return np.array([int(text[i:i + 2], 16) / 255 for i in (1, 3, 5)])
 
 
+def _lighting(material: dict) -> tuple[np.ndarray, np.ndarray]:
+    """What a surface shows (in the shade, added by full sun). In Bryce the shaded
+    side is the ambient color times the ambient value, whatever the main color is;
+    the sun adds the main color times the diffuse value. A channel driven by a
+    texture is shown as grey."""
+    textured = material.get("textures", {})
+
+    def colour(channel):
+        return _rgb(None if channel in textured else material.get(channel))
+
+    shaded = colour("ambient_color") * material.get("ambient", 0.14)
+    lit = colour("color") * material.get("diffuse", 1.0) * 0.96
+    return shaded, lit
+
+
 def _above(polygon, level: float):
     """The part of a polygon (N x 3) at or above the height `level`."""
     kept = []
@@ -241,17 +296,22 @@ def render(scene: Br3, width: int = DEFAULT_SIZE[0], height: int = DEFAULT_SIZE[
     picture = _SKY_TOP * (1 - blend) + _SKY_LOW * blend
     depth = np.full((height, width), np.inf)
 
-    solids, report, floor = [], [], None
+    solids, report, floor, sheets = [], [], None, []
+    detail = _fine_detail(scene)
     for kind, key in scene._objects():
         info = scene.describe(kind, key)
         if kind == "plane":
             y = info["position"][1]
+            material = scene.material(key)
+            drawn_as = "not drawn (raised plane)"
             if y < 1 and floor is None:
-                floor = y
-            report.append({"name": info["name"], "kind": kind,
-                           "preview": "ground" if y < 1 else "not drawn (raised plane)"})
+                floor, drawn_as = y, "ground"
+            elif y < view.eye[1] and material.get("transparency", 0) > 0:
+                sheets.append((y, material))     # mist or shallow water
+                drawn_as = "a see-through tint"
+            report.append({"name": info["name"], "kind": kind, "preview": drawn_as})
             continue
-        parts = object_parts(scene, kind, key)
+        parts = object_parts(scene, kind, key, detail)
         drawn = [part for part in parts if not part[3]]
         if not drawn:
             report.append({"name": info["name"], "kind": kind, "preview": "not drawn"})
@@ -273,50 +333,66 @@ def render(scene: Br3, width: int = DEFAULT_SIZE[0], height: int = DEFAULT_SIZE[
         shadow = np.zeros_like(on_floor)
         if light[1] > 0.02:
             for points, faces in ((p[0], p[1]) for _, parts, _ in solids for p in parts):
-                for face in faces:
-                    # Only what stands above the ground can shade it.
-                    part = _above(points[list(face)], floor + 0.01)
+                faces = np.array(faces)
+                height_of = points[:, 1][faces]
+                # Only what stands above the ground can shade it.
+                whole = height_of.min(1) >= floor + 0.01
+                flat = points - light * ((points[:, 1] - floor) / light[1])[:, None]
+                corners = view.to_camera(flat)
+                for triangle in _on_screen(view, corners[faces[whole]]):
+                    hit = _covered(triangle[0], width, height)
+                    if hit:
+                        shadow[hit[0], hit[1]] = True
+                for face in faces[~whole & (height_of.max(1) >= floor + 0.01)]:
+                    part = _above(points[face], floor + 0.01)
                     if len(part) < 3:
                         continue
-                    flat = part - light * ((part[:, 1] - floor) / light[1])[:, None]
-                    corners = view.to_camera(flat)
-                    for first in range(1, len(corners) - 1):
-                        fan = corners[[0, first, first + 1]]
-                        for triangle in _clip_near(fan):
-                            hit = _covered(view.to_pixels(np.array(triangle)), width, height)
-                            if hit:
-                                shadow[hit[0], hit[1]] = True
+                    cast = part - light * ((part[:, 1] - floor) / light[1])[:, None]
+                    around = view.to_camera(cast)
+                    fan = np.stack([around[[0, i, i + 1]]
+                                    for i in range(1, len(around) - 1)])
+                    for triangle in _on_screen(view, fan):
+                        hit = _covered(triangle[0], width, height)
+                        if hit:
+                            shadow[hit[0], hit[1]] = True
         picture[shadow & on_floor] *= 0.5
 
     owner = np.full((height, width), -1)
-    surfaces = [(index, points, faces, colour)
+    surfaces = [(index, points, faces, material)
                 for index, (_, parts, _) in enumerate(solids)
-                for points, faces, colour, _ in parts]
-    for index, points, faces, shade_of in surfaces:
-        colour = _rgb(shade_of)
-        camera_points = view.to_camera(points)
-        for face in faces:
-            a, b, c = points[list(face)]
-            normal = np.cross(b - a, c - a)
-            length = np.linalg.norm(normal)
-            if length < 1e-9:
+                for points, faces, material, _ in parts]
+    for index, points, faces, material in surfaces:
+        shaded, lit = _lighting(material)
+        faces = np.array(faces)
+        corners = points[faces]
+        normals = np.cross(corners[:, 1] - corners[:, 0], corners[:, 2] - corners[:, 0])
+        lengths = np.linalg.norm(normals, axis=1)
+        solid = lengths >= 1e-9
+        faces, corners = faces[solid], corners[solid]
+        normals = normals[solid] / lengths[solid, None]
+        away = np.einsum("ij,ij->i", normals, view.eye - corners[:, 0]) < 0
+        normals[away] *= -1                    # light the side we can see
+        tones = np.clip(shaded + lit * np.maximum(normals @ light, 0)[:, None], 0, 1)
+        for pixels, depths, face in _on_screen(view, view.to_camera(points)[faces]):
+            hit = _covered(pixels, width, height)
+            if not hit:
                 continue
-            normal /= length
-            if normal @ (view.eye - a) < 0:        # light the side we can see
-                normal = -normal
-            tone = np.clip(colour * (0.14 + 0.96 * max(normal @ light, 0)), 0, 1)
-            for triangle in _clip_near(camera_points[list(face)]):
-                triangle = np.array(triangle)
-                hit = _covered(view.to_pixels(triangle), width, height)
-                if not hit:
-                    continue
-                rows, columns, weights = hit
-                z = 1 / (weights @ (1 / triangle[:, 2]))
-                nearer = z < depth[rows, columns]
-                rows, columns = rows[nearer], columns[nearer]
-                depth[rows, columns] = z[nearer]
-                picture[rows, columns] = tone
-                owner[rows, columns] = index
+            rows, columns, weights = hit
+            z = 1 / (weights @ (1 / depths))
+            nearer = z < depth[rows, columns]
+            rows, columns = rows[nearer], columns[nearer]
+            depth[rows, columns] = z[nearer]
+            picture[rows, columns] = tones[face]
+            owner[rows, columns] = index
+
+    for level, material in sorted(sheets, key=lambda sheet: sheet[0]):
+        with np.errstate(divide="ignore", invalid="ignore"):
+            distance = (level - view.eye[1]) / rays[..., 1]
+        over = (rays[..., 1] < 0) & (distance < depth)
+        shaded, lit = _lighting(material)
+        tone = np.clip(shaded + lit * max(light[1], 0), 0, 1)
+        clear = min(1.0, max(0.0, material.get("transparency", 0)))
+        picture[over] = picture[over] * clear + tone * (1 - clear)
 
     for index, (info, parts, cutting) in enumerate(solids):
         entry = {"name": info["name"], "kind": info["kind"]}
@@ -356,7 +432,7 @@ def to_obj(scene: Br3) -> tuple[str, int]:
     lines, offset, written = ["# exported from a Bryce 3D scene by bryce3d-mcp"], 1, 0
     for kind, key in scene._objects():
         parts = [] if kind == "plane" else [
-            part for part in object_parts(scene, kind, key) if not part[3]]
+            part for part in object_parts(scene, kind, key, 160) if not part[3]]
         if not parts:
             continue
         lines.append("o " + (scene._name(key) or kind).replace(" ", "_"))

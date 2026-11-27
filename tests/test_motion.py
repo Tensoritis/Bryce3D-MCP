@@ -248,3 +248,24 @@ def test_unevenly_spaced_points_do_not_make_the_path_double_back():
                             False, 0, 100, 101)
     across = [m["position"][0] for m in moments]
     assert all(b > a for a, b in zip(across, across[1:]))
+
+
+def damaged_path_scene() -> Br3:
+    """A path whose shape matrix has a huge upright term, as one of Bryce's presets does."""
+    scene = path_scene()
+    scene._write(scene.find("Old Path")[1], 284,
+                 struct.pack("<9d", 1, 0, 0, 0, 2e9, 0, 0, 0, 1))
+    return Br3.from_bytes(scene.data)
+
+
+@pytest.mark.parametrize("operation", [
+    {"op": "path", "name": "Mended", "points": SQUARE},
+    {"op": "follow_path", "name": "Cube 1", "path": "Old Path", "end": 4},
+])
+def test_a_path_never_carries_a_damaged_shape_matrix(operation):
+    scene, _ = run(damaged_path_scene(), operation)
+    if operation["op"] == "path":
+        payload = scene._payload(scene.find("Mended")[1])
+        assert struct.unpack_from("<9d", payload, 284) == (1, 0, 0, 0, 1, 0, 0, 0, 1)
+    else:
+        assert at(scene, 2)["position"] != at(scene, 0)["position"]

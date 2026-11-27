@@ -155,7 +155,8 @@ class SettingAnimation:
         for owner in channel.owners:
             if self._linked(owner, channel.class_name) is not None:
                 continue
-            record = keyframes.fresh(channel.number, channel.form, channel.key_offset, value)
+            record = keyframes.fresh(channel.number, channel.form, channel.key_offset,
+                                     value, self._key_body(channel, owner))
             if channel.slot is None:
                 raise BryceError(f"there is no {channel.class_name} record to animate; "
                                  "use a template scene saved by Bryce")
@@ -164,6 +165,10 @@ class SettingAnimation:
                              after=self._earlier_classes(channel.class_name, owner[0]))
             self._reindex()
             self._write(owner, channel.slot, struct.pack("<I", key))
+
+    def _key_body(self, channel: Channel, owner) -> bytes:
+        """What a new key carries besides its value (nothing, except for materials)."""
+        return b""
 
     def _earlier_classes(self, class_name: str, owner_class: str) -> list[str]:
         """The record types a new track type must follow: Bryce lists a track's

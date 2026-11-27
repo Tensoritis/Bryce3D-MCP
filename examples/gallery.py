@@ -16,6 +16,10 @@ import math
 import os
 import random
 import sys
+import tempfile
+
+import numpy as np
+from PIL import Image
 
 from bryce3d_mcp import preview, sceneops, server
 from bryce3d_mcp.br3 import Br3
@@ -295,48 +299,6 @@ def confetti(path, count=6000, bands=12, seed=7):
     return ops
 
 
-def jagged_arch(centre, radius, thickness, seed=11, along=130, around=28):
-    """A craggy stone arch bristling with spines, made as one new mesh. It runs a
-    little below the ground at both feet."""
-    rng = random.Random(seed)
-    waves = [(rng.uniform(5, 34), rng.randint(2, 11), rng.uniform(0, math.tau),
-              rng.uniform(0.05, 0.15)) for _ in range(11)]
-    start, end = math.radians(-14), math.radians(194)
-    vertices, faces = [], []
-    for i in range(along + 1):
-        angle = start + (end - start) * i / along
-        out = (math.cos(angle), math.sin(angle), 0.0)
-        swell = 1 + 0.5 * abs(math.cos(angle)) ** 2           # heavier toward the feet
-        for j in range(around):
-            turn = math.tau * j / around
-            rough = rng.uniform(0.9, 1.1)
-            for along_f, around_f, phase, height in waves:
-                rough += height * (1 - 2 * abs(math.sin(along_f * angle + around_f * turn
-                                                         + phase)))
-            across = thickness * swell * max(0.5, rough)
-            # Spines grow from the outer side.
-            if math.cos(turn) > 0.35 and 3 < i < along - 3 and rng.random() < 0.03:
-                across += thickness * rng.uniform(0.5, 1.3)
-            lift = math.cos(turn) * across
-            vertices.append([centre[0] + out[0] * (radius + lift),
-                             centre[1] + out[1] * (radius + lift),
-                             centre[2] + math.sin(turn) * thickness * swell
-                             * max(0.5, rough)])
-    for i in range(along):
-        for j in range(around):
-            a, b = i * around + j, i * around + (j + 1) % around
-            c, d = b + around, a + around
-            faces += [[a, b, c], [a, c, d]]
-    for ring, flip in ((0, True), (along, False)):             # close both ends
-        hub = len(vertices)
-        points = vertices[ring * around:(ring + 1) * around]
-        vertices.append([sum(p[k] for p in points) / around for k in range(3)])
-        for j in range(around):
-            a, b = ring * around + j, ring * around + (j + 1) % around
-            faces.append([hub, b, a] if flip else [hub, a, b])
-    return mesh("Arch", vertices, faces, 25)
-
-
 def texture(name, texture_name, channels, strength=None):
     step = {"op": "texture", "name": name, "texture": texture_name, "channels": channels}
     if strength is not None:
@@ -533,75 +495,308 @@ def orrery():
 
 
 # 4 -------------------------------------------------------------------------------
-def far_world():
-    def rocky(name, colour="#5d5348", ground="SandRiver1", bump=0.75, ambient=0.28):
-        return [paint(name, "Flat Gray", color=colour, ambient=ambient, diffuse=0.95,
-                      specular=0.08),
-                texture(name, ground, ["bump"], bump)]
+def _noise(size, cells, rng):
+    """Gradient noise from 0 to 1 on a size x size grid. Each call turns its lattice
+    by its own angle, so that layers of it show no square grain."""
+    turn, shift = rng.uniform(0, math.tau), rng.uniform(0, 64, 2)
+    angles = rng.uniform(0, math.tau, 512)
+    order = rng.permutation(512)
+    line = np.linspace(0, cells, size, endpoint=False)
+    across, down = np.meshgrid(line, line)
+    x = across * math.cos(turn) - down * math.sin(turn) + shift[0]
+    y = across * math.sin(turn) + down * math.cos(turn) + shift[1]
+    ix, iy = np.floor(x).astype(int), np.floor(y).astype(int)
+    fx, fy = x - ix, y - iy
 
-    # The sun stays behind the camera's left shoulder, so faces we see are lit.
-    ops = [*sky("Caribbean Clear", 232, 34),
-           camera([0, 34, -190], [0, 40, -40], 62),
-           add("sphere", "Giant Planet", [-330, 250, 620], [520, 520, 520]),
-           paint("Giant Planet", "Flat White", color="#e3a6b8", ambient=0.62, diffuse=0.5),
-           texture("Giant Planet", "Sin Layers1", ["bump"], 0.35)]
-    # Rough ground made of overlapping terrains: knolls break through the mist.
-    ops += [add("plane", "Bedrock", [0, -1.5, 0], [20.48] * 3), *rocky("Bedrock", "#6f6755")]
-    for n, (x, z, wide, tall, seed) in enumerate(((-92, -128, 190, 15, 3),
-                                                  (96, -122, 190, 13, 9),
-                                                  (-6, -176, 150, 17, 15),
-                                                  (-150, 40, 260, 20, 21),
-                                                  (160, 30, 260, 17, 27),
-                                                  (10, 140, 320, 14, 33),
-                                                  (0, -30, 240, 9, 39))):
-        name = f"Ground {n}"
-        ops += [*land(name, (x, -2.5, z), [wide, tall, wide * 0.9], seed, "dunes", 0.62),
-                *rocky(name, "#716850" if n % 2 else "#675d47", "DesertBump", 0.8, 0.32),
-                texture(name, "DesertBump", COLOURED)]
-    # The arch: one new mesh, craggy and bristling with spines.
+    def slope(dx, dy):
+        picked = angles[order[(order[(ix + dx) % 512] + iy + dy) % 512]]
+        return np.cos(picked) * (fx - dx) + np.sin(picked) * (fy - dy)
+
+    u = fx ** 3 * (fx * (fx * 6 - 15) + 10)
+    v = fy ** 3 * (fy * (fy * 6 - 15) + 10)
+    top = slope(0, 0) * (1 - u) + slope(1, 0) * u
+    low = slope(0, 1) * (1 - u) + slope(1, 1) * u
+    return np.clip(0.5 + 0.72 * (top * (1 - v) + low * v), 0, 1)
+
+
+def _fractal(size, cells, octaves, rng, ridged=False):
+    total, weight, height = 0.0, 0.0, 1.0
+    for octave in range(octaves):
+        layer = _noise(size, cells * 2 ** octave, rng)
+        if ridged:
+            layer = (1 - np.abs(2 * layer - 1)) ** 2          # sharp crests
+        total, weight = total + height * layer, weight + height
+        height *= 0.55
+    return total / weight
+
+
+def heights(kind, size, seed):
+    """One round landform, as numbers from 0 to 1. Nothing in it depends on which
+    way the grid runs: stretching is left to the terrain's size in the scene."""
+    rng = np.random.default_rng(seed)
+    axis = np.linspace(-1, 1, size)
+    x, z = np.meshgrid(axis, axis)
+    # A ragged round outline.
+    reach = np.hypot(x, z) + 0.22 * (_fractal(size, 4, 4, rng) - 0.5)
+    edge = np.clip((0.97 - reach) / 0.3, 0, 1)
+    edge = edge * edge * (3 - 2 * edge)
+    ridges = _fractal(size, 5, 6, rng, ridged=True)
+    grit = _fractal(size, 24, 4, rng)
+    if kind == "mound":                       # a broad hump of broken rock
+        dome = np.clip(1 - reach ** 2, 0, 1) ** 0.8
+        out = dome * (0.35 + 0.75 * ridges) + 0.09 * (grit - 0.5) * edge
+    elif kind == "rubble":                    # rolling ground strewn with broken rock
+        swell = _fractal(size, 3, 4, rng)
+        out = edge * (0.05 + 0.5 * np.clip(swell - 0.38, 0, 1)
+                      + 0.32 * np.clip(ridges - 0.3, 0, 1) + 0.09 * (grit - 0.45))
+        step = 2 / (size - 1)
+        for _ in range(230):                  # mostly small stones, a few outcrops
+            radius = 0.014 + 0.085 * rng.random() ** 3
+            turn, far = rng.uniform(0, math.tau), math.sqrt(rng.random()) * 0.84
+            cx, cz = far * math.cos(turn), far * math.sin(turn)
+            c0, c1 = (int((cx - radius * 2 + 1) / step), int((cx + radius * 2 + 1) / step) + 2)
+            r0, r1 = (int((cz - radius * 2 + 1) / step), int((cz + radius * 2 + 1) / step) + 2)
+            part = np.s_[max(r0, 0):r1, max(c0, 0):c1]
+            # Each stone is stretched its own way and bitten by the finer noise.
+            lie, long = rng.uniform(0, math.pi), rng.uniform(1.0, 1.9)
+            dx, dz = x[part] - cx, z[part] - cz
+            u = (dx * math.cos(lie) + dz * math.sin(lie)) / long
+            v = dz * math.cos(lie) - dx * math.sin(lie)
+            apart = np.hypot(u, v) * (0.35 + 1.3 * grit[part])
+            body = np.clip(1 - (apart / radius) ** 2, 0, 1) ** rng.uniform(0.55, 1.5)
+            top = radius * rng.uniform(1.6, 4.2) * body * (0.3 + 1.25 * ridges[part])
+            out[part] += top * edge[part]
+    elif kind == "range":                     # a massif of sharp peaks
+        peaks = np.zeros_like(x)
+        for n in range(9):
+            cx = -0.62 + 0.155 * n + rng.uniform(-0.05, 0.05) if n % 2 else rng.uniform(-0.55, 0.55)
+            cz = rng.uniform(-0.45, 0.45)
+            spread, tall = rng.uniform(0.28, 0.5), rng.uniform(0.35, 1.0)
+            peaks = np.maximum(peaks, tall * np.clip(
+                1 - np.hypot(x - cx, z - cz) / spread, 0, 1) ** 1.15)
+        out = edge * (peaks * (0.45 + 0.85 * ridges) + 0.06 * (grit - 0.5))
+    else:
+        raise ValueError(kind)
+    out = np.clip(out, 0, None) * (edge > 0)
+    # One freak spike should not set the height of everything else.
+    return np.clip(out / np.quantile(out, 0.9995), 0, 1)
+
+
+def landform(name, kind, centre, size, seed, preset="Big Sur"):
+    """A terrain made from `heights`, on one of Bryce's finer preset terrains
+    ("Big Sur" is 512 samples a side, "Basic River Terrain" 256). `centre` is the
+    middle of its base."""
+    detail = 512 if preset == "Big Sur" else 256
+    folder_ = os.path.join(tempfile.gettempdir(), "bryce3d_gallery")
+    os.makedirs(folder_, exist_ok=True)
+    path = os.path.join(folder_, f"{kind}_{seed}_{detail}.png")
+    grid = (heights(kind, detail, seed) * 65535).round().astype(np.uint16)
+    Image.fromarray(grid).save(path)
+    return [{"op": "insert_preset", "preset": preset, "name": name},
+            {"op": "set", "name": name, "size": list(size),
+             "position": [centre[0], centre[1] + size[1] / 2, centre[2]]},
+            {"op": "terrain", "name": name, "heightmap_path": path}]
+
+
+def arch_mountain(name, centre, scale, seed=5, step=1.15):
+    """A rock massif with a round hole through it, as one closed mesh. The outline
+    and the hole are in units that `scale` turns into scene units; the thickness
+    shrinks to nothing at every edge, so the front and back faces meet there."""
+    rng = np.random.default_rng(seed)
+    # (across, height) along the top, measured from under the middle of the hole.
+    outline = [(-76, -3), (-66, 5), (-57, 8), (-49, 17), (-42, 22), (-35, 30),
+               (-30, 37), (-26, 55), (-22, 47), (-17, 51), (-13, 43), (-8, 49),
+               (-1, 55), (8, 57), (15, 49), (20, 43), (24, 51), (29, 40), (35, 31),
+               (40, 22), (46, 15), (52, 17), (58, 8), (66, 6), (76, -3)]
+    across = np.arange(-76, 76 + step / 2, step)
+    up = np.arange(-4, 62, step)
+    X, Y = np.meshgrid(across, up)
+    waves = _fractal(256, 6, 5, rng, ridged=True)
+    fine = _fractal(256, 20, 4, rng)
+
+    def rough(field, x, y, zoom=1.0, shift=0):
+        i = ((x * zoom + 90 + shift) % 180 / 180 * 255).astype(int)
+        j = ((y * zoom + 20 + shift) % 180 / 180 * 255).astype(int)
+        return field[j, i]
+
+    top = np.interp(X, *zip(*outline)) + 9 * (rough(fine, X, X * 0.37, 2.1) - 0.5)
+    hole_x, hole_y = 3.0, 15.0
+    around = np.arctan2(Y - hole_y, X - hole_x)
+    ragged = 1 + 0.07 * np.sin(5 * around + 1) + 0.05 * np.sin(11 * around)
+    hole = (np.hypot((X - hole_x) / 14.5, (Y - hole_y) / 13.5) - ragged) * 14
+    inside = np.minimum.reduce([top - Y, hole, Y + 3.5])
+
+    def thickness(x, y, f, shift):
+        body = 15 * np.clip(1 - y / 80, 0.25, 1)
+        bite = (0.45 + 0.95 * rough(waves, x, y, 1.0, shift)
+                + 0.35 * (rough(fine, x, y, 1.6, shift) - 0.5))
+        return body * np.sqrt(np.clip(f / 9, 0, 1)) * np.clip(bite, 0.2, None)
+
+    rows, columns = X.shape
+    points: list[tuple[float, float, float]] = []       # x, y, f
+    seen: dict = {}
+
+    def corner(r, c):
+        key = (r, c)
+        if key not in seen:
+            seen[key] = len(points)
+            points.append((X[r, c], Y[r, c], inside[r, c]))
+        return seen[key]
+
+    def crossing(a, b):
+        key = (min(a, b), max(a, b))
+        if key not in seen:
+            (ra, ca), (rb, cb) = a, b
+            t = inside[ra, ca] / (inside[ra, ca] - inside[rb, cb])
+            seen[key] = len(points)
+            points.append((X[ra, ca] + (X[rb, cb] - X[ra, ca]) * t,
+                           Y[ra, ca] + (Y[rb, cb] - Y[ra, ca]) * t, 0.0))
+        return seen[key]
+
+    triangles = []
+    for r in range(rows - 1):
+        for c in range(columns - 1):
+            for half in (((r, c), (r, c + 1), (r + 1, c + 1)),
+                         ((r, c), (r + 1, c + 1), (r + 1, c))):
+                polygon = []
+                for i, here in enumerate(half):
+                    there = half[(i + 1) % 3]
+                    if inside[here] > 0:
+                        polygon.append(corner(*here))
+                    if (inside[here] > 0) != (inside[there] > 0):
+                        polygon.append(crossing(here, there))
+                triangles += [[polygon[0], polygon[i], polygon[i + 1]]
+                              for i in range(1, len(polygon) - 1)]
+
+    x, y, f = (np.array(v) for v in zip(*points))
+    front, back = -thickness(x, y, f, 0), thickness(x, y, f, 47)
+    rim = f <= 0
+    vertices = [[x[i], y[i], front[i]] for i in range(len(x))]
+    behind = {}
+    for i in range(len(x)):
+        if rim[i]:
+            behind[i] = i                                  # shared with the front
+        else:
+            behind[i] = len(vertices)
+            vertices.append([x[i], y[i], back[i]])
+    # Counter-clockwise from outside: the front looks towards -z.
+    faces = [[a, c, b] for a, b, c in triangles]
+    faces += [[behind[a], behind[b], behind[c]] for a, b, c in triangles
+              if not (rim[a] and rim[b] and rim[c])]
+    placed = [[centre[k] + v[k] * scale for k in range(3)] for v in vertices]
+    return mesh(name, placed, faces, 24)
+
+
+def far_world():
+    """A ringless gas giant over a plain of broken rock and low mist. Colour
+    textures go only on terrains and the planet: on new meshes Bryce drew them as
+    bright rectangles, so those get plain colours and a bump."""
+    def stone(name, colour, shade, ambient=0.42, diffuse=0.92, bump=0.8,
+              grain="DesertBump"):
+        return [paint(name, "Flat Gray", color=colour, ambient_color=shade,
+                      ambient=ambient, diffuse=diffuse, specular=0.04),
+                texture(name, grain, ["bump"], bump)]
+
+    def ground(name, light="#b9b08c", middle="#7c7154", dark="#383023"):
+        """Mottled khaki rock: Bryce's DesertBump with its oranges replaced."""
+        return [*stone(name, middle, "#33424c", 0.42, 0.95, 0.75),
+                texture(name, "DesertBump", ["color"]),
+                {"op": "texture_edit", "name": name, "channels": ["color"],
+                 "color_sets": {"2": [light, middle, dark],
+                                "4": [light, middle, dark]}}]
+
+    # The camera is level, so the horizon sits across the middle of the picture.
+    ops = [*sky("Wisp o'the Will", 118, 27),   # lights the side of the giant we see
+           camera([0, 30, -190], [0, 30, 0], 62),
+           # The giant: Bryce's own banded Jupiter, tipped, with a soft pink fill in
+           # its shadows so that it sits in the hazy sky like a far-off world.
+           add("sphere", "Giant Planet", [-590, 345, 1310], [1040] * 3,
+               rotation=[0, 20, -17]),
+           wear("Giant Planet", "Jupiter"),
+           {"op": "set", "name": "Giant Planet",
+            "material": {"ambient_color": "#c79bb8", "ambient": 0.3, "diffuse": 0.95,
+                         "specular": 0.12}}]
+
+    ops += [add("plane", "Plain", [0, 0, 0], [20.48] * 3), *ground("Plain")]
+    # Foreground: a broken ridge under the camera, with rubble to either side.
+    for n, (kind, x, z, wide, tall, deep, seed) in enumerate((
+            ("mound", -4, -101, 118, 13.5, 66, 4),
+            ("mound", 52, -112, 66, 10, 52, 12),
+            ("rubble", -62, -76, 140, 15, 120, 7),
+            ("rubble", 66, -62, 140, 14, 130, 19),
+            ("rubble", -6, -18, 170, 9, 130, 23))):
+        name = f"Near Ground {n}"
+        ops += [*landform(name, kind, (x, -1.2, z), (wide, tall, deep), seed),
+                *ground(name)]
+    # The middle distance: fields of small sharp rocks running to the mountains.
+    for n, (x, z, wide, tall, seed) in enumerate((
+            (-150, 70, 250, 18, 31), (30, 105, 230, 12.5, 37), (190, 55, 240, 16, 41),
+            (-80, 215, 300, 17, 43), (190, 240, 300, 18, 47), (-300, 200, 300, 20, 53),
+            (20, 370, 460, 19, 59))):
+        name = f"Far Ground {n}"
+        ops += [*landform(name, "rubble", (x, -1.4, z), (wide, tall, wide * 0.85), seed),
+                *ground(name, "#aaa68e", "#706a58", "#34333a")]
+
+    # The great arch, and the broken rock around its feet.
+    ops += [arch_mountain("Arch", (74, 0.5, 205), 1.12),
+            *stone("Arch", "#716873", "#27344e", 0.5, 0.82, 0.85)]
+    for n, (x, z, wide, tall, seed) in enumerate(((8, 192, 78, 17, 61),
+                                                  (146, 198, 96, 19, 67),
+                                                  (92, 172, 64, 8, 71))):
+        name = f"Arch Foot {n}"
+        ops += [*landform(name, "range", (x, -1.5, z), (wide, tall, wide * 0.62), seed,
+                          "Basic River Terrain"),
+                *stone(name, "#6d6570", "#26334c", 0.5, 0.82, 0.7, "Sand1")]
     rng = random.Random(11)
-    ops += [jagged_arch((42, 6, 40), 40, 9),
-            *rocky("Arch", "#6a5e52", "DesertBump", 0.8, 0.3),
-            texture("Arch", "DesertBump", COLOURED)]
-    for n, (x, z, wide, tall) in enumerate(((84, 50, 74, 42), (2, 56, 70, 30),
-                                            (112, 66, 80, 24), (-24, 66, 56, 15))):
-        name = f"Footing {n}"
-        ops += [*land(name, (x, -2, z), [wide, tall, wide * 0.6], 60 + n, "mountain", 0.55),
-                *rocky(name, "#625648", "DesertBump"),
-                texture(name, "DesertBump", COLOURED)]
-    for n in range(22):
-        x = 42 + rng.choice((-1, 1)) * rng.uniform(34, 68)
-        tall = rng.uniform(5, 19) * (1.2 - abs(x - 42) / 90)
+    for n in range(26):
+        side = rng.choice((-1, 1))
+        x = 77 + side * rng.uniform(33, 92)
+        tall = rng.uniform(5, 17) * (1.25 - abs(x - 77) / 120)
         name = f"Spire {n}"
-        ops += [turned(name, [(tall * 0.2, 0), (tall * 0.11, tall * 0.45),
-                              (tall * 0.07, tall * 0.52), (0.12, tall)],
-                       (x, 3, 40 + rng.uniform(-9, 9)), rng.uniform(-14, 14), sides=7),
-                *rocky(name, "#3c3735", "Sand1")]
-    # Blue ranges along the horizon.
-    for n, (x, z, wide, tall) in enumerate(((-330, 330, 260, 80), (-160, 460, 220, 56),
-                                            (250, 470, 300, 92), (480, 300, 230, 70),
-                                            (40, 560, 300, 38))):
+        ops += [turned(name, [(tall * 0.19, 0), (tall * 0.12, tall * 0.34),
+                              (tall * 0.085, tall * 0.4), (tall * 0.05, tall * 0.7),
+                              (0.1, tall)],
+                       (x, 1, 192 + rng.uniform(-14, 6)), rng.uniform(-11, 11), sides=6),
+                *stone(name, "#5d5663", "#222d45", 0.5, 0.8, 0.6, "Sand1")]
+
+    # Blue ranges along the horizon: paler and bluer the farther they stand.
+    for n, (x, z, wide, tall, deep, seed, tone, shade) in enumerate((
+            (-292, 430, 330, 78, 150, 83, "#8a93b4", "#4d628f"),
+            (-96, 520, 270, 46, 130, 89, "#97a6c6", "#637ca9"),
+            (330, 560, 300, 92, 160, 97, "#a3b3d2", "#718bb8"),
+            (112, 640, 330, 40, 140, 101, "#a9bad8", "#7d97c2"),
+            (500, 430, 280, 58, 150, 103, "#8f9ab9", "#546893"),
+            (-520, 560, 320, 70, 150, 107, "#a3b3d2", "#718bb8"))):
         name = f"Range {n}"
-        ops += [*land(name, (x, -3, z), [wide, tall, wide * 0.6], 80 + n * 3, "mountain", 0.5),
-                paint(name, "Flat Gray", color="#5f6f92", ambient=0.34),
-                texture(name, "Sand1", ["bump"], 0.4)]
-    # Boulders in the foreground and rubble beyond.
-    for n, (x, y, z, wide) in enumerate(((-47, 8, -122, 25), (-13, 8, -98, 13),
-                                         (58, 8, -130, 28), (10, 9, -142, 11),
-                                         (28, 6, -66, 9), (-70, 7, -40, 15))):
-        ops += [rock(f"Boulder {n}", (x, y, z), (wide, wide * 0.62, wide * 0.86), 100 + n),
-                *rocky(f"Boulder {n}", "#6a563c", "DesertBump", 0.85),
-                texture(f"Boulder {n}", "DesertBump", COLOURED)]
-    for n in range(46):
-        wide = rng.uniform(2, 8)
-        x, z = rng.uniform(-150, 150), rng.uniform(-90, 190)
-        name = f"Rubble {n}"
-        ops += [rock(name, (x, 4.2, z), (wide, wide * 0.7, wide * 0.9), 200 + n, 2, 0.4),
-                *rocky(name, "#58503f")]
-    for n, (position, wide) in enumerate((((6, 98, -20), 17), ((-36, 62, 10), 14),
-                                          ((14, 56, 110), 8))):
-        ops += [rock(f"Asteroid {n}", position, (wide, wide * 0.85, wide), 300 + n, 4, 0.26),
-                *rocky(f"Asteroid {n}", "#98928c", "Sand1", 0.9, 0.2)]
+        ops += [*landform(name, "range", (x, -2, z), (wide, tall, deep), seed,
+                          "Basic River Terrain"),
+                *stone(name, tone, shade, 0.58, 0.5, 0.45, "Sand1")]
+
+    # Rounded boulders sunk into the ground. (centre, width, height)
+    for n, (spot, wide, tall) in enumerate((((-44, 7.5, -66), 19, 14),
+                                            ((-23, 4.5, -52), 8, 7),
+                                            ((-3, 5.5, -20), 14, 9),
+                                            ((52, 7.5, -66), 20, 15),
+                                            ((38, 3.5, -4), 11, 8),
+                                            ((-74, 6, -12), 15, 11),
+                                            ((-26, 3.5, 44), 10, 7),
+                                            ((24, 8.5, -118), 9, 5))):
+        name = f"Boulder {n}"
+        ops += [rock(name, spot, (wide, tall, wide * 0.88), 100 + n, 4, 0.085),
+                *stone(name, "#6f614a", "#272f36", 0.45, 0.95, 0.9, "Sand1")]
+    for n, (position, wide) in enumerate((((-46, 62, 208), 15), ((11, 108, 236), 19),
+                                          ((52, 58, 420), 12), ((-6, 66, 520), 9))):
+        ops += [rock(f"Asteroid {n}", position, (wide, wide * 0.84, wide * 0.92),
+                     300 + n, 4, 0.24),
+                *stone(f"Asteroid {n}", "#a29ba0", "#3a4868", 0.42, 0.9, 0.9, "Sand1")]
+
+    # Mist lying in the hollows: two thin sheets, one above the other.
+    for n, (level, clear) in enumerate(((1.9, 0.55), (3.3, 0.82))):
+        name = f"Mist {n}"
+        ops += [add("plane", name, [0, level, 0], [20.48] * 3),
+                paint(name, "Flat White", color="#bfe3df", ambient_color="#a6d2d4",
+                      ambient=0.55, diffuse=0.4, specular=0.0, transparency=clear,
+                      refraction=1.0)]
     return ops
 
 

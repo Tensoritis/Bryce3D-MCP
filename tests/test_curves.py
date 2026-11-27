@@ -195,7 +195,9 @@ def test_a_material_can_be_animated():
     found = reread.material(reread.find("Cube 1")[1])
     assert found["color"] in ("#7f007f", "#800080", "#7f0080", "#80007f")
     assert found["diffuse"] == pytest.approx(0.5)
-    assert set(reread.animated_settings()["materials"]["Cube 1"]) == {"color", "diffuse"}
+    assert set(reread.animated_settings()["materials"]["Cube 1"]) == {
+        "color", "ambient_color", "diffuse"}            # ambient goes with color
+    assert found["ambient_color"] == found["color"]
 
 
 def lamp_scene() -> bytes:
@@ -312,3 +314,59 @@ def test_mac_models_are_left_out_of_the_object_list():
     folder = presets.folder(os.environ["BRYCE3D_INSTALL"])
     for found in presets.entries(folder, "objects"):
         assert not presets.load(found).mac_model(found.key)
+
+
+def test_a_new_color_takes_the_ambient_color_along():
+    """Bryce shades a surface's dark side with the ambient color alone, so a white
+    one left behind washes the color out."""
+    scene = Br3.from_bytes(basic_scene())
+    assert scene.set_material("Cube 1", {"color": "#c04020"})["ambient_color"] == "#c04020"
+    # It was following, so it goes on following.
+    assert scene.set_material("Cube 1", {"color": "#2040c0"})["ambient_color"] == "#2040c0"
+
+
+def test_a_chosen_ambient_color_is_left_alone():
+    scene = Br3.from_bytes(basic_scene())
+    scene.set_material("Cube 1", {"color": "#c04020", "ambient_color": "#102030"})
+    found = scene.set_material("Cube 1", {"color": "#2040c0"})
+    assert found["color"] == "#2040c0" and found["ambient_color"] == "#102030"
+
+
+def test_color_keys_leave_a_chosen_ambient_color_alone():
+    scene = Br3.from_bytes(basic_scene())
+    scene.set_material("Cube 1", {"color": "#c04020", "ambient_color": "#102030"})
+    scene.set_keyframes("Cube 1", target="material", keys=[
+        {"frame": 0, "color": "#ff0000"}, {"frame": 20, "color": "#0000ff"}])
+    assert set(scene.animated_settings()["materials"]["Cube 1"]) == {"color"}
+
+
+def test_more_color_keys_keep_the_ambient_color_following():
+    scene = Br3.from_bytes(basic_scene())
+    scene.set_keyframes("Cube 1", target="material", keys=[
+        {"frame": 0, "color": "#ff0000"}, {"frame": 20, "color": "#0000ff"}])
+    scene.set_keyframes("Cube 1", target="material", duration=4, keys=[
+        {"frame": 40, "color": "#00ff00"}])
+    scene.set_time({"frame": 40})
+    found = scene.material(scene.find("Cube 1")[1])
+    assert found["color"] == found["ambient_color"] == "#00ff00"
+
+
+def test_a_new_material_track_is_laid_out_as_bryce_lays_it_out():
+    """Colour keys are 100 bytes and number keys 84, each repeating its channel's
+    block of the material record."""
+    scene = Br3.from_bytes(basic_scene())
+    scene.set_keyframes("Cube 1", target="material", keys=[
+        {"frame": 0, "ambient_color": "#ff0000", "ambient": 0.1},
+        {"frame": 20, "ambient_color": "#0000ff", "ambient": 0.9}])
+    material = scene._own_material("Cube 1")
+    body = scene._payload(material)
+    for class_name, stride, block in (("Mat_eAmbientC", 100, 332),
+                                      ("Mat_eAmbient", 84, 596)):
+        record = scene._payload(scene._linked(material, class_name))
+        assert keyframes.stride(record) == stride
+        for key in keyframes.keys(record):
+            assert key[44:68] == body[block - 4:block + 20]     # texture link
+    scene.set_time({"frame": 20})
+    found = scene.material(scene.find("Cube 1")[1])
+    assert found["ambient_color"] == "#0000ff"
+    assert found["ambient"] == pytest.approx(0.9)

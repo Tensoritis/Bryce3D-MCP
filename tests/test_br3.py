@@ -230,6 +230,38 @@ def test_preview_reports_where_objects_land(scene, library):
     assert red > green and red > blue
 
 
+def _front_on(scene):
+    scene.set_camera(position=[0, 30, -150], heading=0, pitch=0)
+    scene.set_object("Cube 1", position=[0, 30, 0])
+
+
+def test_preview_lights_a_shaded_side_with_the_ambient_color(scene):
+    """As in Bryce: a black surface with a white ambient color still shows."""
+    _front_on(scene)
+    scene.set_material("Cube 1", {"color": "#000000", "ambient_color": "#ffffff",
+                                  "ambient": 0.6})
+    shown = preview.render(scene, 480, 360)[0].getpixel((240, 180))
+    assert shown == pytest.approx((153, 153, 153), abs=2)
+
+
+def test_preview_tints_what_lies_under_a_see_through_plane(scene, library):
+    _front_on(scene)
+    scene.set_camera(position=[0, 30, -150], heading=0, pitch=0)
+    before = preview.render(scene, 480, 360)[0].getpixel((240, 340))
+    sceneops.apply(scene, [
+        {"op": "duplicate", "name": "Plane 1", "new_name": "Mist",
+         "position": [0, 5, 0]},
+        {"op": "set", "name": "Mist", "material": {
+            "color": "#ff0000", "ambient": 1.0, "diffuse": 0.0, "transparency": 0.5}},
+    ], library)
+    picture, report = preview.render(scene, 480, 360)
+    found = {r["name"]: r["preview"] for r in report}
+    assert found["Mist"] == "a see-through tint"
+    after = picture.getpixel((240, 340))
+    assert after == pytest.approx(((before[0] + 255) / 2, before[1] / 2, before[2] / 2),
+                                  abs=2)
+
+
 def test_obj_export(scene):
     text, count = preview.to_obj(scene)
     assert count == 1 and text.count("\nv ") == 8 and text.count("\nf ") == 12

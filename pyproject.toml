@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bryce3d-mcp"
-version = "0.14.0"
+version = "0.15.0"
 description = "MCP server that lets AI agents build and edit MetaCreations Bryce 3D scenes"
 readme = "README.md"
 requires-python = ">=3.10"

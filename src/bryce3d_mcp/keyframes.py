@@ -127,12 +127,14 @@ def build(record: bytes, entries, form: str = "d", offset: int = VALUE) -> bytes
     return bytes(out) + tail
 
 
-def fresh(number: int, form: str, offset: int, value) -> bytes:
-    """A new one-key track, for a setting that has none."""
-    width = offset + number * struct.calcsize(form)
+def fresh(number: int, form: str, offset: int, value, body: bytes = b"") -> bytes:
+    """A new one-key track, for a setting that has none. `body` is what follows the
+    key's first 44 bytes in kinds of track that carry more than the value."""
+    width = max(offset + number * struct.calcsize(form), VALUE + len(body))
     record = bytearray(HEAD + max(width, _SHORTEST_KEY))
     struct.pack_into("<3I", record, 0, 1, 1, 1)
     struct.pack_into("<I", record, HEAD + 8, 2)
+    record[HEAD + VALUE:HEAD + VALUE + len(body)] = body
     struct.pack_into(f"<{number}{form}", record, HEAD + offset, *value)
     return bytes(record)
 

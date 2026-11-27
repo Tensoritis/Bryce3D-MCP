@@ -81,6 +81,8 @@ def find(directory: str, category: str, name: str, library: str | None = None) -
         available = [p for p in available
                      if library.lower() in (p.library.lower(),
                                             os.path.splitext(p.library)[0].lower())]
+    if not isinstance(name, str):
+        raise BryceError(f"give the {category[:-1]} preset's name; see br3_presets")
     wanted = name.strip().lower()
     matches = [p for p in available if p.name.lower() == wanted]
     if not matches:

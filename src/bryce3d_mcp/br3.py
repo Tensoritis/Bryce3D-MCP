@@ -231,7 +231,7 @@ _PICTURE_FLAGS, _PICTURE_ZOOMS_IN = 272, 0x2
 _PICTURE_IMAGE = 504           # link to the stored picture
 _PICTURE_STEPS = 17.0
 _USES_TEXTURES = 0x40
-_SHOWN = ("color", "diffuse", "ambient", "specular", "transparency", "reflection",
+_SHOWN = ("color", "ambient_color", "diffuse", "ambient", "specular", "transparency", "reflection",
           "bump", "refraction")
 
 
@@ -805,6 +805,9 @@ class Br3(settings_anim.SettingAnimation, motion.PathObjects):
             raise BryceError(f"unknown material settings {unknown}; "
                              f"use {sorted(MATERIAL_CHANNELS)}")
         material = self._own_material(name)
+        if "color" in settings and "ambient_color" not in settings \
+                and self._ambient_follows(material):
+            settings = {**settings, "ambient_color": settings["color"]}
         self._refuse_animated_settings(self._material_channels(material, set(settings)),
                                        f"the material of {name!r}")
         released = set()
@@ -827,6 +830,44 @@ class Br3(settings_anim.SettingAnimation, motion.PathObjects):
         if released:
             self._discard(released)
         return self.material(self.find(name)[1])
+
+    def _colour_in_force(self, material: Ref, channel: str) -> tuple:
+        _, offset, class_name = MATERIAL_CHANNELS[channel]
+        track = self._linked(material, class_name)
+        if track is not None:
+            _, form, value = self._setting(track)
+            if form == "colour":
+                return tuple(value)
+        return struct.unpack_from("<3f", self._payload(material), offset)
+
+    def _same_keys(self, first: Ref, second: Ref | None) -> bool:
+        """Whether two color tracks hold the same keys."""
+        if second is None:
+            return False
+        found = []
+        for track in (first, second):
+            payload = self._payload(track)
+            offset = self._setting(track)[0]
+            found.append(keyframes.values(payload, 3, "f", offset - keyframes.HEAD))
+        return [(e[0], tuple(e[-1])) for e in found[0]] \
+            == [(e[0], tuple(e[-1])) for e in found[1]]
+
+    def _ambient_follows(self, material: Ref) -> bool:
+        """Whether a new color should become the ambient color too. Bryce lights a
+        surface's shaded side with the ambient color alone, and its flat materials
+        have a white one, which washes any other color out. So an ambient color
+        that is still a grey, or the same as the color, goes with the color; one
+        that was chosen, textured or animated is left alone."""
+        if "ambient_color" in self._textures(material):
+            return False
+        track = self._linked(material, "Mat_eAmbientC")
+        if track is not None and keyframes.count(self._payload(track)) > 1:
+            return self._same_keys(track, self._linked(material, "Mat_eDiffuseC"))
+        ambient = self._colour_in_force(material, "ambient_color")
+        if max(ambient) - min(ambient) < 0.004:
+            return True
+        colour = self._colour_in_force(material, "color")
+        return all(abs(a - c) < 0.004 for a, c in zip(ambient, colour))
 
     def set_texture(self, name: str, texture: str, channels: list[str],
                     sources=(), strength: float | None = None) -> dict:
@@ -1240,6 +1281,16 @@ class Br3(settings_anim.SettingAnimation, motion.PathObjects):
                 settings_anim.hex_colour if colour else settings_anim._plain))
         return out
 
+    def _key_body(self, channel, owner) -> bytes:
+        """A material key repeats its channel's block of the material record:
+        texture kind, texture and flags, with the value 28 bytes in. Volume colour
+        and refraction have no block."""
+        block = MATERIAL_CHANNELS.get(channel.name, (None,))[0]
+        if not channel.class_name.startswith("Mat_") or block is None:
+            return b""
+        length = 56 if channel.number == 3 else 40
+        return self._payload(owner)[block - 4:block - 4 + length]
+
     def _material_channels(self, material: Ref, only=None) -> list:
         out = []
         for label, (_, cached, class_name) in MATERIAL_CHANNELS.items():
@@ -1247,8 +1298,9 @@ class Br3(settings_anim.SettingAnimation, motion.PathObjects):
                 continue
             colour = label in MATERIAL_COLOURS
             track = self._linked(material, class_name)
-            if track is None:
-                offset = 220
+            if track is None:                # where the value will sit in a new one
+                offset = (keyframes.HEAD + keyframes.VALUE
+                          if MATERIAL_CHANNELS[label][0] is None else 220)
             else:
                 offset, form, _ = self._setting(track)
                 if form not in ("colour", "float"):
@@ -1326,6 +1378,14 @@ class Br3(settings_anim.SettingAnimation, motion.PathObjects):
         offset = MATERIAL_CHANNELS[channel.name][1]
         return struct.unpack_from(f"<{channel.number}f", payload, offset)
 
+    def _follow_with_ambient(self, name: str, by_frame: dict) -> None:
+        """Color keys take the ambient color along, as set_material does."""
+        keyed = [values for values in by_frame.values() if "color" in values]
+        if keyed and not any("ambient_color" in v for v in by_frame.values()) \
+                and self._ambient_follows(self._own_material(name)):
+            for values in keyed:
+                values["ambient_color"] = values["color"]
+
     def _key_settings(self, target, name, keys, duration, curve, library) -> dict:
         channels = self._target_channels(target, name)
         fields = {"camera": settings_anim.CAMERA_FIELDS,
@@ -1359,6 +1419,8 @@ class Br3(settings_anim.SettingAnimation, motion.PathObjects):
                 raise BryceError(f"two {again[0]} keys are on frame {frame}")
             slot.update(values)
 
+        if target == "material":
+            self._follow_with_ambient(name, by_frame)
         named = {fields[k] for values in by_frame.values() for k in values}
         if isinstance(curve, dict):
             stray = sorted(set(curve) - set(channels))
@@ -2225,6 +2287,8 @@ class Br3(settings_anim.SettingAnimation, motion.PathObjects):
             copy = self._copy(source, ref)
             self._append(tag, copy)
             self._make_still(copy)
+            if copy[0] == "C3dPath":
+                self._mend_path(copy)
             copies.append((tag, copy))
         centres = [self.centre_of(ref) for _, ref in copies]
         middle = [sum(c[a] for c in centres) / len(centres) for a in range(3)]

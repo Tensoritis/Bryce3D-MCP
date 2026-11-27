@@ -3,10 +3,11 @@
 A path object (record C3dPath, 700 bytes plus 100 per point) keeps its points
 already in their final shape, measured from the object's centre in file units:
 in Bryce's tilted and stretched presets the saved points are tilted and stretched.
-At 640 are the numbers 1, 2 and the point count, at 652 the bounding box (minimum
-then maximum corner, doubles), and from 700 the points: x, y, z as doubles, then
-tension, continuity, bias and twist as floats. The remaining bytes of a point are
-whatever was in memory when it was saved.
+A 3x3 matrix at 284 shapes what Bryce draws, and is the unit matrix on a path. At
+640 are the numbers 1, 2 and the point count, at 652 the bounding box (minimum then
+maximum corner, doubles), and from 700 the points: x, y, z as doubles, then tension,
+continuity, bias and twist as floats. The remaining bytes of a point are whatever was
+in memory when it was saved.
 
 Between its points Bryce draws the curve in spline.py, shaped by the tension,
 continuity and bias of each point; following a saved path uses that same curve.
@@ -28,6 +29,8 @@ from .errors import BryceError
 PATH_TAG, PATH_CLASS = "path3dob", "C3dPath"
 _HEAD, _COUNT, _BOX, _POINTS, _STRIDE = 640, 648, 652, 700, 100
 _TCBT = 24                                  # tension, continuity, bias, twist
+_SHAPE = 284                                # 3x3 doubles; Bryce draws through it
+_PLAIN_SHAPE = struct.pack("<9d", 1, 0, 0, 0, 1, 0, 0, 0, 1)
 MAX_POINTS = 500
 MAX_KEYS = 600
 _CLOSE_ENOUGH = 0.03                        # of the path's size: ends that meet
@@ -204,6 +207,12 @@ class PathObjects:
         return ([[(c + v) * self.UNIT for c, v in zip(centre, p)] for p in points],
                 split_loop(points)[1], read_shaping(payload))
 
+    def _mend_path(self, ref) -> None:
+        """Give a copied path the plain shape matrix of a path. The first of
+        Bryce's 30 path presets holds about two billion where its upright 1
+        belongs, which stretches the drawn path up and down out of sight."""
+        self._write(ref, _SHAPE, _PLAIN_SHAPE)
+
     def add_path(self, points: list, name: str | None = None, closed: bool = False,
                  smooth_curve: bool = True, donors=()) -> dict:
         """Add a Bryce path object through points given in Bryce units."""
@@ -230,6 +239,7 @@ class PathObjects:
         self._append(PATH_TAG, copy)
         self._make_still(copy)
         self._rename(copy, stem)
+        self._mend_path(copy)
         kept = self._payload(copy)[:_HEAD]       # the new name and the new links
         self.file.replace(self._entry(copy), kept + data[_HEAD:])
         self._reindex()

@@ -86,6 +86,13 @@ its height stands on the ground. Giving `size` avoids the difference. Material c
 `refraction` is the index (1.0 bends nothing, 1.33 is like water). Giving a plain value to a
 textured channel removes the texture from that channel only.
 
+**Ambient color matters.** Bryce lights a surface's shaded side with `ambient_color` times
+`ambient`, whatever `color` is, and its flat preset materials have a white ambient color
+that washes everything out. So when you give `color` alone and the ambient color is still
+a grey, or the same as the old color, it takes the new color too (color keys included). An
+ambient color you chose, textured or animated differently is left alone. For soft, deep
+shadows give a darker or bluer `ambient_color` yourself.
+
 ### One-time setup: the template file
 
 New objects are copied from a scene saved by **your own** Bryce, so none of Bryce's data is
@@ -193,6 +200,12 @@ changes when things happen, and the table above still decides the route.
 
 - `path` makes a real Bryce path object. Bryce's 30 ready-made ones can be added with
   `insert_preset` and `"library": "Paths"`. A path can be moved, but not resized or turned.
+- **Fixed in 0.15.0:** the first path in Bryce's `Paths.obp` holds about two billion in
+  the matrix Bryce draws a path through, where 1 belongs. Versions before 0.15.0 copied
+  it into every new path, and which very likely is why Bryce drew one of our check
+  scenes with very long upright lines. New paths and inserted path presets now get a clean matrix.
+  Scenes made earlier keep the bad value: build them again. The fix has not yet been
+  seen in Bryce.
 - With `smooth` true (the default), many points are saved along an even curve through
   yours, which never loops back on itself.
 - With `smooth` false, exactly your points are saved and Bryce draws **its own curve**
@@ -280,8 +293,9 @@ that the script builds itself:
   carved jar, a curved slide, jagged pink peaks and a ribbon of 6,000 rainbow flecks
 - **silver_drops** - chrome spheres over rippled water under a tilted horizon
 - **orrery** - a gyroscope of thin chrome rings beside a crystal citadel on eroded crags
-- **far_world** - rough textured ground, a spined rock arch, craggy boulders and asteroids,
-  and a pink planet
+- **far_world** - Bryce's banded Jupiter material as a giant planet, a rock massif with a
+  hole through it (one new mesh), broken ground from 512 x 512 terrains whose heights the
+  script computes, two sheets of mist, layered blue ranges, boulders and asteroids
 - **colour_generation** - tilted glass cubes, one carved by a boolean
 
 They are rendered in the order that tests plain shapes first and new meshes last. The
@@ -294,12 +308,17 @@ stops at the first problem and writes the pictures and a `render_log.json` to
 
 All five rendered on Windows with version 0.5.1, with no dialogs, in 8 seconds to 10
 minutes each. Those renders showed that new meshes came out at double size and terrains at
-half the stated height, plus a missing boolean part. All three are fixed in 0.6.0, which
-**has not been rendered yet.** Colors still differ from what the scenes aim for.
+half the stated height, plus a missing boolean part; all three were fixed in 0.6.0.
+
+**far_world was rebuilt in 0.15.0 and has not been rendered in Bryce since.** Its last
+render showed a flat grey planet, because the scene set the main color and left the
+material's white ambient color in place, and bright rectangles around the meshes that had
+a color texture. The new scene sets both colors and keeps color textures off its meshes.
+It needs Bryce's own preset files, builds in a minute or two and is about 23 MB.
 
 ## Status - read this first
 
-Version 0.14.0. The Python code has automated tests, run on Linux. The bridge DLL is tested
+Version 0.15.0. The Python code has automated tests, run on Linux. The bridge DLL is tested
 in a harness that loads your real `Bryce 3D.exe` and `Axiom.dll` on Linux with stand-ins for
 Windows. **Parts of it have not run on Windows yet; see the table.**
 
@@ -324,10 +343,11 @@ Windows. **Parts of it have not run on Windows yet; see the table.**
 | Booleans | In the first render the carved cube was missing. 0.6.0 writes the extra flags Bryce's own boolean parts have. **Not rendered since** |
 | Preset models, plain groups, lights, disk, lattice | Layouts read from Bryce's own files; all 154 bundled presets load with every link intact. **Not opened in Bryce yet** |
 | Position, rotation and scale keyframes | **Confirmed moving in Bryce** with a test scene that animates one object each way. Rebuilding two-key position records that Bryce saved matches them **byte for byte** |
+| Material colors | **Changed in 0.15.0.** The shaded side of a surface in a Bryce render matched ambient color times ambient value (159 to 161 measured, 158 predicted), so `color` now takes the ambient color along. **Fixed:** material tracks that this server had to create (for a material without one) were too short for a color; new ones now repeat the material's channel block, as all of Bryce's own tracks in the template do. Neither change has been rendered |
 | Time curves | Layout and handle rules read from Bryce's code, and the rules match its own curve routine. Positions worked out through a curve match what Bryce saved in a CD scene. **A curve made here has not been played in Bryce** |
 | Movement between keys | **Changed in 0.14.0:** earlier versions moved positions in straight lines, which Bryce does not. Checked against the values Bryce saved at its time marker in the animated scenes on the Bryce CD: all of more than 400 in-between positions agree to within a millionth of a file unit. Straight blending agrees for the field of view, a lamp's brightness, a material color, the sky and sun colors and numbers tested (in one or a few cases each) and 4 of 5 camera angles (the fifth lies outside both of its keys). The sun's direction agrees in both cases. **Object rotation is only partly settled:** it agrees exactly in 3 poses from 2 scenes, but differs by 0.2 to 85 degrees in 3 other scenes, and why is not known. Lamp color and the local origin had no in-between case; the origin uses the position rule because its records are laid out the same way |
 | Camera, sun, sky, material and lamp keys | Written into the records Bryce itself keeps for them (lamp records are built here; where the CD's scenes attach lamp records agrees in all 40 cases). **Keys made here have not been played in Bryce** |
-| Path objects and `follow_path` | The record was read from Bryce's 30 path presets, which all load and can be followed. **Changed in 0.14.0:** the curve between path points was read from Bryce's code. In two CD scenes, objects on Bryce's own path link sit within 0.00002 file units of that curve; the bounding boxes Bryce saved agree with it, including the effect of tension (one box is about 0.003 off on one side). How far along the path Bryce puts a follower agrees to about 0.03% of its length. Continuity and bias were read from code only, with no saved case. **A path made here has not been opened in Bryce** |
+| Path objects and `follow_path` | The record was read from Bryce's 30 path presets, which all load and can be followed. **Changed in 0.14.0:** the curve between path points was read from Bryce's code. In two CD scenes, objects on Bryce's own path link sit within 0.00002 file units of that curve; the bounding boxes Bryce saved agree with it, including the effect of tension (one box is about 0.003 off on one side). How far along the path Bryce puts a follower agrees to about 0.03% of its length. Continuity and bias were read from code only, with no saved case. **Fixed in 0.15.0:** paths made here were drawn wrongly in Bryce because of a damaged value copied from one preset; the corrected record has not been opened in Bryce |
 | Frame-by-frame animation | Frames and previews tested here. Rendering a series is tested against a stand-in only |
 | Saving and loading | Save-box detection works on real pictures. The Save As and load steps are **not tried live** |
 | The bridge | **Loaded on Windows.** Opening scenes, starting renders from the menu, noticing when each finished and capturing the picture worked for all five gallery scenes |
@@ -337,11 +357,13 @@ Windows. **Parts of it have not run on Windows yet; see the table.**
 
 ### How good is the preview?
 
-`br3_preview` draws shapes, flat colors, the ground, a stand-in sky, the sun and ground
-shadows in about a second, and says for each object whether it is in frame, off an edge,
+`br3_preview` draws shapes, the ground, a stand-in sky, the sun and ground shadows in a
+few seconds (a large scene with many terrains takes longer: about 15 seconds at 480 x 360 for far_world). It lights each
+surface from its color, ambient color, diffuse and ambient settings, and draws a
+see-through plane below the camera (mist, shallow water) as a flat tint. It also says for each object whether it is in frame, off an edge,
 behind the camera or hidden. Against Bryce's render of a test scene, object outlines lined
-up within about 2 pixels, and new meshes and terrains line up with the gallery renders. It does **not** show textures, ripples, Bryce's skies and clouds,
-atmosphere, reflections, transparency, boolean cuts, object-on-object shadows or light
+up within about 2 pixels, and new meshes and terrains line up with the gallery renders. It does **not** show textures (a textured channel shows grey), ripples, Bryce's skies and clouds,
+atmosphere, reflections, see-through objects, boolean cuts, object-on-object shadows or light
 from light objects.
 It draws new meshes and camera tilt. Use it for layout, and `br3_render` for the look: a
 textured, reflective scene looks flat and plain in the preview.
@@ -688,7 +710,12 @@ Not everything in Bryce 3D is covered by the file tools:
 - A procedural texture's noise types, filters and the way its parts are combined cannot
   be edited.
 - Inside the Labs, the agent works by looking and clicking; there are no per-control tools.
-- New meshes carry no texture coordinates; up to 50,000 triangles each.
+- New meshes carry no texture coordinates; up to 50,000 triangles each. In a real render,
+  new meshes with a procedural color texture drew bright rectangles around themselves.
+  The cause is not known, so give meshes plain colors and use textures for bump.
+- Which way a terrain's rows run against the scene's axes has not been settled from a
+  render. The preview and a heightmap you import could be turned a quarter circle from
+  what Bryce shows.
 - Only some Terrain Editor tools are rewritten (see Terrain operations); the other terrain
   operations are this project's own.
 - `br3_open_in_bryce` needs a path made of Windows ANSI characters, under 260 bytes.
