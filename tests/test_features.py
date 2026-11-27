@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 
 from bryce3d_mcp import presets, preview, sceneops
-from bryce3d_mcp.br3 import (SKY_CACHE, Br3, camera_matrix, quaternion_from_euler,
+from bryce3d_mcp.br3 import (SKY_CACHE, UNIT, Br3, camera_matrix, quaternion_from_euler,
                              quaternion_from_matrix, rotation_matrix)
 from bryce3d_mcp.errors import BryceError
 from scene_files import (basic_scene, group_donor, material_library, sky_library,
@@ -116,6 +116,50 @@ def test_boolean_roles(scene, library, install):
         "Cube 1": "positive", "Bite": "negative"}
     report = preview.render(after, 160, 120)[1]
     assert "negative part" in next(r for r in report if r["name"] == "Bitten")["note"]
+
+
+def flag_word(scene, ref):
+    return struct.unpack_from("<I", scene._payload(ref), 272)[0]
+
+
+def test_boolean_parts_carry_the_flags_bryce_gives_them(scene, library, install):
+    after = run(scene, library, install,
+                {"op": "add", "kind": "sphere", "name": "Bite", "position": [0, 20, 0]},
+                {"op": "group", "names": ["Cube 1", "Bite"], "negative": ["Bite"],
+                 "name": "Bitten"})
+    kind, group = after.find("Bitten")
+    assert flag_word(after, group) == 0x04020008
+    assert {after._name(r): flag_word(after, r) for _, r in after._members(group)} == {
+        "Cube 1": 0x10000048, "Bite": 0x10000050}
+    apart = run(after, library, install, {"op": "ungroup", "name": "Bitten"})
+    assert flag_word(apart, apart.find("Bite")[1]) == 0x10
+
+
+def test_a_plain_group_has_no_boolean_flags(scene, library, install):
+    after = run(scene, library, install,
+                {"op": "add", "kind": "sphere", "name": "Ball", "position": [30, 20, 0]},
+                {"op": "group", "names": ["Cube 1", "Ball"], "name": "Pair"})
+    _, group = after.find("Pair")
+    assert flag_word(after, group) == 0x04000000
+    assert {flag_word(after, r) for _, r in after._members(group)} == {0}
+
+
+@pytest.mark.skipif(not os.environ.get("BRYCE3D_INSTALL"),
+                    reason="set BRYCE3D_INSTALL to test against real preset files")
+def test_every_boolean_part_in_real_presets_has_both_flags():
+    from bryce3d_mcp import presets
+    folder = presets.folder(os.environ["BRYCE3D_INSTALL"])
+    checked = 0
+    for file_name in os.listdir(folder):
+        source = presets.donor(folder, file_name)
+        for row in source._rows.get("C3dObjList", []):
+            for _, ref, _ in source._list_items(("C3dObjList",
+                                                 struct.unpack_from(">I", row)[0])):
+                flags = flag_word(source, ref)
+                if flags & 0x38:
+                    assert flags & 0x10000040 == 0x10000040
+                    checked += 1
+    assert checked > 150
 
 
 def test_grouped_scenes_survive_copy_move_delete_and_export(scene, library, install):
@@ -317,3 +361,103 @@ def test_texture_scale_refusals(scene, library, install, change, message):
     with pytest.raises(BryceError, match=message):
         sceneops.apply(scene, [{"op": "texture_scale", "name": "Cube 1", **change}],
                        library, install)
+
+
+def sky_flags(scene):
+    owner = scene._first("C3dBaseSky")
+    return struct.unpack_from("<I", scene._payload(owner), 268)[0]
+
+
+def test_sky_switches_set_one_mode_at_a_time(scene):
+    sceneops.apply(scene, [{"op": "sky", "switches": {"mode": "darker"}}])
+    assert sky_flags(scene) & 0xF == 0x1 | 0x4
+    sceneops.apply(scene, [{"op": "sky", "switches": {"mode": "custom"}}])
+    assert sky_flags(scene) & 0xF == 0x1 | 0x8
+    assert scene.sky_switches()["mode"] == "custom"
+    sceneops.apply(scene, [{"op": "sky", "switches": {"mode": "off"}}])
+    assert sky_flags(scene) & 0xF == 0
+    assert scene.sky_switches()["mode"] == "off"
+
+
+def test_sky_switches_leave_other_bits_alone(scene):
+    owner = scene._first("C3dBaseSky")
+    scene._write(owner, 268, struct.pack("<I", 0x34000180))
+    state = scene.set_sky_switches({"rainbow": True, "volumetric": "fine", "stars": True})
+    assert sky_flags(scene) == 0x34000180 | 0x4000 | 0x1000000
+    assert state["rainbow"] and state["stars"] and state["volumetric"] == "fine"
+    assert struct.unpack_from("<2I", scene._payload(owner), 868) == (1, 0)
+    scene.set_sky_switches({"rainbow": False, "volumetric": "off"})
+    assert sky_flags(scene) == 0x34000180
+
+
+def test_cloud_layers_share_one_clouds_bit(scene):
+    owner = scene._first("C3dBaseSky")
+    scene._write(owner, 268, struct.pack("<I", 0x3 | 0x40))      # stale layer, clouds off
+    scene.set_sky_switches({"stratus_clouds": True})
+    assert sky_flags(scene) & 0x70 == 0x10 | 0x20
+    scene.set_sky_switches({"stratus_clouds": False})
+    assert sky_flags(scene) & 0x70 == 0
+
+
+def test_sky_switches_reject_unknown_names_and_values(scene):
+    before = sky_flags(scene)
+    for bad in ({"mode": "stormy"}, {"fireworks": True}, {"rainbow": "yes"}):
+        with pytest.raises(BryceError):
+            sceneops.apply(scene, [{"op": "sky", "switches": bad}])
+    with pytest.raises(BryceError):
+        sceneops.apply(scene, [{"op": "sky"}])
+    assert sky_flags(scene) == before
+
+
+@pytest.mark.skipif(not os.environ.get("BRYCE3D_INSTALL"),
+                    reason="set BRYCE3D_INSTALL to test real presets")
+def test_every_preset_sky_with_atmosphere_has_exactly_one_mode():
+    lib = presets.donor(presets.folder(os.environ["BRYCE3D_INSTALL"]), "Sky Presets.bsk")
+    checked = 0
+    for row in lib._rows["C3dBaseSky"]:
+        payload = lib._payload(("C3dBaseSky", struct.unpack_from(">I", row)[0]))
+        flags = struct.unpack_from("<I", payload, 268)[0]
+        if flags & 1:
+            assert sum(bool(flags & bit) for bit in (2, 4, 8)) == 1
+            checked += 1
+    assert checked > 20
+
+
+# -- how tall a terrain is --------------------------------------------------------
+def test_a_terrain_is_as_tall_as_its_size_says(scene, library, install):
+    after = run(scene, library, install,
+                {"op": "add", "kind": "terrain", "name": "Hill", "position": [0, 6, 40],
+                 "size": [60, 12, 50]})
+    grid = after.terrain_heights("Hill")[0]
+    heights = [0] * (grid * grid)
+    heights[grid * grid // 2 + grid // 2] = 65535            # one peak, flat ground
+    after.set_terrain_heights("Hill", heights)
+    kind, key = after.find("Hill")
+    points = preview.object_parts(after, kind, key)[0][0]
+    assert points[:, 1].max() == pytest.approx(12, abs=0.2)      # stands on the ground
+    assert points[:, 1].min() >= -1e-6
+    assert after.describe(kind, key)["size"] == pytest.approx([60, 12, 50])
+    assert after.transform(key)[2][1] == pytest.approx(12 / UNIT)
+
+
+def test_a_symmetric_lattice_reaches_both_ways():
+    flat = [0, 0, 0, 0, 65535, 0, 0, 0, 0]
+    up = preview._terrain(3, flat)[0]
+    both = preview._terrain(3, flat, mirrored=True)[0]
+    assert (up[:, 1].min(), up[:, 1].max()) == (-0.5, 0.5)
+    assert (both[:, 1].min(), both[:, 1].max()) == (-1.0, 1.0)
+
+
+@pytest.mark.skipif(not os.environ.get("BRYCE3D_INSTALL"),
+                    reason="set BRYCE3D_INSTALL to test real presets")
+def test_mountain_presets_stand_at_half_their_height():
+    """Most of Bryce's mountains stand on the ground (some are sunk into it on
+    purpose). Those sit at half their height, whatever that height is."""
+    lib = presets.donor(presets.folder(os.environ["BRYCE3D_INSTALL"]), "Mountains.obp")
+    standing = []
+    for row in lib._rows["C3dHeightField"]:
+        info = lib.describe("terrain",
+                            ("C3dHeightField", struct.unpack_from(">I", row)[0]))
+        if info["position"][1] == pytest.approx(info["size"][1] / 2, rel=0.01):
+            standing.append(round(info["size"][1]))
+    assert len(standing) >= 15 and len(set(standing)) >= 3

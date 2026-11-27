@@ -563,7 +563,8 @@ def br3_info(path: str) -> str:
     """Everything editable in a scene: objects (exact position, size, rotation,
     material), camera, sun and sky settings."""
     document = Br3.load(path)
-    return json.dumps({**document.summary(), "sky": document.sky()})
+    return json.dumps({**document.summary(), "sky": document.sky(),
+                       "sky_switches": document.sky_switches()})
 
 
 @tool

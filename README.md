@@ -65,13 +65,14 @@ applies completely or writes nothing.
 | `texture_scale` | Multiply a procedural texture's three scale numbers, to resize or stretch its pattern |
 | `camera` | Position, heading, pitch or `look_at`, `bank` (tilt: positive drops the right end of the horizon), field of view |
 | `sun` | Azimuth (relative to the camera: 0 ahead, 90 right, 180 behind), altitude, colors |
-| `sky` | Single sky settings by name, including the moon phase (`MoonPhAng`, `MoonPhTA`, `MoonPhES`, `MoonPhHard`). Which ones show depends on the sky mode |
+| `sky` | `settings`: single sky values by name, including the moon phase (`MoonPhAng`, `MoonPhTA`, `MoonPhES`, `MoonPhHard`). `switches`: the sky mode (`soft`, `darker`, `custom`, `off`), `volumetric` (`off`, `rough`, `fine`) and true/false for stratus and cumulus clouds, cloud shadows, linked or fixed clouds, sun linked to view, haze and fog blended with the sun, rainbow and secondary rainbow, halo rings, illusion, moon image and phase, stars and comets |
 
 `br3_presets` lists every preset by name, read from your own Bryce folder (found from the
 running program, or set `BRYCE3D_INSTALL`).
 
 Units are Bryce units and Y is up. `position` is the object's center. A cube at scale 1 is
-20.48 on each side. Material colors are `#rrggbb`. Material numbers (`diffuse`, `ambient`,
+20.48 on each side; a terrain at scale 1 is 20.48 wide and 10.24 tall, so one placed at half
+its height stands on the ground. Giving `size` avoids the difference. Material colors are `#rrggbb`. Material numbers (`diffuse`, `ambient`,
 `specular`, `transparency`, `reflection`, `bump`, `metallic`, `density`) use 1.0 for 100%;
 `refraction` is the index (1.0 bends nothing, 1.33 is like water). Giving a plain value to a
 textured channel removes the texture from that channel only.
@@ -155,8 +156,8 @@ that the script builds itself:
   carved jar, a curved slide, jagged pink peaks and a ribbon of 6,000 rainbow flecks
 - **silver_drops** - chrome spheres over rippled water under a tilted horizon
 - **orrery** - a gyroscope of thin chrome rings beside a crystal citadel on eroded crags
-- **far_world** - rough textured ground breaking through mist, a spined arch, craggy
-  boulders and asteroids, and a clouded pink planet
+- **far_world** - rough textured ground, a spined rock arch, craggy boulders and asteroids,
+  and a pink planet
 - **colour_generation** - tilted glass cubes, one carved by a boolean
 
 They are rendered in the order that tests plain shapes first and new meshes last. The
@@ -165,32 +166,38 @@ larger scenes are 10 to 15 MB each.
 On Windows, start Bryce and double-click `render-gallery.bat`. Your template needs a stone.
 It asks whether to load the bridge, never discards unsaved work unless you type `DISCARD`,
 stops at the first problem and writes the pictures and a `render_log.json` to
-`workspace\gallery`. **These scenes have not been successfully rendered in Bryce yet.** The
-first attempt, with an earlier version, was stopped by Bryce's save question and counted
-blank pictures as renders. Expect to tune colors, ripples and sun angles.
+`workspace\gallery`. To redo one scene, run `render-gallery.bat 04_far_world`.
+
+All five rendered on Windows with version 0.5.1, with no dialogs, in 8 seconds to 10
+minutes each. Those renders showed that new meshes came out at double size and terrains at
+half the stated height, plus a missing boolean part. All three are fixed in 0.6.0, which
+**has not been rendered yet.** Colors still differ from what the scenes aim for.
 
 ## Status - read this first
 
-Version 0.5.1. The Python code has automated tests, run on Linux. The bridge DLL is tested
+Version 0.6.0. The Python code has automated tests, run on Linux. The bridge DLL is tested
 in a harness that loads your real `Bryce 3D.exe` and `Axiom.dll` on Linux with stand-ins for
-Windows. **Most new features have not run on Windows yet.**
+Windows. **Parts of it have not run on Windows yet; see the table.**
 
 | What | State |
 | --- | --- |
 | Opening and rendering scenes edited by this code | **Confirmed in Bryce** (earlier version) |
 | Adding sphere, cube, torus, cylinder, cone and pyramid; duplicate; move, scale, delete; rotation about X and Y; material color; sun direction | **Confirmed in Bryce** (a 13-object demo matched within about 2 pixels) |
 | A generated terrain | **Confirmed in Bryce** to appear. Heights survived Bryce re-saving the file exactly |
-| Opening a scene by message, and pictures of Bryce's window | Reached the live program in the first gallery run |
-| Rendering from the menu by message | **Unknown.** In that run Bryce's save question blocked it. With the bridge, the render button is pressed if the menu does nothing |
-| New mesh shapes | Re-encoding a stone made by Bryce gives the same size, identical header and geometry equal to 1e-12. **A new mesh has not been rendered** |
-| Sky and sun settings | **Fixed in 0.5.0:** earlier versions did not write the copy Bryce draws from. All 38 cached positions agree with the settings in four Bryce-saved scenes. Not rendered |
-| Camera including bank | Reading matches a real render within 1.7 pixels. **Writing, and the direction of bank, not rendered** |
-| Textures from the `texture` operation | **Fixed in 0.5.1:** earlier versions left out the type marker in front of the texture link, so Bryce could probably not have followed it. All 127 textured channels in Bryce's own preset and template files have the marker, and all those written here now do. Not rendered |
+| Opening a scene, rendering from the menu by message, and pictures of Bryce's window | **Confirmed in Bryce** with the bridge loaded |
+| New mesh shapes | **Rendered in Bryce.** **Fixed in 0.6.0:** they were double size. With that one change the preview matches the renders shape for shape |
+| Terrain height | **Fixed in 0.6.0:** terrains are half as tall as earlier versions said. Bryce's mountain presets sit at half their height, and a render agrees |
+| Sky and sun settings | **Fixed in 0.5.0:** earlier versions did not write the copy Bryce draws from. All 38 cached positions agree with the settings in four Bryce-saved scenes. Preset skies and the sun direction rendered; single values not checked in a render |
+| Sky mode and switches | New in 0.6.0. Each bit was read from the code that fills Bryce's menu and Sky & Fog window, and every preset sky with its atmosphere on has exactly one mode. **Not rendered** |
+| Camera including bank | Reading matches a real render within 1.7 pixels. Writing and bank **rendered**: a negative bank raises the right end of the horizon |
+| Textures from the `texture` operation | **Rendered** (water ripples, rock color) after the 0.5.1 fix: each texture link needs its type marker |
 | Texture scale | The three numbers were identified from Bryce's presets. **Whether a larger number makes a pattern larger or smaller is not confirmed** |
-| Groups, booleans, preset models, materials, textures and skies, rotation about Z, other object kinds | Layouts read from Bryce's own files; all 154 bundled presets load with every link intact. **Not opened in Bryce yet** |
+| Preset materials and skies, rotation about Z | **Rendered** |
+| Booleans | In the first render the carved cube was missing. 0.6.0 writes the extra flags Bryce's own boolean parts have. **Not rendered since** |
+| Preset models, plain groups, lights, disk, lattice | Layouts read from Bryce's own files; all 154 bundled presets load with every link intact. **Not opened in Bryce yet** |
 | Animation | Frames and previews tested here. Rendering a series is tested against a stand-in only |
 | Saving and loading | Save-box detection works on real pictures. The Save As and load steps are **not tried live** |
-| The bridge | Works in the harness with Bryce's real input functions. **Never loaded on Windows.** The busy signal used to follow renders may need tuning |
+| The bridge | **Loaded on Windows.** Opening scenes, starting renders from the menu, noticing when each finished and capturing the picture worked for all five gallery scenes |
 | Labs (`open_lab`, then click and drag) | Depends on the two rows above. **Not tried live**; the Sky Lab key is unverified |
 | Terrain library (`.obp`) reading and encoding | All 32 bundled terrains re-encode byte for byte. Importing an edited one is untried |
 | Real mouse and keyboard tools | Button positions measured on a running copy. The input code is untried |
@@ -200,7 +207,7 @@ Windows. **Most new features have not run on Windows yet.**
 `br3_preview` draws shapes, flat colors, the ground, a stand-in sky, the sun and ground
 shadows in about a second, and says for each object whether it is in frame, off an edge,
 behind the camera or hidden. Against Bryce's render of a test scene, object outlines lined
-up within about 2 pixels. It does **not** show textures, ripples, Bryce's skies and clouds,
+up within about 2 pixels, and new meshes and terrains line up with the gallery renders. It does **not** show textures, ripples, Bryce's skies and clouds,
 atmosphere, reflections, transparency, boolean cuts, object-on-object shadows or lights.
 It draws new meshes and camera tilt. Use it for layout, and `br3_render` for the look: a
 textured, reflective scene looks flat and plain in the preview.
@@ -378,7 +385,11 @@ objects, an item in the root object list.
 - **Sky and sun:** each value is kept in a setting record and cached in the sky or sun
   record, which is what Bryce draws from, so both are written. 35 sky offsets (the four moon
   phase values at 680-704) and 3 sun offsets agree with Bryce-saved scenes. The Sky Lab's
-  on/off switches live in a flag word whose bits have not been identified.
+  on/off switches are bits of the word at 268 in the sky record (stars and comets are two
+  whole numbers at 868 and 872).
+- **Sizes:** primitives span -1 to 1 before scaling. A mesh's stored points count double,
+  and a terrain's heights run from -0.5 to 0.5 (a symmetric lattice's from -1 to 1). One
+  file unit is 10.24 Bryce units.
 - **Textures:** in a material, each textured channel block is preceded by a four-byte type
   (`brtx` procedural, `pctx` picture), then the texture's id; bit `0x40` of the word at 268
   is set. A procedural texture record keeps three scale numbers (doubles at 276).
@@ -468,8 +479,6 @@ Not everything in Bryce 3D is covered by the file tools:
 
 - Bryce's own animation timeline, keyframes and path objects are not read or written.
   Animation here is frame-by-frame.
-- Sky mode and the Sky Lab's switches (clouds, stars, rainbow and so on) cannot be set one
-  by one in a file. Use a sky preset, or the Sky Lab through the bridge.
 - Texture mapping modes, editing a texture's internals, and picture textures are not
   covered. Existing textures can be reused and procedural ones rescaled.
 - Inside the Labs, the agent works by looking and clicking; there are no per-control tools.

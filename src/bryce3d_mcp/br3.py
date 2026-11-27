@@ -21,6 +21,13 @@ from .errors import BryceError
 
 UNIT = 10.24            # Bryce units (as shown in the program) per file unit
 PRIMITIVE_SIZE = 2 * UNIT
+# How far shapes reach in their own space. Primitives span -1 to 1. A mesh's stored
+# points count double, and a terrain reaches half as far up and down as sideways: its
+# heights run from -0.5 to 0.5 (a symmetric lattice from -1 to 1). Bryce's mountain
+# presets all sit with their centre half their vertical scale above the ground, and
+# renders of new meshes and terrains agree.
+MESH_UNIT = 2.0
+_TERRAIN_EXTENT = (2.0, 1.0, 2.0)
 _ROOT = "C3dRootObjList"
 _MATERIAL = "C3dBaseMaterial"
 _CAMERA = "C3dBaseCamera"
@@ -49,6 +56,22 @@ SKY_CACHE = {
     "MoonPhHard": 704,
 }
 SUN_CACHE = {"DiscClr": 836, "HaloClr": 848, "SunVctr": 860}
+
+# The Sky & Fog tick boxes are bits of one word in the sky record. Each was read off
+# the code that fills Bryce's own menu and dialog, and the mode bits agree with all
+# of Bryce's sky presets.
+_SKY_FLAGS = 268
+_ATMOSPHERE_ON, _CLOUDS_ON = 0x1, 0x10
+SKY_MODES = {"soft": 0x2, "darker": 0x4, "custom": 0x8, "off": 0}
+SKY_SWITCHES = {
+    "stratus_clouds": 0x20, "cumulus_clouds": 0x40, "cloud_shadows": 0x1000,
+    "link_clouds": 0x80000, "fixed_clouds": 0x400000, "link_sun_to_view": 0x200,
+    "blend_haze_with_sun": 0x2000, "blend_fog_with_sun": 0x200000,
+    "rainbow": 0x4000, "secondary_rainbow": 0x8000000, "halo_rings": 0x10000,
+    "illusion": 0x100000, "moon_image": 0x20000, "moon_phase": 0x40000,
+}
+_VOLUMETRIC = {"off": 0, "rough": 0x800000, "fine": 0x1000000}
+_SKY_FIELDS = {"stars": 868, "comets": 872}     # whole numbers after the bits
 
 # user-facing kind -> root list tag
 KINDS = {
@@ -82,6 +105,13 @@ _TRACK_SLOT = {name: slot for slot, name in _SLOT_CLASS.items() if slot >= 492}
 # Boolean role of an object inside a group: bits of the flag word at 272.
 _FLAGS, BOOLEAN_BITS = 272, {"neutral": 0, "positive": 0x08, "negative": 0x10,
                              "intersect": 0x20}
+# In Bryce's own models a part with a boolean role inside a group also carries these
+# two bits (all 179 such parts in the bundled presets). Without them a boolean
+# group did not appear in a real render. Groups have their own two: one on every
+# boolean group, one on a group that stands directly in the scene.
+_IN_GROUP, _HAS_ROLE = 0x10000000, 0x40
+_ROLE_MASK = 0x38 | _HAS_ROLE
+_TOP_GROUP, _BOOLEAN_GROUP = 0x04000000, 0x00020000
 # A record is named by (class name, id).
 Ref = tuple[str, int]
 
@@ -689,11 +719,29 @@ class Br3:
         if mode not in BOOLEAN_BITS:
             raise BryceError(f"boolean must be one of {', '.join(BOOLEAN_BITS)}")
         flags = struct.unpack_from("<I", self._payload(ref), _FLAGS)[0]
-        self._write(ref, _FLAGS, struct.pack("<I", (flags & ~0x38) | BOOLEAN_BITS[mode]))
+        flags = (flags & ~_ROLE_MASK) | BOOLEAN_BITS[mode]
+        if flags & _IN_GROUP and BOOLEAN_BITS[mode]:
+            flags |= _HAS_ROLE
+        self._write(ref, _FLAGS, struct.pack("<I", flags))
+
+    def _set_membership(self, ref: Ref, inside: bool, role: str) -> None:
+        """Mark an object as a part of a group, or as standing in the scene again."""
+        flags = struct.unpack_from("<I", self._payload(ref), _FLAGS)[0]
+        flags &= ~(_IN_GROUP | _ROLE_MASK)
+        if ref[0] == _GROUP:
+            flags &= ~(_TOP_GROUP | _BOOLEAN_GROUP)
+            if role != "neutral":
+                flags |= _BOOLEAN_GROUP
+            flags |= _IN_GROUP if inside else _TOP_GROUP
+        elif inside and role != "neutral":
+            flags |= _IN_GROUP
+        self._write(ref, _FLAGS, struct.pack("<I", flags))
+        self.set_boolean(ref, role)
 
     def _local_extent(self, kind: str, key: Ref) -> list[float]:
-        """How big an object is in its own space. Bryce's shapes span -1 to 1; a
-        mesh has whatever its points span."""
+        """How big an object is in its own space: what its scale multiplies."""
+        if kind == "terrain":
+            return list(_TERRAIN_EXTENT)
         if kind == "mesh":
             try:
                 points = trimesh.decode(self._payload(key))[0]
@@ -702,7 +750,7 @@ class Br3:
             if points:
                 spans = [max(p[a] for p in points) - min(p[a] for p in points)
                          for a in range(3)]
-                return [span if span > 1e-9 else 2.0 for span in spans]
+                return [span * MESH_UNIT if span > 1e-9 else 2.0 for span in spans]
         return [2.0] * 3
 
     def describe(self, kind: str, key: Ref) -> dict:
@@ -854,7 +902,7 @@ class Br3:
             raise BryceError(f"an object named {final!r} already exists")
         heightfield.pack_name(final, 32)
         if settings.get("position") is None:
-            settings["position"] = self._resting_position(source, matches[0], settings)
+            settings["position"] = self._resting_position(source, kind, matches[0], settings)
         new = self._copy(source, matches[0])
         self._append(KINDS[kind], new)
         # The copy still carries the original's name until it is renamed.
@@ -880,8 +928,8 @@ class Br3:
         half = max(hi - lo for lo, hi in zip(low, high)) / 2
         if not half > 0:
             raise BryceError("the mesh has no size")
-        # Like Bryce's own shapes, keep the geometry within -1..1 and let the
-        # object's scale give it its size.
+        # Keep the stored geometry within -1..1 and let the object's scale give it
+        # its size.
         local = [[(p[a] - middle[a]) / half for a in range(3)] for p in points]
         if size is not None:
             wanted = _triple(size, "size")
@@ -910,7 +958,7 @@ class Br3:
                           current[:trimesh.HEADER] + payload[trimesh.HEADER:])
         centre = middle if position is None else _triple(position, "position")
         self.place(ref, [c / UNIT for c in centre],
-                   [f * half / UNIT for f in factors],
+                   [f * half / (MESH_UNIT * UNIT) for f in factors],
                    quaternion_from_euler(rotation or (0, 0, 0)), library)
         if material:
             self.set_material(final, material, library)
@@ -919,24 +967,27 @@ class Br3:
         return info
 
     def mesh_geometry(self, ref: Ref) -> tuple[list, list]:
-        """A mesh object's points (in its own space) and outward triangles."""
+        """A mesh object's points and outward triangles, in the same object space as
+        the primitives (so its scale and UNIT apply directly)."""
         points, _, triangles = trimesh.decode(self._payload(ref))
-        return points, [(t[0], t[2], t[1]) for t in triangles]
+        return ([tuple(c * MESH_UNIT for c in p) for p in points],
+                [(t[0], t[2], t[1]) for t in triangles])
 
-    def _resting_position(self, source: "Br3", key: Ref, settings: dict):
+    def _resting_position(self, source: "Br3", kind: str, key: Ref, settings: dict):
         """When a resized solid has no position, keep it standing on the ground."""
-        info = source.describe("", key)
+        position = source.describe(kind, key).get("position")
         old = source._vector(key, "Obj_eScale")
-        position = info.get("position")
-        if position is None or old is None or abs(position[1] - old[1] * UNIT) > 0.05:
+        reach = source._local_extent(kind, key)[1] / 2     # centre to underside
+        if position is None or old is None \
+                or abs(position[1] - old[1] * reach * UNIT) > 0.05:
             return None
         if settings.get("scale") is not None:
-            new = _triple(settings["scale"], "scale")[1]
+            new = _triple(settings["scale"], "scale")[1] * reach * UNIT
         elif settings.get("size") is not None:
-            new = _triple(settings["size"], "size")[1] / PRIMITIVE_SIZE
+            new = _triple(settings["size"], "size")[1] / 2
         else:
             return None
-        return [position[0], new * UNIT, position[2]]
+        return [position[0], new, position[2]]
 
     def remove_all_except(self, keep: set[str]) -> int:
         """Delete every object whose name is not in `keep`. Returns how many went."""
@@ -953,7 +1004,7 @@ class Br3:
             raise BryceError(f"an object named {final!r} already exists")
         heightfield.pack_name(final, 32)
         if settings.get("position") is None:
-            settings["position"] = self._resting_position(self, original, settings)
+            settings["position"] = self._resting_position(self, kind, original, settings)
         copy = self._copy(self, original)
         self._append(KINDS[kind], copy)
         self._rename(copy, final)
@@ -1027,11 +1078,12 @@ class Br3:
         for member_name, ref, centre in zip(names, members, centres):
             _, _, scale, rotation = self.transform(ref)
             self.place(ref, [c - m for c, m in zip(centre, middle)], scale, rotation, library)
-            if boolean:
-                self.set_boolean(ref, "negative" if member_name in negative else
-                                 "intersect" if member_name in intersect else "positive")
+            role = "neutral" if not boolean else (
+                "negative" if member_name in negative else
+                "intersect" if member_name in intersect else "positive")
+            self._set_membership(ref, True, role)
         self.place(group, middle, (1.0, 1.0, 1.0), (0.0, 0.0, 0.0, 1.0), library or source)
-        self.set_boolean(group, "positive" if boolean else "neutral")
+        self._set_membership(group, False, "positive" if boolean else "neutral")
         self._write_root([raw for _, ref, raw in self._root()[2] if ref not in members])
         self._append(_GROUP_TAG, group)
         self._rename(group, final)
@@ -1060,6 +1112,7 @@ class Br3:
             moves.append((ref, world, size, turn))
         for ref, world, size, turn in moves:
             self.place(ref, world, size, turn, library)
+            self._set_membership(ref, False, self.boolean_of(ref))
         released = frozenset(ref for _, ref, _ in items)
         doomed = set(self._closure(group, skip=released))
         self._write_root([raw for _, ref, raw in self._root()[2] if ref != group]
@@ -1227,6 +1280,66 @@ class Br3:
             self._set_setting(tracks[label], value, label)
             self._cache_setting("C3dBaseSky", SKY_CACHE.get(label), tracks[label])
         return self.sky()
+
+    def sky_switches(self) -> dict:
+        """The sky mode and the Sky & Fog tick boxes."""
+        owner = self._first("C3dBaseSky")
+        if owner is None:
+            return {}
+        payload = self._payload(owner)
+        flags = struct.unpack_from("<I", payload, _SKY_FLAGS)[0]
+        mode = "off"
+        if flags & _ATMOSPHERE_ON:
+            mode = next((n for n, bit in SKY_MODES.items() if flags & bit), "soft")
+        out = {"mode": mode}
+        out.update({name: bool(flags & bit) for name, bit in SKY_SWITCHES.items()})
+        for name in ("stratus_clouds", "cumulus_clouds"):
+            out[name] = out[name] and bool(flags & _CLOUDS_ON)
+        out["volumetric"] = next((n for n, bit in _VOLUMETRIC.items() if flags & bit), "off")
+        if len(payload) >= max(_SKY_FIELDS.values()) + 4:
+            out.update({name: bool(struct.unpack_from("<I", payload, at)[0])
+                        for name, at in _SKY_FIELDS.items()})
+        return out
+
+    def set_sky_switches(self, switches: dict) -> dict:
+        owner = self._first("C3dBaseSky")
+        if owner is None:
+            raise BryceError("the scene has no sky record")
+        allowed = ["mode", "volumetric", *SKY_SWITCHES, *_SKY_FIELDS]
+        unknown = sorted(set(switches) - set(allowed))
+        if unknown:
+            raise BryceError(f"unknown sky switches {unknown}; use {allowed}")
+        before = self.sky_switches()
+        flags = struct.unpack_from("<I", self._payload(owner), _SKY_FLAGS)[0]
+        for name, value in switches.items():
+            if name in ("mode", "volumetric"):
+                table = SKY_MODES if name == "mode" else _VOLUMETRIC
+                if value not in table:
+                    raise BryceError(f"{name} must be one of {', '.join(table)}")
+                mask = 0
+                for bit in table.values():
+                    mask |= bit
+                if name == "mode":
+                    mask |= _ATMOSPHERE_ON
+                flags = flags & ~mask | table[value]
+                if name == "mode" and value != "off":
+                    flags |= _ATMOSPHERE_ON
+            elif not isinstance(value, bool):
+                raise BryceError(f"{name} must be true or false")
+            elif name in SKY_SWITCHES:
+                flags = flags | SKY_SWITCHES[name] if value else flags & ~SKY_SWITCHES[name]
+            else:
+                self._write(owner, _SKY_FIELDS[name], struct.pack("<I", int(value)))
+        if "stratus_clouds" in switches or "cumulus_clouds" in switches:
+            # Both layers hang off one "clouds" bit; a layer that was off while
+            # that bit was clear must not appear just because the other is turned on.
+            for name in ("stratus_clouds", "cumulus_clouds"):
+                on = switches.get(name, before[name])
+                flags = flags | SKY_SWITCHES[name] if on else flags & ~SKY_SWITCHES[name]
+            layers = SKY_SWITCHES["stratus_clouds"] | SKY_SWITCHES["cumulus_clouds"]
+            flags = flags | _CLOUDS_ON if flags & layers else flags & ~_CLOUDS_ON
+        self._write(owner, _SKY_FLAGS, struct.pack("<I", flags))
+        return self.sky_switches()
 
     def _cache_setting(self, owner_class: str, offset: int | None, track: Ref) -> None:
         """Copy a setting record's value into its owner's cached copy, which is

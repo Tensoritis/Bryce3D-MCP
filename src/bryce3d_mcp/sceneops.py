@@ -56,8 +56,14 @@ OPERATIONS = {
     "sun": ((), ("azimuth", "altitude", "disc_color", "halo_color"),
             "Aim the sun. Bryce stores it relative to the camera: azimuth 0 is ahead of "
             "the camera, 90 to its right, 180 behind it."),
-    "sky": (("settings",), (), "Change sky settings by the names br3_info lists. "
-            "Which of them show depends on the sky mode."),
+    "sky": ((), ("settings", "switches"),
+            "Change the sky. settings are numbers and colours by the names br3_info "
+            "lists. switches are the Sky & Fog choices: mode (soft, darker, custom or "
+            "off), volumetric (off, rough or fine), and true/false for stratus_clouds, "
+            "cumulus_clouds, cloud_shadows, link_clouds, fixed_clouds, link_sun_to_view, "
+            "blend_haze_with_sun, blend_fog_with_sun, rainbow, secondary_rainbow, "
+            "halo_rings, illusion, moon_image, moon_phase, stars, comets. Which numbers "
+            "show depends on the mode."),
 }
 
 
@@ -72,7 +78,8 @@ def describe() -> dict:
         "boolean": list(BOOLEAN_BITS),
         "presets": "br3_presets lists the names for insert_preset, material_preset and "
                    "sky_preset",
-        "scale": "multipliers [x, y, z]; or give size in Bryce units (scale 1 = 20.48)",
+        "scale": "multipliers [x, y, z]; or give size in Bryce units (for primitives "
+                 "scale 1 = 20.48; a terrain at scale 1 is 20.48 wide and 10.24 tall)",
         "rotation": "degrees [x, y, z]; +y turns +x toward +z, +x tips +y toward -z",
     }
 
@@ -206,8 +213,14 @@ def _run(scene: Br3, op: str, fields: dict, sources: _Sources):
         return {"camera": scene.set_camera(**fields)}
     if op == "sun":
         return {"sun": scene.set_sun(**fields)}
-    scene.set_sky(fields["settings"])
-    return {"sky_changed": sorted(fields["settings"])}
+    settings, switches = fields.get("settings"), fields.get("switches")
+    if not settings and not switches:
+        raise BryceError("give settings, switches or both")
+    if switches:
+        scene.set_sky_switches(switches)
+    if settings:
+        scene.set_sky(settings)
+    return {"sky_changed": sorted({**(settings or {}), **(switches or {})})}
 
 
 def _mesh(scene: Br3, library: Br3 | None, fields: dict) -> dict:

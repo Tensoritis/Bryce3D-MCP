@@ -315,8 +315,8 @@ def jagged_arch(centre, radius, thickness, seed=11, along=130, around=28):
                                                          + phase)))
             across = thickness * swell * max(0.5, rough)
             # Spines grow from the outer side.
-            if math.cos(turn) > 0.35 and 3 < i < along - 3 and rng.random() < 0.07:
-                across += thickness * rng.uniform(0.7, 2.0)
+            if math.cos(turn) > 0.35 and 3 < i < along - 3 and rng.random() < 0.03:
+                across += thickness * rng.uniform(0.5, 1.3)
             lift = math.cos(turn) * across
             vertices.append([centre[0] + out[0] * (radius + lift),
                              centre[1] + out[1] * (radius + lift),
@@ -534,21 +534,17 @@ def orrery():
 
 # 4 -------------------------------------------------------------------------------
 def far_world():
-    def rocky(name, colour="#5d5348", ground="SandRiver1", bump=0.75, ambient=0.16):
+    def rocky(name, colour="#5d5348", ground="SandRiver1", bump=0.75, ambient=0.28):
         return [paint(name, "Flat Gray", color=colour, ambient=ambient, diffuse=0.95,
                       specular=0.08),
                 texture(name, ground, ["bump"], bump)]
 
-    ops = [*sky("Caribbean Clear", 285, 24),
+    # The sun stays behind the camera's left shoulder, so faces we see are lit.
+    ops = [*sky("Caribbean Clear", 232, 34),
            camera([0, 34, -190], [0, 40, -40], 62),
            add("sphere", "Giant Planet", [-330, 250, 620], [520, 520, 520]),
-           paint("Giant Planet", "Flat White", color="#e3a6b8", ambient=0.62, diffuse=0.5,
-                 transparency=0.1, refraction=1.0),
-           texture("Giant Planet", "Sin Layers1", ["bump"], 0.35),
-           # Bryce's own use of this texture: colour, ambient and transparency together.
-           add("sphere", "Planet Clouds", [-330, 250, 620], [524, 524, 524]),
-           paint("Planet Clouds", "Flat White", ambient=0.55, diffuse=0.5, refraction=1.0),
-           texture("Planet Clouds", "Athmospher1", [*COLOURED, "transparency"])]
+           paint("Giant Planet", "Flat White", color="#e3a6b8", ambient=0.62, diffuse=0.5),
+           texture("Giant Planet", "Sin Layers1", ["bump"], 0.35)]
     # Rough ground made of overlapping terrains: knolls break through the mist.
     ops += [add("plane", "Bedrock", [0, -1.5, 0], [20.48] * 3), *rocky("Bedrock", "#6f6755")]
     for n, (x, z, wide, tall, seed) in enumerate(((-92, -128, 190, 15, 3),
@@ -560,16 +556,19 @@ def far_world():
                                                   (0, -30, 240, 9, 39))):
         name = f"Ground {n}"
         ops += [*land(name, (x, -2.5, z), [wide, tall, wide * 0.9], seed, "dunes", 0.62),
-                *rocky(name, "#716850" if n % 2 else "#675d47", "DesertBump", 0.8, 0.2),
+                *rocky(name, "#716850" if n % 2 else "#675d47", "DesertBump", 0.8, 0.32),
                 texture(name, "DesertBump", COLOURED)]
     # The arch: one new mesh, craggy and bristling with spines.
     rng = random.Random(11)
-    ops += [jagged_arch((42, 6, 40), 40, 9), *rocky("Arch", "#403a38", "Sand1", 0.8)]
+    ops += [jagged_arch((42, 6, 40), 40, 9),
+            *rocky("Arch", "#6a5e52", "DesertBump", 0.8, 0.3),
+            texture("Arch", "DesertBump", COLOURED)]
     for n, (x, z, wide, tall) in enumerate(((84, 50, 74, 42), (2, 56, 70, 30),
                                             (112, 66, 80, 24), (-24, 66, 56, 15))):
         name = f"Footing {n}"
         ops += [*land(name, (x, -2, z), [wide, tall, wide * 0.6], 60 + n, "mountain", 0.55),
-                *rocky(name, "#46403a", "Sand1")]
+                *rocky(name, "#625648", "DesertBump"),
+                texture(name, "DesertBump", COLOURED)]
     for n in range(22):
         x = 42 + rng.choice((-1, 1)) * rng.uniform(34, 68)
         tall = rng.uniform(5, 19) * (1.2 - abs(x - 42) / 90)
@@ -603,17 +602,13 @@ def far_world():
                                           ((14, 56, 110), 8))):
         ops += [rock(f"Asteroid {n}", position, (wide, wide * 0.85, wide), 300 + n, 4, 0.26),
                 *rocky(f"Asteroid {n}", "#98928c", "Sand1", 0.9, 0.2)]
-    for n, (height, clear) in enumerate(((3.6, 0.62), (5.4, 0.86))):
-        ops += [add("plane", f"Mist {n}", [0, height, 0], [20.48] * 3),
-                paint(f"Mist {n}", "Flat White", color="#a8e0d8", ambient=0.65, diffuse=0.35,
-                      transparency=clear, refraction=1.0)]
     return ops
 
 
 # 5 -------------------------------------------------------------------------------
 def colour_generation():
     ops = [*sky("Cold Storm Coming", 250, 30), *sea("Violet Sea", "#28307a", 0.4, 0.26),
-           camera([0, 52, -192], [0, 40, -40], bank=11)]
+           camera([0, 52, -192], [0, 40, -40], bank=-11)]
 
     def glass(name, colour, see_through=0.55):
         return wear(name, "Mirror", color=colour, diffuse=0.55, ambient=0.18, reflection=0.22,

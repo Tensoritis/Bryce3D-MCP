@@ -7,7 +7,7 @@ import struct
 import pytest
 
 from bryce3d_mcp import preview, sceneops, trimesh
-from bryce3d_mcp.br3 import Br3
+from bryce3d_mcp.br3 import Br3, MESH_UNIT, UNIT
 from bryce3d_mcp.errors import BryceError
 from scene_files import basic_scene, mesh_scene
 
@@ -123,7 +123,9 @@ def test_a_new_mesh_stays_where_its_points_are():
                       vertices=TETRA, faces=OUTWARD)
     assert info["position"] == [5, 5, 5] and info["size"] == pytest.approx([10, 10, 10])
     points, triangles = scene.mesh_geometry(scene.find("Wedge")[1])
-    assert max(abs(c) for p in points for c in p) == pytest.approx(1)
+    stored = trimesh.decode(scene._payload(scene.find("Wedge")[1]))[0]
+    assert max(abs(c) for p in stored for c in p) == pytest.approx(1)
+    assert max(abs(c) for p in points for c in p) == pytest.approx(MESH_UNIT)
     assert volume(points, triangles) > 0
     world = preview.object_parts(scene, *scene.find("Wedge"))[0][0]
     assert world.min(0) == pytest.approx([0, 0, 0], abs=1e-6)
@@ -188,3 +190,23 @@ def test_bryce_own_stone_is_reproduced():
         for corner in (3, 4, 5):
             assert got_normals[mine[corner]] == pytest.approx(
                 normals[theirs[corner]], abs=1e-12)
+
+
+def world_spans(scene, name):
+    """The size an object really has: its points as placed, in Bryce units."""
+    kind, key = scene.find(name)
+    points = preview.object_parts(scene, kind, key)[0][0]
+    return list(points.max(axis=0) - points.min(axis=0))
+
+
+def test_a_new_mesh_is_drawn_at_the_size_that_was_asked_for(tmp_path):
+    scene, info = add(Br3.from_bytes(basic_scene()), shape="custom", name="Wedge",
+                      vertices=TETRA, faces=OUTWARD)
+    assert world_spans(scene, "Wedge") == pytest.approx([10, 10, 10])
+    sceneops.apply(scene, [{"op": "set", "name": "Wedge", "size": [30, 8, 12]}])
+    assert world_spans(scene, "Wedge") == pytest.approx([30, 8, 12])
+    # Bryce counts a mesh's stored points double: +-1 at scale 1 is 40.96 across.
+    kind, key = scene.find("Wedge")
+    stored = trimesh.decode(scene._payload(key))[0]
+    across = max(p[0] for p in stored) - min(p[0] for p in stored)
+    assert across * 2 * scene.transform(key)[2][0] * UNIT == pytest.approx(30)

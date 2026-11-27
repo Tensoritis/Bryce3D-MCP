@@ -66,17 +66,22 @@ def _torus(tube: float = 0.2):
     return np.array(points), _grid_faces(u, v, wrap_u=True, wrap_v=True)
 
 
-def _terrain(size: int, heights: list[int], detail: int = 64):
+def _terrain(size: int, heights: list[int], detail: int = 64, mirrored: bool = False):
     grid = np.array(heights, float).reshape(size, size) / 65535
     keep = np.unique(np.linspace(0, size - 1, min(size, detail)).round().astype(int))
     grid = grid[np.ix_(keep, keep)]
     axis = keep / (size - 1) * 2 - 1
     x, z = np.meshgrid(axis, axis)
-    points = np.stack([x, grid * 2 - 1, z], -1).reshape(-1, 3)
     n = len(keep)
     faces = _grid_faces(n, n)
     flat = grid.reshape(-1)                      # Bryce does not draw zero height
-    return points, [f for f in faces if flat[list(f)].max() > 0]
+    faces = [f for f in faces if flat[list(f)].max() > 0]
+    if mirrored:                                 # a symmetric lattice: both ways
+        top = np.stack([x, grid, z], -1).reshape(-1, 3)
+        under = np.stack([x, -grid, z], -1).reshape(-1, 3)
+        return (np.concatenate([top, under]),
+                faces + [(c + n * n, b + n * n, a + n * n) for a, b, c in faces])
+    return np.stack([x, grid - 0.5, z], -1).reshape(-1, 3), faces
 
 
 _SHAPES = {
@@ -115,7 +120,8 @@ def _local_parts(scene: Br3, kind: str, ref) -> list:
         except BryceError:
             points, faces = _SHAPES[kind]()      # a rough stand-in
     elif kind in ("terrain", "lattice"):
-        points, faces = _terrain(*heightfield.decode(scene._payload(ref)))
+        points, faces = _terrain(*heightfield.decode(scene._payload(ref)),
+                                 mirrored=kind == "lattice")
     elif kind in _SHAPES:
         points, faces = _SHAPES[kind]()
     else:
