@@ -24,7 +24,10 @@ def test_tool_list(backend):
     assert {"br3_new", "br3_edit", "br3_preview", "br3_info", "br3_status", "br3_operations",
             "br3_render_result", "br3_open_in_bryce", "br3_export_obj",
             "br3_terrain_picture"} <= names
-    assert len(names) == 42
+    assert {"br3_render", "bryce_command", "bryce_file_command", "bryce_dialogs",
+            "press_dialog_button"} <= names
+    assert "br3_presets" in names
+    assert len(names) == 46
 
 
 def test_build_through_tool_function(backend):

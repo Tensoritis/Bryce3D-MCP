@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from . import heightfield, terrain
-from .br3 import KINDS, MATERIAL_COLOURS, MATERIAL_VALUES, Br3
+from . import heightfield, presets, terrain
+from .br3 import BOOLEAN_BITS, KINDS, MATERIAL_COLOURS, MATERIAL_VALUES, Br3
 from .errors import BryceError
 
-MAX_OPERATIONS = 200
-_PLACEMENT = ("position", "scale", "size", "rotation", "material")
+MAX_OPERATIONS = 500
+_PLACEMENT = ("position", "scale", "size", "rotation", "material", "boolean")
 
 # op -> (required fields, optional fields, help)
 OPERATIONS = {
@@ -15,7 +15,22 @@ OPERATIONS = {
             "Add an object copied from the template file."),
     "set": (("name",), ("new_name", *_PLACEMENT), "Change an existing object."),
     "duplicate": (("name",), ("new_name", *_PLACEMENT), "Copy an object in this scene."),
-    "delete": (("name",), (), "Remove an object."),
+    "delete": (("name",), (), "Remove an object or a whole group."),
+    "group": (("names",), ("name", "negative", "intersect"),
+              "Group objects so they move as one. List some in negative to cut them out "
+              "of the others, or in intersect to keep only the overlap."),
+    "ungroup": (("name",), (), "Take a group apart."),
+    "insert_preset": (("preset",), ("library", "name", "position", "scale", "rotation"),
+                      "Add a ready-made model from Bryce's object presets (mountains, "
+                      "boolean lessons, tutorial models). scale is one number."),
+    "material_preset": (("name", "preset"), ("library", "material"),
+                        "Give an object one of Bryce's materials (Mirror, Metallic Chrome, "
+                        "Mirrored Checkerboard, woods, metals...); material then adjusts it."),
+    "texture": (("name", "texture", "channels"), ("strength",),
+                "Drive material channels (for example bump) with a Bryce texture, found "
+                "by name. BasicSin24 on bump makes ripples."),
+    "sky_preset": (("preset",), ("library",),
+                   "Take the sky and sun of one of Bryce's sky presets."),
     "terrain": (("name",), ("operations", "heightmap_path"),
                 "Reshape a terrain object: start from its heights or a picture, then apply "
                 "terrain_operations."),
@@ -38,6 +53,9 @@ def describe() -> dict:
         "material_settings": {"colors (#rrggbb)": list(MATERIAL_COLOURS),
                               "numbers (1.0 is 100%)": list(MATERIAL_VALUES)},
         "position": "center of the object in Bryce units [x, y, z]; y is up",
+        "boolean": list(BOOLEAN_BITS),
+        "presets": "br3_presets lists the names for insert_preset, material_preset and "
+                   "sky_preset",
         "scale": "multipliers [x, y, z]; or give size in Bryce units (scale 1 = 20.48)",
         "rotation": "degrees [x, y, z]; +y turns +x toward +z, +x tips +y toward -z",
     }
@@ -61,7 +79,8 @@ def validate(operations) -> None:
                              f"{', '.join(unknown)}; allowed: {', '.join(required + optional)}")
 
 
-def apply(scene: Br3, operations: list[dict], library: Br3 | None = None) -> list:
+def apply(scene: Br3, operations: list[dict], library: Br3 | None = None,
+          install: str | None = None) -> list:
     """Run the operations on `scene` in order. The caller writes the file only if
     this returns, so a failure leaves nothing half done on disk."""
     validate(operations)
@@ -69,28 +88,81 @@ def apply(scene: Br3, operations: list[dict], library: Br3 | None = None) -> lis
     for number, step in enumerate(operations):
         fields = {k: v for k, v in step.items() if k != "op" and v is not None}
         try:
-            results.append(_run(scene, step["op"], fields, library))
+            results.append(_run(scene, step["op"], fields, _Sources(library, install)))
         except BryceError as error:
             raise BryceError(f"operation {number} ({step['op']}): {error}. "
                              "Nothing was written.") from error
     return results
 
 
-def _run(scene: Br3, op: str, fields: dict, library: Br3 | None):
+class _Sources:
+    """Where objects can be copied from: the template file and Bryce's presets."""
+
+    def __init__(self, library: Br3 | None, install: str | None) -> None:
+        self.library, self.install = library, install
+
+    def folder(self) -> str:
+        return presets.folder(self.install)
+
+    def preset(self, category: str, fields: dict):
+        found = presets.find(self.folder(), category, fields.pop("preset"),
+                             fields.pop("library", None))
+        return found, presets.load(found)
+
+    def donor(self, file_name: str):
+        try:
+            return presets.donor(self.folder(), file_name)
+        except BryceError:
+            return None
+
+
+def _run(scene: Br3, op: str, fields: dict, sources: _Sources):
+    library = sources.library
+    if op == "group":
+        return scene.group(fields.pop("names"), fields.pop("name", None), library=library,
+                           donors=(sources.donor("Boolean Objects.obp"),), **fields)
+    if op == "ungroup":
+        return scene.ungroup(fields["name"], library)
+    if op == "insert_preset":
+        found, source = sources.preset("objects", fields)
+        return scene.insert_preset(source, found.key, found.name, library=library, **fields)
+    if op == "material_preset":
+        name, material = fields.pop("name"), fields.pop("material", None)
+        found, source = sources.preset("materials", fields)
+        info = scene.apply_material_preset(name, source, found.key)
+        if material:
+            scene.set_material(name, material, library)
+            info = scene.describe(*scene.find(name))
+        return info
+    if op == "texture":
+        others = [library, sources.donor("Boolean Objects.obp"),
+                  sources.donor("Tutorial.obp"), sources.donor("Simple&Fast.mat")]
+        return scene.set_texture(fields["name"], fields["texture"], fields["channels"],
+                                 others, fields.get("strength"))
+    if op == "sky_preset":
+        found, source = sources.preset("skies", fields)
+        scene.apply_sky_preset(source, found.key)
+        return {"sky_preset": found.name, "sun": scene.sun()}
     if op == "add":
-        material = fields.pop("material", None)
+        material, boolean = fields.pop("material", None), fields.pop("boolean", None)
         info = scene.add_object(fields.pop("kind"), library=library, **fields)
+        if boolean:
+            scene.set_boolean(scene.find(info["name"])[1], boolean)
+            info = scene.describe(*scene.find(info["name"]))
         if material:
             scene.set_material(info["name"], material, library)
             info = scene.describe(*scene.find(info["name"]))
         return info
     if op in ("set", "duplicate"):
         name = fields.pop("name")
-        material = fields.pop("material", None)
+        material, boolean = fields.pop("material", None), fields.pop("boolean", None)
         if op == "duplicate":
-            info = scene.duplicate(name, fields.pop("new_name", None), **fields)
+            info = scene.duplicate(name, fields.pop("new_name", None), library, **fields)
         else:
-            info = scene.set_object(name, **fields)
+            info = scene.set_object(name, library=library, **fields)
+        if boolean:
+            scene.set_boolean(scene.find(info["name"])[1], boolean)
+            info = scene.describe(*scene.find(info["name"]))
         if material:
             scene.set_material(info["name"], material, library)
             info = scene.describe(*scene.find(info["name"]))

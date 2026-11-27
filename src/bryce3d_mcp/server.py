@@ -20,7 +20,7 @@ except ImportError:  # mcp 1.x
     from mcp.server.fastmcp import Image
     from mcp.server.fastmcp.exceptions import ToolError
 
-from . import heightfield, layout, meshes, preview, scene, sceneops, terrain
+from . import heightfield, layout, meshes, presets, preview, scene, sceneops, terrain
 from .br3 import Br3
 from .ccmf import CompositeFile
 from .commands import COMMANDS
@@ -28,34 +28,32 @@ from .controller import BryceController
 from .errors import BryceError
 
 INSTRUCTIONS = """\
-Builds and edits MetaCreations Bryce 3D scenes.
+Builds, renders and edits MetaCreations Bryce 3D scenes.
 
-PREFERRED - work on scene files with the br3_ tools. They do not use the mouse,
-keyboard or screen:
+BUILD with the br3_ tools. They work on scene files:
 1. br3_new starts a scene from the user's template file (br3_status explains it).
 2. br3_edit applies a batch of changes and writes a NEW file, returning a preview
    picture and a report of what is in frame. Feed the returned path back in to keep
    building. br3_info lists everything in a scene.
-3. br3_preview is approximate (no textures, clouds or reflections). For the real
-   picture: br3_open_in_bryce, have Bryce render, then br3_render_result.
-Units are Bryce units, Y is up, position is the object's center, a cube of scale 1
-is 20.48 on a side and rests on the ground at y=10.24.
+3. br3_preview is approximate (no textures, clouds or reflections). br3_render gives
+   Bryce's real picture of a scene.
 
-FALLBACK - the other tools drive Bryce's real interface and take over the mouse
-and keyboard while they run. Use them only when the user wants that. Then:
-- Call bryce_status then screenshot first.
-- Prefer build_scene / create_object / set_attributes: they take exact numbers.
-  Units are Bryce units, Y is up, position is the object's center, a default cube
-  is 20.48 on each side and rests on the ground at y=10.24.
-- For anything without a dedicated tool, use hover (Bryce names the control in its
-  bottom-left status text), then click, drag, press_keys or list_menus.
-- Terrain: use terrain_edit. It edits exact heights inside Bryce's own file format,
-  which is far more precise than painting in the Terrain Editor.
-- Tools marked UNVERIFIED have not been observed working on Bryce 3D: check the result.
-- Coordinates are UI pixels from the top-left of the 640x480 interface. A screenshot
-  starts at y=-20, so UI y = image y - 20 and UI x = image x.
-- Pass confirm=true or overwrite=true only after the user has agreed.
+RUN BRYCE with bryce_command (any menu item), bryce_file_command, bryce_dialogs and
+screenshot. These use window messages and pictures of Bryce's own windows: they do
+not move the mouse, type, or take focus.
+
+LAST RESORT - click, drag, hover, press_keys, type_text, create_object, build_scene
+and the other interface tools take over the user's mouse and keyboard while they
+run. Use them only when the user wants that. Then:
+- Call screenshot first. Coordinates are UI pixels from the top-left of the 640x480
+  interface; a screenshot starts at y=-20, so UI y = image y - 20.
+- hover makes Bryce name the control in its bottom-left status text.
+- Tools marked UNVERIFIED have not been observed working on Bryce 3D.
 - If a tool reports that Bryce lost focus or the user moved the mouse, stop and ask.
+
+Units are Bryce units, Y is up, position is the object's center, a cube of scale 1
+is 20.48 on a side and rests on the ground at y=10.24. Pass confirm=true or
+overwrite=true only after the user has agreed.
 """
 
 mcp = MCPServer("bryce3d", instructions=INSTRUCTIONS)
@@ -79,12 +77,26 @@ def _ui(action: Callable[[BryceController], Any]) -> Any:
         return action(controller)
 
 
-def _with_shot(action: Callable[[BryceController], Any]) -> list:
+def _quiet(action: Callable[[BryceController], Any]) -> Any:
+    """Run one action without taking focus: window messages and window pictures only."""
+    with _lock:
+        return action(get_controller())
+
+
+def _shoot(action: Callable[[BryceController], Any]) -> Callable[[BryceController], list]:
     def run(c: BryceController):
         result = action(c)
         return [json.dumps(result if result is not None else {"ok": True}),
                 Image(data=c.screenshot_png(), format="png")]
-    return _ui(run)
+    return run
+
+
+def _with_shot(action: Callable[[BryceController], Any]) -> list:
+    return _ui(_shoot(action))
+
+
+def _quiet_shot(action: Callable[[BryceController], Any]) -> list:
+    return _quiet(_shoot(action))
 
 
 def tool(fn):
@@ -104,16 +116,19 @@ def tool(fn):
 # -- looking --------------------------------------------------------------------
 @tool
 def bryce_status() -> str:
-    """Find Bryce, focus it, and report screen size, UI origin and native menu count."""
-    return json.dumps(_ui(lambda c: c.backend.info()))
+    """Find Bryce and report screen size, where its interface is and how many menu
+    items it has. Does not take focus."""
+    return json.dumps(_quiet(lambda c: c.backend.info()))
 
 
 @tool
 def screenshot(scale: float = 1.0) -> Image:
-    """Capture the Bryce interface and the pop-ups around it (UI y = image y - 20)."""
+    """Picture Bryce's own windows (UI y = image y - 20). It does not take focus,
+    works while Bryce is behind other windows, and never includes other programs.
+    Bryce must not be minimized."""
     if not 0.25 <= scale <= 3:
         raise BryceError("scale must be between 0.25 and 3")
-    return Image(data=_ui(lambda c: c.screenshot_png(scale=scale)), format="png")
+    return Image(data=_quiet(lambda c: c.screenshot_png(scale=scale)), format="png")
 
 
 @tool
@@ -213,15 +228,15 @@ def run_command(command: str, confirm: bool = False) -> list:
 
 
 @tool
-def render(mode: Literal["button", "resume", "clear"] = "button", wait: bool = True,
+def render(mode: Literal["resume", "clear", "button"] = "clear", wait: bool = True,
            timeout_seconds: float = 600, settle_seconds: float = 6,
            dismiss_report: bool = False) -> list:
-    """Start a render. mode: button (the render sphere, tested by hand), resume
-    (Ctrl+R) or clear (Ctrl+Alt+R, restarts from nothing); the shortcuts come from
-    Bryce's menu table. With wait=true this returns once the picture has not changed
-    for settle_seconds; raise that for heavy scenes. For long renders use wait=false,
-    then render_status. dismiss_report clicks the Render Report's check mark; use it
-    only after a screenshot shows the report."""
+    """Start a render of whatever Bryce has open. clear (File/Clear and Render) and
+    resume (File/Render) go through Bryce's menu by window message, without focus,
+    mouse or keyboard. button clicks the render sphere with the mouse. With wait=true
+    this returns once the picture has not changed for settle_seconds; raise that for
+    heavy scenes. For long renders use wait=false, then render_status.
+    dismiss_report CLICKS (uses the mouse) the Render Report's check mark."""
     if not 10 <= timeout_seconds <= 3600:
         raise BryceError("timeout_seconds must be 10-3600")
     if not 3 <= settle_seconds <= 120:
@@ -236,28 +251,49 @@ def render(mode: Literal["button", "resume", "clear"] = "button", wait: bool = T
             result = {"started": True}
         shot = Image(data=c.screenshot_png(), format="png")
         if dismiss_report and result.get("finished"):
+            c.backend.begin()
             c.backend.click(*layout.RENDER_REPORT_OK)
         return [json.dumps(result), shot]
-    return _ui(run)
+    return _ui(run) if mode == "button" else _quiet(run)
 
 
 @tool
 def render_status(watch_seconds: float = 15) -> list:
     """Watch the picture for up to watch_seconds. finished=true means it stopped
-    changing, which a very slow render can also look like."""
+    changing, which a very slow render can also look like. Does not take focus."""
     if not 6 <= watch_seconds <= 50:
         raise BryceError("watch_seconds must be 6-50")
-    return _with_shot(lambda c: c.wait_for_still_picture(watch_seconds, settle=5))
+    return _quiet_shot(lambda c: c.wait_for_still_picture(watch_seconds, settle=5))
 
 
 @tool
 def save_render_image(name: str) -> list:
-    """Save what the viewport shows now as a PNG. This is a screen capture, so its
-    resolution is the on-screen size."""
-    picture = _ui(lambda c: c.render_picture())
+    """Save what Bryce's viewport shows now as a PNG, at on-screen size. For the
+    full render file use br3_render_result."""
+    picture = _quiet(lambda c: c.render_picture())
     path = _output_path(name, "png")
     picture.save(path)
     return [json.dumps({"path": path, "size": picture.size}), _png(picture)]
+
+
+@tool
+def br3_render(path: str, confirm: bool = False, timeout_seconds: float = 600,
+               settle_seconds: float = 8) -> list:
+    """The real render of a scene file, with no focus, mouse or keyboard: opens it in
+    the running Bryce, runs Clear and Render from Bryce's menu, waits until the
+    picture is still and returns it. It replaces the scene open in Bryce, so pass
+    confirm=true once the user agrees. Bryce must be running and not minimized.
+    NEW and not yet tried on a running Bryce: check the picture against br3_preview.
+    A Render Report box may cover part of it."""
+    if not 10 <= timeout_seconds <= 3600:
+        raise BryceError("timeout_seconds must be 10-3600")
+    if not 3 <= settle_seconds <= 120:
+        raise BryceError("settle_seconds must be 3-120")
+
+    def run(c: BryceController):
+        result = c.open_and_render(path, confirm, timeout_seconds, settle_seconds)
+        return [json.dumps(result), _png(c.render_picture())]
+    return _quiet(run)
 
 
 # -- terrain files ---------------------------------------------------------------
@@ -344,7 +380,7 @@ def terrain_edit(source_path: str, output_name: str, operations: list[dict] | No
         handle.write(document.data)
     next_step = ("In Bryce: open the object library (the arrow beside Create), choose Import, "
                  "pick this file, then select the terrain and accept." if extension == ".obp"
-                 else "Open it in Bryce with open_scene (this discards unsaved work).")
+                 else "Render it with br3_render, or open it with br3_open_in_bryce.")
     result = {"path": target, "index": index, "grid": size, "next": next_step}
     return [json.dumps(result), _png(_enlarged(terrain.preview(size, grid)))]
 
@@ -362,6 +398,17 @@ def _library(given: str | None) -> Br3 | None:
     if given:
         raise BryceError(f"template file not found: {path}")
     return None
+
+
+def _install_folder() -> str | None:
+    """Where Bryce is installed: BRYCE3D_INSTALL, else wherever it is running from."""
+    configured = os.environ.get("BRYCE3D_INSTALL")
+    if configured:
+        return configured
+    try:
+        return get_controller().backend.install_folder()
+    except (BryceError, OSError, AttributeError):
+        return None
 
 
 def _write_scene(document: Br3, output_name: str) -> str:
@@ -397,6 +444,28 @@ def br3_status(templates_path: str | None = None) -> str:
 
 
 @tool
+def br3_presets(category: Literal["objects", "materials", "skies"],
+                contains: str = "") -> str:
+    """Names and descriptions of Bryce's own presets, read from the user's Bryce
+    folder: ready-made models (insert_preset), materials such as Mirror and
+    Metallic Chrome (material_preset) and skies (sky_preset). Also lists the
+    texture names the texture operation can use when category is materials."""
+    folder = presets.folder(_install_folder())
+    wanted = contains.lower()
+    result: dict[str, Any] = {"presets": [
+        {"name": p.name, "library": p.library, "about": p.description[:160]}
+        for p in presets.entries(folder, category)
+        if wanted in (p.name + " " + p.description).lower()]}
+    if category == "materials":
+        names: set[str] = set()
+        for name in ("Boolean Objects.obp", "Tutorial.obp", "Simple&Fast.mat"):
+            donor = presets.donor(folder, name)
+            names.update(donor.textures() if donor else ())
+        result["textures"] = sorted(names)
+    return json.dumps(result)
+
+
+@tool
 def br3_operations() -> str:
     """The operations br3_edit accepts, with their fields."""
     return json.dumps(sceneops.describe())
@@ -422,7 +491,7 @@ def br3_new(output_name: str, keep: list[str] | None = None,
                          "see br3_status")
     document = Br3.from_bytes(library.data)
     document.remove_all_except(set(["Plane 1"] if keep is None else keep))
-    results = sceneops.apply(document, operations or [], library)
+    results = sceneops.apply(document, operations or [], library, _install_folder())
     path = _write_scene(document, output_name)
     return _preview_result(document, {"path": path, "results": results})
 
@@ -438,7 +507,8 @@ def br3_edit(source_path: str, output_name: str, operations: list[dict],
      {"op":"camera","position":[0,45,-160],"look_at":[0,25,0]},
      {"op":"sun","azimuth":220,"altitude":35}]"""
     document = Br3.load(source_path)
-    results = sceneops.apply(document, operations, _library(templates_path))
+    results = sceneops.apply(document, operations, _library(templates_path),
+                             _install_folder())
     path = _write_scene(document, output_name)
     return _preview_result(document, {"path": path, "results": results})
 
@@ -474,15 +544,12 @@ def br3_export_obj(path: str, output_name: str) -> str:
 
 
 @tool
-def br3_open_in_bryce(path: str, confirm: bool = False) -> str:
-    """Ask the running Bryce to open a scene, using the message a second copy of
-    Bryce sends when it is launched with a file. This does not move the mouse, type
-    or take focus. It can replace the open scene, so pass confirm=true once the user
-    agrees. Bryce may then ask on screen whether to save changes. NOT YET TRIED on a
-    running Bryce: both ends were found in Bryce's code. If nothing happens, the user
-    can open the file by hand."""
-    with _lock:
-        return json.dumps(get_controller().open_by_message(path, confirm))
+def br3_open_in_bryce(path: str, confirm: bool = False) -> list:
+    """Open a scene in the running Bryce, using the message a second copy of Bryce
+    sends when it is launched with a file. No focus, mouse or keyboard. It can
+    replace the open scene, so pass confirm=true once the user agrees. If Bryce asks
+    a question, see bryce_dialogs or the returned picture."""
+    return _quiet_shot(lambda c: c.open_scene(path, confirm))
 
 
 @tool
@@ -559,40 +626,65 @@ def type_text(text: str) -> list:
 
 @tool
 def list_menus() -> str:
-    """List Bryce's native Windows menu items, if the window has them. UNVERIFIED."""
-    return json.dumps(_ui(lambda c: c.backend.menu()))
+    """List Bryce's menu (File, Edit, Objects, Help) with what is enabled right now.
+    Does not take focus."""
+    items = _quiet(lambda c: c.backend.menu())
+    return json.dumps([{"path": i["path"], "enabled": i["enabled"]} for i in items])
 
 
 @tool
-def invoke_menu(path: str, confirm: bool = False) -> list:
-    """Run a menu item by path from list_menus, e.g. File/Import Object. UNVERIFIED."""
-    return _with_shot(lambda c: {"invoked": c.invoke_menu(path, confirm)})
+def bryce_command(command: str, confirm: bool = False) -> list:
+    """Run any item of Bryce's menu by window message, without focus, mouse or
+    keyboard: for example render, undo, duplicate, replicate, select_all,
+    group_objects, ungroup_objects, create_path, edit_object (the Terrain Editor for
+    a terrain), attributes, edit_material, motion_lab, or a path such as
+    "Edit/Multi-Replicate". Commands act on what is selected in Bryce. For commands
+    that ask for a file use bryce_file_command. See list_menus."""
+    return _quiet_shot(lambda c: {"ran": c.command(command, confirm)})
+
+
+@tool
+def bryce_file_command(command: Literal["open", "merge", "import_object", "export_image",
+                                        "render_to_disk", "save_as"],
+                       path: str, confirm: bool = False) -> list:
+    """Run a menu command that asks for a file and answer its Windows dialog, all by
+    window message. open, merge and import_object read an existing file; the others
+    write a new one. Bryce may then show its own options box; check the picture."""
+    if not confirm:
+        raise BryceError("this reads into the open scene or writes a file; pass "
+                         "confirm=true once the user has agreed")
+    writes = command in ("export_image", "render_to_disk", "save_as")
+    return _quiet_shot(lambda c: c.run_with_path(
+        "File/" + command.replace("_", " "), path,
+        ".br3" if command == "save_as" else "", new_file=writes))
+
+
+@tool
+def bryce_dialogs() -> str:
+    """Standard Windows dialogs Bryce has open (file pickers, questions), with their
+    text and buttons. Boxes that Bryce draws itself show only in screenshot."""
+    return json.dumps(_quiet(lambda c: c.dialogs()))
+
+
+@tool
+def press_dialog_button(button: str, confirm: bool = False) -> list:
+    """Press a button, by its label, on a Windows dialog Bryce has open."""
+    return _quiet_shot(lambda c: {"pressed": c.press_dialog_button(button, confirm)})
 
 
 # -- files ----------------------------------------------------------------------
 @tool
-def open_scene(path: str, confirm: bool = False) -> list:
-    """Open a Bryce scene (Ctrl+O). UNVERIFIED."""
-    return _with_shot(lambda c: c.open_scene(path, confirm))
-
-
-@tool
 def save_scene(path: str | None = None, confirm: bool = False) -> list:
-    """Press Save (Ctrl+S). A scene that already has a file is saved over it. An
-    unnamed scene asks for a name, and `path` is typed there. UNVERIFIED."""
-    def run(c):
-        target = c.save_scene(path, confirm)
-        if target is None:
-            return {"saved": "in place (Bryce did not ask for a name)"}
-        return {"requested_path": target, "file_exists": os.path.isfile(target)}
-    return _with_shot(run)
+    """Save the scene open in Bryce, by window message. Without a path it saves over
+    the scene's own file; with a path it uses Save As and refuses existing files."""
+    return _quiet_shot(lambda c: c.save_scene(path, confirm))
 
 
 @tool
 def submit_file_dialog(path: str) -> list:
-    """Type a path into a Windows file dialog that Bryce already has open, e.g. after
-    invoke_menu File/Import Object or the Terrain Editor's Picture button."""
-    return _with_shot(lambda c: c.fill_file_dialog(path))
+    """Put a path in a Windows file dialog that Bryce already has open (for example
+    one opened by the Terrain Editor's Picture button) and accept it."""
+    return _quiet_shot(lambda c: c.fill_file_dialog(path))
 
 
 def output_directory() -> str:
@@ -658,7 +750,6 @@ def check() -> int:
     """Find the running Bryce and save a screenshot: a test of the Windows layer."""
     try:
         controller = get_controller()
-        controller.backend.begin()
         print(json.dumps(controller.backend.info(), indent=2))
         path = _output_path("check-screenshot", "png")
         with open(path, "wb") as handle:

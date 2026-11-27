@@ -33,9 +33,19 @@ class Backend(Protocol):
         """Window class of the foreground Bryce window."""
 
     def menu(self) -> list[dict]:
-        """Native Win32 menu items as {path, id, enabled}. Empty if none."""
+        """Native Win32 menu items as {path, id, menu, enabled}."""
 
-    def invoke_menu(self, command_id: int) -> None: ...
+    def run_menu(self, item: dict) -> None:
+        """Run one of those items by window message."""
+
+    def open_file(self, path: str) -> None: ...
+
+    def dialogs(self) -> list[dict]:
+        """Open Windows dialogs as {window, title, text, buttons, takes_path}."""
+
+    def fill_dialog(self, dialog: int, text: str) -> None: ...
+
+    def press_dialog_button(self, dialog: int, button_id: int) -> None: ...
 
     def info(self) -> dict: ...
 

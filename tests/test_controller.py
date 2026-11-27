@@ -108,13 +108,63 @@ def test_key_normalization():
             normalize_keys(bad)
 
 
-def test_path_only_typed_into_a_real_file_dialog(bryce, tmp_path):
+MENU = ("File/New Document...", "File/Open...", "File/Import Object...", "File/Save...",
+        "File/Save As...", "File/Render", "File/Clear and Render", "Edit/Undo", "Edit/Clear")
+
+
+def with_menu(backend):
+    backend.menu_items = [{"path": path, "id": number, "menu": 900, "enabled": True}
+                          for number, path in enumerate(MENU, 1)]
+
+
+def a_file_dialog():
+    return {"window": 55, "title": "Save As", "text": [], "takes_path": True,
+            "buttons": [{"id": 1, "label": "Save"}, {"id": 2, "label": "Cancel"}]}
+
+
+@pytest.mark.parametrize("name, number", [("File/Import Object", 3), ("import_object", 3),
+                                          ("render", 6), ("Clear and Render", 7),
+                                          ("clear_and_render", 7), ("undo", 8)])
+def test_menu_names(bryce, name, number):
     controller, backend = bryce
-    # No dialog: Bryce saved in place, and nothing may be typed.
-    assert controller.save_scene(str(tmp_path / "a"), confirm=True) is None
-    assert backend.typed() == []
-    backend.window_class = "#32770"
-    assert controller.save_scene(str(tmp_path / "a"), confirm=True).endswith("a.br3")
+    with_menu(backend)
+    controller.command(name)
+    assert backend.log == [("menu", number)]            # a message, no keys or clicks
+
+
+def test_risky_commands_need_confirmation(bryce):
+    controller, backend = bryce
+    with_menu(backend)
+    for name in ("new_document", "open", "save", "save_as", "Edit/Clear"):
+        with pytest.raises(ConfirmationRequired):
+            controller.command(name)
+    assert backend.log == []
+
+
+def test_commands_refuse_when_a_windows_dialog_is_open(bryce):
+    controller, backend = bryce
+    with_menu(backend)
+    backend.open_dialogs = [a_file_dialog()]
+    with pytest.raises(UnexpectedScreen):
+        controller.command("render")
+    assert backend.log == []
+
+
+def test_save_as_fills_the_dialog_by_message(bryce, tmp_path):
+    controller, backend = bryce
+    with_menu(backend)
+    backend.on_menu = lambda item: backend.open_dialogs.append(a_file_dialog())
+    result = controller.save_scene(str(tmp_path / "a"), confirm=True)
+    assert result["submitted"].endswith("a.br3")
+    assert backend.log == [("menu", 5), ("fill_dialog", 55, str(tmp_path / "a.br3"))]
+
+
+def test_no_dialog_means_nothing_is_filled(bryce, tmp_path):
+    controller, backend = bryce
+    with_menu(backend)
+    with pytest.raises(BryceError, match="no Windows file dialog"):
+        controller.save_scene(str(tmp_path / "a"), confirm=True)
+    assert backend.log == [("menu", 5)]
 
 
 def test_save_and_open_guards(bryce, tmp_path):
@@ -130,33 +180,41 @@ def test_save_and_open_guards(bryce, tmp_path):
     assert backend.log == []
 
 
-@pytest.mark.parametrize("mode, event", [("resume", ("key", "ctrl+r")),
-                                         ("clear", ("key", "ctrl+alt+r")),
+def test_dialog_buttons(bryce):
+    controller, backend = bryce
+    backend.open_dialogs = [a_file_dialog()]
+    assert controller.dialogs()[0]["title"] == "Save As"
+    with pytest.raises(ConfirmationRequired):
+        controller.press_dialog_button("cancel")
+    controller.press_dialog_button("cancel", confirm=True)
+    assert backend.log == [("button", 55, 2)]
+
+
+@pytest.mark.parametrize("mode, event", [("resume", ("menu", 6)), ("clear", ("menu", 7)),
                                          ("button", ("click", layout.RENDER_BUTTON, 1))])
 def test_render_modes(bryce, mode, event):
     controller, backend = bryce
+    with_menu(backend)
     controller.start_render(mode)
     assert backend.log == [event]
+
+
+def test_open_and_render_uses_only_messages(bryce, tmp_path):
+    controller, backend = bryce
+    with_menu(backend)
+    scene = tmp_path / "s.br3"
+    scene.write_text("x")
+    result = controller.open_and_render(str(scene), confirm=True, timeout=60)
+    assert result["finished"]
+    assert backend.log == [("open_file", str(scene)), ("menu", 7)]
 
 
 def test_render_refuses_while_a_dialog_is_open(bryce):
     controller, backend = bryce
     backend.attributes = True
     with pytest.raises(UnexpectedScreen):
-        controller.start_render("resume")
+        controller.start_render("button")
     assert backend.log == []
-
-
-def test_menus(bryce):
-    controller, backend = bryce
-    with pytest.raises(BryceError, match="no native Windows menu"):
-        controller.invoke_menu("File/Import Object")
-    backend.menu_items = [{"path": "File/Import Object...", "id": 7, "enabled": True},
-                          {"path": "File/New", "id": 8, "enabled": True}]
-    controller.invoke_menu("file/import object")
-    assert ("menu", 7) in backend.log
-    with pytest.raises(ConfirmationRequired):
-        controller.invoke_menu("File/New")
 
 
 def test_render_waits_for_a_still_picture(bryce):

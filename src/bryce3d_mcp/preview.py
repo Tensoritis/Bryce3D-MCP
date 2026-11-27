@@ -14,6 +14,7 @@ import math
 import numpy as np
 from PIL import Image
 
+from . import heightfield
 from .br3 import UNIT, Br3, rotation_matrix
 
 DEFAULT_SIZE = (480, 360)       # Bryce's default document
@@ -91,20 +92,38 @@ _SHAPES = {
 }
 
 
-def object_mesh(scene: Br3, kind: str, key: int):
-    """(vertices in Bryce units, triangle list), or None for things with no surface."""
+def _placed(points, transform):
+    """Apply an object's (position, origin, scale, rotation) to local points."""
+    position, origin, scale, rotation = (np.array(v) for v in transform)
+    return ((points + origin) * scale) @ np.array(rotation_matrix(rotation)) + position
+
+
+def _local_parts(scene: Br3, kind: str, ref) -> list:
+    """The surfaces of one object in its parent's coordinates (file units) as
+    (vertices, triangles, "#rrggbb" or None, cuts). A group gives one part per
+    member; `cuts` marks a boolean negative, which has no surface of its own."""
+    if kind == "group":
+        transform = scene.transform(ref)
+        return [(_placed(points, transform), faces, colour, cuts)
+                for member_kind, member in scene._members(ref)
+                for points, faces, colour, cuts in _local_parts(scene, member_kind, member)]
     if kind in ("terrain", "lattice"):
-        points, faces = _terrain(*scene.terrain_heights(scene._name(key)))
+        points, faces = _terrain(*heightfield.decode(scene._payload(ref)))
     elif kind in _SHAPES:
         points, faces = _SHAPES[kind]()
     else:
-        return None
-    position = np.array(scene._vector(key, "Obj_ePosition"))
-    origin = np.array(scene._vector(key, "Obj_eOrigin") or (0, 0, 0))
-    scale = np.array(scene._vector(key, "Obj_eScale") or (1, 1, 1))
-    matrix = np.array(rotation_matrix(scene._vector(key, "Obj_eOrient", 4) or (0, 0, 0, 1)))
-    world = ((points + origin) * scale) @ matrix + position
-    return world * UNIT, faces
+        return []
+    return [(_placed(points, scene.transform(ref)), faces,
+             scene.material(ref).get("color"), scene.boolean_of(ref) == "negative")]
+
+
+def object_parts(scene: Br3, kind: str, ref) -> list:
+    """_local_parts with the vertices in Bryce units."""
+    return [(points * UNIT, faces, colour, cuts)
+            for points, faces, colour, cuts in _local_parts(scene, kind, ref)]
+
+
+_LENS = 1.037
 
 
 class _View:
@@ -117,8 +136,10 @@ class _View:
         self.up = np.cross(self.forward, self.right)
         self.heading = h
         self.width, self.height = width, height
-        # Bryce's field of view spans the picture's diagonal.
-        self.focal = math.hypot(width, height) / 2 / math.tan(math.radians(camera["fov"]) / 2)
+        # The field of view spans about the picture's diagonal. _LENS was measured
+        # from a Bryce render at 480x360 (11 points fit to within 1.4 pixels).
+        self.focal = (_LENS * math.hypot(width, height) / 2
+                      / math.tan(math.radians(camera["fov"]) / 2))
 
     def to_camera(self, points):
         d = points - self.eye
@@ -219,11 +240,12 @@ def render(scene: Br3, width: int = DEFAULT_SIZE[0], height: int = DEFAULT_SIZE[
             report.append({"name": info["name"], "kind": kind,
                            "preview": "ground" if y < 1 else "not drawn (raised plane)"})
             continue
-        mesh = object_mesh(scene, kind, key)
-        if mesh is None:
+        parts = object_parts(scene, kind, key)
+        drawn = [part for part in parts if not part[3]]
+        if not drawn:
             report.append({"name": info["name"], "kind": kind, "preview": "not drawn"})
             continue
-        solids.append((info, *mesh))
+        solids.append((info, drawn, len(parts) - len(drawn)))
 
     on_floor = np.zeros((height, width), bool)
     if floor is not None:
@@ -239,7 +261,7 @@ def render(scene: Br3, width: int = DEFAULT_SIZE[0], height: int = DEFAULT_SIZE[
         # Ground shadows: flatten every solid along the sunlight.
         shadow = np.zeros_like(on_floor)
         if light[1] > 0.02:
-            for _, points, faces in solids:
+            for points, faces in ((p[0], p[1]) for _, parts, _ in solids for p in parts):
                 for face in faces:
                     # Only what stands above the ground can shade it.
                     part = _above(points[list(face)], floor + 0.01)
@@ -256,8 +278,11 @@ def render(scene: Br3, width: int = DEFAULT_SIZE[0], height: int = DEFAULT_SIZE[
         picture[shadow & on_floor] *= 0.5
 
     owner = np.full((height, width), -1)
-    for index, (info, points, faces) in enumerate(solids):
-        colour = _rgb(info.get("material", {}).get("color"))
+    surfaces = [(index, points, faces, colour)
+                for index, (_, parts, _) in enumerate(solids)
+                for points, faces, colour, _ in parts]
+    for index, points, faces, shade_of in surfaces:
+        colour = _rgb(shade_of)
         camera_points = view.to_camera(points)
         for face in faces:
             a, b, c = points[list(face)]
@@ -282,9 +307,12 @@ def render(scene: Br3, width: int = DEFAULT_SIZE[0], height: int = DEFAULT_SIZE[
                 picture[rows, columns] = tone
                 owner[rows, columns] = index
 
-    for index, (info, points, _) in enumerate(solids):
+    for index, (info, parts, cutting) in enumerate(solids):
         entry = {"name": info["name"], "kind": info["kind"]}
-        cam = view.to_camera(points)
+        if cutting:
+            entry["note"] = (f"{cutting} negative part(s) not drawn: the preview does not "
+                             "cut shapes, use br3_render to see the boolean")
+        cam = view.to_camera(np.concatenate([part[0] for part in parts]))
         ahead = cam[cam[:, 2] >= _NEAR]
         pixels = int((owner == index).sum())
         if len(ahead) == 0:
@@ -316,13 +344,14 @@ def to_obj(scene: Br3) -> tuple[str, int]:
     """The scene's surfaces as Wavefront OBJ text. Returns (text, objects written)."""
     lines, offset, written = ["# exported from a Bryce 3D scene by bryce3d-mcp"], 1, 0
     for kind, key in scene._objects():
-        mesh = None if kind == "plane" else object_mesh(scene, kind, key)
-        if mesh is None:
+        parts = [] if kind == "plane" else [
+            part for part in object_parts(scene, kind, key) if not part[3]]
+        if not parts:
             continue
-        points, faces = mesh
-        lines.append("o " + scene._name(key).replace(" ", "_"))
-        lines += [f"v {x:.5f} {y:.5f} {z:.5f}" for x, y, z in points]
-        lines += ["f " + " ".join(str(i + offset) for i in face) for face in faces]
-        offset += len(points)
+        lines.append("o " + (scene._name(key) or kind).replace(" ", "_"))
+        for points, faces, _, _ in parts:
+            lines += [f"v {x:.5f} {y:.5f} {z:.5f}" for x, y, z in points]
+            lines += ["f " + " ".join(str(i + offset) for i in face) for face in faces]
+            offset += len(points)
         written += 1
     return "\n".join(lines) + "\n", written

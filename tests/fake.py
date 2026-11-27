@@ -23,6 +23,8 @@ class FakeBackend:
         self.backdrop = BLACK
         self.window_class = "Bryce"
         self.menu_items = []
+        self.open_dialogs = []
+        self.on_menu = None
         self.render_frames = 0
         self._frame = 0
 
@@ -94,8 +96,21 @@ class FakeBackend:
     def menu(self):
         return self.menu_items
 
-    def invoke_menu(self, command_id):
-        self._input("menu", command_id)
+    def run_menu(self, item):
+        self.log.append(("menu", item["id"]))
+        if self.on_menu:
+            self.on_menu(item)
+
+    def dialogs(self):
+        return list(self.open_dialogs)
+
+    def fill_dialog(self, dialog, text):
+        self.log.append(("fill_dialog", dialog, text))
+        self.open_dialogs.clear()
+
+    def press_dialog_button(self, dialog, button_id):
+        self.log.append(("button", dialog, button_id))
+        self.open_dialogs.clear()
 
     def info(self):
         return {}

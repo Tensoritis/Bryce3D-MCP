@@ -79,7 +79,7 @@ def test_moving_writes_position_and_clears_origin(scene):
     assert again == info
     assert again["position"] == pytest.approx([-10, 20, 30])
     assert again["size"] == [40.96, 20.48, 20.48]
-    assert again["material"] == {"color": "#00ff00", "diffuse": 0.5}
+    assert again["material"]["color"] == "#00ff00" and again["material"]["diffuse"] == 0.5
     key = scene.find("Cube 1")[1]
     assert scene._vector(key, "Obj_eOrigin") == (0, 0, 0)
 
@@ -151,16 +151,42 @@ def test_terrain_writes_both_copies(scene, library):
     assert list(struct.unpack_from(">256H", memory, 208)) == wanted
 
 
-def test_camera_updates_the_cached_copy(scene):
-    got = scene.set_camera(position=[0, 55, -170], look_at=[0, 22, 0], fov=50)
-    assert got["position"] == pytest.approx([0, 55, -170]) and got["heading"] == 0
-    assert got["pitch"] == pytest.approx(-10.99, abs=0.01)
-    payload = scene._payload(scene._first("C3dBaseCamera"))
-    assert struct.unpack_from("<3d", payload, 452) == pytest.approx(
-        (0, 55 / UNIT, 170 / UNIT))
-    flat = [v for row in camera_matrix(math.radians(got["pitch"]), math.pi) for v in row]
-    assert struct.unpack_from("<9d", payload, 380) == pytest.approx(flat, abs=1e-3)
-    assert struct.unpack_from("<d", payload, 724)[0] == pytest.approx(math.radians(50))
+def test_camera_moves_both_views(scene):
+    got = scene.set_camera(position=[40, 55, -170], look_at=[0, 22, 0], fov=50)
+    assert got["position"] == pytest.approx([40, 55, -170])
+    assert got["heading"] == pytest.approx(346.76, abs=0.01)
+    assert got["pitch"] == pytest.approx(-10.69, abs=0.01)         # looking down
+    again = Br3.from_bytes(scene.data)
+    assert again.camera("director") == again.camera("perspective") == got
+    assert "camera_view" not in again.summary()
+    for name in ("perspective", "director"):
+        payload = again._payload(again._camera_key(name))
+        assert struct.unpack_from("<3d", payload, 356) == (0, 0, 0)
+        assert struct.unpack_from("<3d", payload, 452) == pytest.approx(
+            (40 / UNIT, 55 / UNIT, -170 / UNIT))
+        tilt, turn = struct.unpack_from("<2d", payload, 644)
+        assert tilt > 0                              # Bryce stores down as positive
+        forward = struct.unpack_from("<3d", payload, 428)     # third row
+        length = math.dist((40, 55, -170), (0, 22, 0))
+        assert forward == pytest.approx((-40 / length, -33 / length, 170 / length))
+    track = again._vector(again._camera_key("perspective"), "Cam_eCraOrient")
+    assert track[0] == pytest.approx(tilt) and track[1] == pytest.approx(turn)
+
+
+def test_director_view_position_is_an_offset_turned_by_the_matrix(scene):
+    key = scene._camera_key("director")
+    half = math.sqrt(0.5)
+    scene._write(key, 356, struct.pack("<3d", 0, 3, -14.142135623730951))
+    scene._write(key, 380, struct.pack("<9d", half, 0, half, 0, 1, 0, -half, 0, half))
+    scene._write(key, 644, struct.pack("<2d", 0, -math.pi / 4))
+    camera = scene.camera()                  # the values in Bryce's default director view
+    assert camera["position"] == pytest.approx([102.4, 30.72, -102.4], abs=1e-3)
+    assert camera["heading"] == 315
+
+
+def test_bryce_top_view_convention():
+    # Bryce's own Top camera is above the scene with pitch stored as +90 degrees.
+    assert camera_matrix(math.pi / 2, 0)[2] == pytest.approx([0, -1, 0])
 
 
 def test_sun_updates_the_cached_copy(scene):
@@ -259,12 +285,12 @@ def test_render_result_reads_the_bitmap(workspace):
     assert info["size"] == [480, 360] and os.path.isfile(info["exported"])
 
 
-def test_open_by_message_needs_confirmation_and_sends_no_input(workspace):
+def test_open_needs_confirmation_and_sends_no_input(workspace):
     folder, fake = workspace
     controller = server.get_controller()
     with pytest.raises(ConfirmationRequired):
-        controller.open_by_message(str(folder / "start.br3"))
-    controller.open_by_message(str(folder / "start.br3"), confirm=True)
+        controller.open_scene(str(folder / "start.br3"))
+    controller.open_scene(str(folder / "start.br3"), confirm=True)
     assert fake.log == [("open_file", str(folder / "start.br3"))]
 
 

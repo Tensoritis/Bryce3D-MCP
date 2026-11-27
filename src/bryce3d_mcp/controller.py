@@ -19,7 +19,7 @@ from .commands import COMMANDS, is_blocked, is_destructive, normalize_keys
 from .errors import BryceError, ConfirmationRequired, UnexpectedScreen
 
 FILE_DIALOG_CLASS = "#32770"
-RENDER_MODES = {"button": None, "resume": "render", "clear": "clear_and_render"}
+RENDER_MODES = {"button": None, "resume": "Render", "clear": "Clear and Render"}
 Vector = Sequence[float]
 
 
@@ -192,16 +192,17 @@ class BryceController:
 
     # -- rendering --------------------------------------------------------------
     def start_render(self, mode: str = "button") -> None:
-        """button: the large render sphere. resume: Render (Ctrl+R).
-        clear: Clear and Render (Ctrl+Alt+R)."""
+        """button: click the large render sphere (uses the mouse). resume and clear:
+        File/Render and File/Clear and Render from Bryce's menu, without input."""
         if mode not in RENDER_MODES:
             raise BryceError(f"render mode must be one of {', '.join(RENDER_MODES)}")
-        if self.attributes_open() or self.materials_open() or self.library_open():
+        if mode == "button" and (self.attributes_open() or self.materials_open()
+                                 or self.library_open()):
             raise UnexpectedScreen("a dialog is open; close it before rendering")
         if mode == "button":
             self.backend.click(*layout.RENDER_BUTTON)
         else:
-            self.backend.key(COMMANDS[RENDER_MODES[mode]].keys)
+            self.command("File/" + RENDER_MODES[mode])
 
     def wait_for_still_picture(self, timeout: float = 600, settle: float = 6,
                                poll: float = 1.5) -> dict:
@@ -228,29 +229,67 @@ class BryceController:
         """The viewport as it is on screen now."""
         return self.backend.grab(layout.VIEWPORT_BOX)
 
-    # -- files ------------------------------------------------------------------
-    def fill_file_dialog(self, path: str) -> None:
-        """Type a path into a Windows file dialog, only if one is really in front."""
-        if not path or any(c in path for c in '\r\n\t"'):
-            raise BryceError("invalid path")
-        self._wait_for(lambda: self.backend.foreground_class() == FILE_DIALOG_CLASS,
-                       "no Windows file dialog appeared, so the path was not typed")
-        self.backend.key("ctrl+a")
-        self.backend.type_text(path)
-        self.backend.key("enter")
-        self.backend.sleep(1.5)
+    # -- menu commands and file dialogs: window messages only ---------------------
+    def menu_item(self, name: str) -> dict:
+        """The native menu item named by "Menu/Item", an item label, or a name such
+        as clear_and_render."""
+        wanted = _menu_key(name.replace("_", " "))
+        items = self.backend.menu()
+        if not items:
+            raise BryceError("Bryce's menu could not be read")
+        matches = [i for i in items if _menu_key(i["path"]) == wanted] or [
+            i for i in items if _menu_key(i["path"]).split("/")[-1] == wanted]
+        if len(matches) != 1:
+            raise BryceError(f"menu item {name!r} not found; see list_menus")
+        return matches[0]
 
-    def open_scene(self, path: str, confirm: bool = False) -> None:
-        if not confirm:
-            raise ConfirmationRequired("opening a scene can discard unsaved work; "
+    def command(self, name: str, confirm: bool = False) -> str:
+        """Run any item of Bryce's menu without focus, mouse or keyboard."""
+        item = self.menu_item(name)
+        if _menu_key(item["path"]).split("/")[-1] in NEEDS_CONFIRM and not confirm:
+            raise ConfirmationRequired(f"{item['path']!r} may change files or discard work; "
                                        "pass confirm=true once the user has agreed")
-        if not os.path.isfile(path):
-            raise BryceError(f"file not found: {path}")
-        self.backend.key("ctrl+o")
-        self.fill_file_dialog(os.path.abspath(path))
+        if not item["enabled"]:
+            raise BryceError(f"menu item {item['path']!r} is disabled right now")
+        if self.backend.dialogs():
+            raise UnexpectedScreen("Bryce has a Windows dialog open; see bryce_dialogs")
+        self.backend.run_menu(item)
+        self.backend.sleep(1.0)
+        return item["path"]
 
-    def open_by_message(self, path: str, confirm: bool = False) -> dict:
-        """Hand Bryce a file the way a second launch of Bryce would, without input."""
+    def dialogs(self) -> list[dict]:
+        return [{k: v for k, v in d.items() if k != "window"} for d in self.backend.dialogs()]
+
+    def press_dialog_button(self, label: str, confirm: bool = False) -> str:
+        if not confirm:
+            raise ConfirmationRequired("answering a Bryce question can overwrite or discard "
+                                       "work; pass confirm=true once the user has agreed")
+        wanted = label.replace("&", "").strip().lower()
+        for dialog in self.backend.dialogs():
+            for button in dialog["buttons"]:
+                if button["label"].strip().lower() == wanted:
+                    self.backend.press_dialog_button(dialog["window"], button["id"])
+                    self.backend.sleep(1.0)
+                    return button["label"]
+        raise BryceError(f"no open dialog has a button {label!r}; see bryce_dialogs")
+
+    def fill_file_dialog(self, path: str) -> dict:
+        """Put a path in the open Windows file dialog and accept it."""
+        if not path or any(c in path for c in '\r\n\t"*?<>|'):
+            raise BryceError("invalid path")
+        found: list[dict] = []
+
+        def ready():
+            found[:] = [d for d in self.backend.dialogs() if d["takes_path"]]
+            return bool(found)
+
+        self._wait_for(ready, "no Windows file dialog appeared", timeout=8)
+        self.backend.fill_dialog(found[0]["window"], path)
+        self.backend.sleep(1.5)
+        return {"submitted": path, "dialogs_still_open": self.dialogs()}
+
+    def open_scene(self, path: str, confirm: bool = False) -> dict:
+        """Hand Bryce a file the way a second launch of Bryce would."""
         if not confirm:
             raise ConfirmationRequired("opening a scene can discard unsaved work; "
                                        "pass confirm=true once the user has agreed")
@@ -260,58 +299,66 @@ class BryceController:
         if not os.path.isfile(target):
             raise BryceError(f"file not found: {target}")
         self.backend.open_file(target)
-        return {"sent": target,
-                "note": "message delivered to Bryce's window; check that the scene opened"}
-
-    def save_scene(self, path: str | None = None, confirm: bool = False) -> str | None:
-        """Press Save (Ctrl+S). Bryce 3D has no shortcut for Save As: a scene that
-        already has a file is saved over it, and only an unnamed one asks for a path."""
-        if not confirm:
-            raise ConfirmationRequired("Save writes over the scene's current file, if it has one; "
-                                       "pass confirm=true once the user has agreed")
-        target = None
-        if path is not None:
-            target = os.path.abspath(path)
-            if not os.path.splitext(target)[1]:
-                target += ".br3"
-            if os.path.exists(target):
-                raise BryceError(f"{target} already exists; choose a new name")
-            if not os.path.isdir(os.path.dirname(target)):
-                raise BryceError(f"folder does not exist: {os.path.dirname(target)}")
-        self.backend.key("ctrl+s")
         self.backend.sleep(1.5)
-        if self.backend.foreground_class() != FILE_DIALOG_CLASS:
-            return None  # saved in place, without asking for a name
-        if target is None:
-            raise UnexpectedScreen("Bryce is asking for a file name; call submit_file_dialog "
-                                   "with a new path")
-        self.fill_file_dialog(target)
-        return target
+        return {"sent": target, "dialogs": self.dialogs()}
 
-    # -- native menus --------------------------------------------------------------
-    def invoke_menu(self, path: str, confirm: bool = False) -> str:
-        wanted = _menu_key(path)
-        items = self.backend.menu()
-        if not items:
-            raise BryceError("this Bryce window exposes no native Windows menu; "
-                             "use screenshots with click and hover instead")
-        matches = [i for i in items if _menu_key(i["path"]) == wanted]
-        if len(matches) != 1:
-            raise BryceError(f"menu item {path!r} not found; see list_menus")
-        item = matches[0]
-        if not item["enabled"]:
-            raise BryceError(f"menu item {item['path']!r} is disabled right now")
-        risky = ("new", "open", "revert", "delete", "clear", "cut", "exit", "quit", "close", "save")
-        if any(word in _menu_key(item["path"].split("/")[-1]) for word in risky) and not confirm:
-            raise ConfirmationRequired(f"{item['path']!r} may change files or discard work; "
-                                       "pass confirm=true once the user has agreed")
-        self.backend.invoke_menu(item["id"])
-        self.backend.sleep(1.0)
-        return item["path"]
+    def save_scene(self, path: str | None = None, confirm: bool = False) -> dict:
+        """Save over the scene's file, or with a path, Save As under a new name."""
+        if not confirm:
+            raise ConfirmationRequired("saving writes files; pass confirm=true once the "
+                                       "user has agreed")
+        if path is None:
+            self.command("File/Save", confirm=True)
+            return {"saved": "File/Save", "dialogs": self.dialogs()}
+        return self.run_with_path("File/Save As", path, ".br3", new_file=True)
+
+    def run_with_path(self, command: str, path: str, extension: str = "",
+                      new_file: bool = False) -> dict:
+        """Run a command that asks for a file, and answer with `path`."""
+        target = os.path.abspath(path)
+        if extension and not os.path.splitext(target)[1]:
+            target += extension
+        if new_file and os.path.exists(target):
+            raise BryceError(f"{target} already exists; choose a new name")
+        if new_file and not os.path.isdir(os.path.dirname(target)):
+            raise BryceError(f"folder does not exist: {os.path.dirname(target)}")
+        if not new_file and not os.path.isfile(target):
+            raise BryceError(f"file not found: {target}")
+        self.command(command, confirm=True)
+        result = self.fill_file_dialog(target)
+        result["file_exists"] = os.path.isfile(target)
+        return result
+
+    # -- rendering without input --------------------------------------------------
+    def open_and_render(self, path: str, confirm: bool = False, timeout: float = 600,
+                        settle: float = 8, poll: float = 2) -> dict:
+        """Open a scene in the running Bryce, render it from nothing and wait."""
+        before = self.backend.grab(layout.VIEWPORT_BOX)
+        opened = self.open_scene(path, confirm)
+        if opened["dialogs"]:
+            raise UnexpectedScreen(f"Bryce asked a question while opening: {opened['dialogs']}. "
+                                   "Answer it with press_dialog_button, then try again.")
+        loaded = self.wait_for_still_picture(timeout=60, settle=3, poll=1)
+        changed = ImageChops.difference(
+            before, self.backend.grab(layout.VIEWPORT_BOX)).getbbox() is not None
+        started = self.backend.grab(layout.VIEWPORT_BOX)
+        self.command("File/Clear and Render")
+        result = self.wait_for_still_picture(timeout, settle, poll)
+        result["picture_changed_on_open"] = changed and loaded["finished"]
+        result["picture_changed_on_render"] = ImageChops.difference(
+            started, self.backend.grab(layout.VIEWPORT_BOX)).getbbox() is not None
+        result["dialogs"] = self.dialogs()
+        return result
+
+
+# Items (as _menu_key leaf names) that can discard work, write files or end Bryce.
+NEEDS_CONFIRM = frozenset((
+    "new document", "open", "merge", "revert to saved", "save", "save as", "export image",
+    "render to disk", "quit", "cut", "clear", "reset to defaults", "print"))
 
 
 def _menu_key(path: str) -> str:
-    return "/".join(part.strip().rstrip(". …").lower() for part in path.split("/"))
+    return "/".join(part.strip().rstrip(". \u2026").lower() for part in path.split("/"))
 
 
 def validate_attributes(name=None, position=None, rotation=None, size=None, boolean=None) -> None:

@@ -9,15 +9,25 @@ OBJECT_TRACKS = ((492, "Obj_ePosition"), (496, "Obj_eOrient"), (500, "Obj_eScale
                  (508, "Obj_eOrigin"))
 
 
+def cached(camera, offset, translation):
+    """The values a camera record caches: looking along +z with a 60 degree lens."""
+    struct.pack_into("<3d", camera, 356, *offset)
+    struct.pack_into("<9d", camera, 380, 1, 0, 0, 0, 1, 0, 0, 0, 1)
+    struct.pack_into("<3d", camera, 452, *translation)
+    struct.pack_into("<d", camera, 724, 1.0471975511965976)
+
+
 class Builder:
     def __init__(self):
         self.classes: dict[str, list[tuple[int, bytes, str]]] = {}
         self.next_key = 0x05000000
 
-    def record(self, class_name, payload, name=""):
-        self.next_key += 0x40
-        self.classes.setdefault(class_name, []).append((self.next_key, bytes(payload), name))
-        return self.next_key
+    def record(self, class_name, payload, name="", key=None):
+        if key is None:
+            self.next_key += 0x40
+            key = self.next_key
+        self.classes.setdefault(class_name, []).append((key, bytes(payload), name))
+        return key
 
     def track(self, class_name, values, size=240, offset=192, form="d"):
         payload = bytearray(size)
@@ -49,12 +59,17 @@ class Builder:
         """`objects` is a list of (root tag, id)."""
         camera = bytearray(808)
         camera[8:20] = b"perspective\0"
-        for offset, key in ((492, self.track("Obj_ePosition", (0, 3, 14))),
+        cached(camera, offset=(0, 0, 0), translation=(0, 3, -14))
+        for offset, key in ((492, self.track("Obj_ePosition", (0, 3, -14))),
                             (508, self.track("Obj_eOrigin", (0, 0, 0))),
-                            (780, self.track("Cam_eCraOrient", (0, 3.141592653589793, 0))),
+                            (780, self.track("Cam_eCraOrient", (0, 0, 0))),
                             (788, self.track("Cam_eFOV", [1.0471975511965976], 200))):
             struct.pack_into("<I", camera, offset, key)
         camera_key = self.record("C3dBaseCamera", camera, "perspective")
+        director = bytearray(808)                  # a view with no tracks, like Bryce's
+        director[8:17] = b"director\0"
+        cached(director, offset=(0, 3, -14), translation=(0, 0, 0))
+        self.record("C3dBaseCamera", director, "director")
         sun = bytearray(896)
         struct.pack_into("<I", sun, 892, self.track("SunL_eSunVctr", (0.0, 0.6, -0.8)))
         self.record("C3dSunLight", sun)
@@ -66,7 +81,9 @@ class Builder:
         root = struct.pack("<III", 1, 1, len(items)) + b"".join(
             tag.encode()[::-1] + struct.pack("<II", key, 0) for tag, key in items)
         self.record("C3dRootObjList", root)
+        return self.pack(entries)
 
+    def pack(self, entries=512):
         payloads, class_rows, entry = {}, [], 24
         for class_name, records in self.classes.items():
             rows = []
@@ -104,3 +121,67 @@ def template_scene() -> bytes:
     terrain = b.solid("C3dHeightField", "Terrain 1", (0, 1, 0), scale=(8, 2, 8),
                       payload=land, extra=[(756, memory_key)])
     return b.build([("sphr3dob", ball), ("hfld3dob", terrain)])
+
+
+def object_list(items):
+    """The payload of a root or group object list, from (tag, id) pairs."""
+    return struct.pack("<III", 1, 1, len(items)) + b"".join(
+        tag.encode()[::-1] + struct.pack("<II", key, 0) for tag, key in items)
+
+
+def description(name, about=""):
+    return name.encode().ljust(64, b"\0") + about.encode().ljust(257, b"\0")
+
+
+def group_donor() -> bytes:
+    """A preset library whose one preset is a group of two spheres. As in Bryce's
+    files, the group and its member list share an id, and so does the description."""
+    b = Builder()
+    b.next_key = 0x09000000
+    members = [("sphr3dob", b.solid("C3dSphere", name, (x, 0, 0)))
+               for name, x in (("", -1), ("", 1))]
+    group = b.solid("C3dGroupType", "Group 1", (0, 1, 0))
+    b.record("C3dObjList", object_list(members), key=group)
+    root = b.record("C3dRootObjList", object_list([("grou3dob", group)]))
+    b.record("objpresetdesc", description("Twin Balls", "Two grouped spheres."), key=root)
+    return b.pack(0)
+
+
+def flat_material(colour=(1, 1, 1), **values):
+    """A material as Bryce's presets store it: values in the record, no tracks."""
+    body = bytearray(976)
+    struct.pack_into("<3f", body, 300, *colour)
+    for offset, value in values.items():
+        struct.pack_into("<f", body, int(offset[1:]), value)
+    return body
+
+
+def material_library() -> bytes:
+    b = Builder()
+    b.next_key = 0x0A000000
+    mirror = b.record("C3dBaseMaterial", flat_material((0, 0, 1), o740=1.0))
+    b.record("CPresetDescr", description("Mirror\tx", "Reflects."), key=mirror)
+    texture = bytearray(1588)
+    texture[8:14] = b"checks"
+    texture_key = b.record("C3dTexture", texture)
+    checker = flat_material((0.5, 0.5, 0.5))
+    for block in (276, 716):                      # colour and reflection use it
+        struct.pack_into("<I", checker, block, texture_key)
+        struct.pack_into("<I", checker, block + 20, 0x10000000)
+    key = b.record("C3dBaseMaterial", checker)
+    b.record("CPresetDescr", description("Checker"), key=key)
+    return b.pack(0)
+
+
+def sky_library() -> bytes:
+    b = Builder()
+    b.next_key = 0x0B000000
+    sky = bytearray(1344)
+    struct.pack_into("<3f", sky, 368, 1.0, 0.5, 0.0)       # BaseC
+    struct.pack_into("<d", sky, 416, 0.7)                  # ShadowInt
+    key = b.record("C3dBaseSky", sky)
+    sun = bytearray(896)
+    struct.pack_into("<3d", sun, 860, 1.0, 0.0, 0.0)
+    b.record("C3dSunLight", sun, key=key)                  # same id as its sky
+    b.record("CPresetDescr", description("Sunset"), key=key)
+    return b.pack(0)

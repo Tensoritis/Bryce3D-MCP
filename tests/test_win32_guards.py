@@ -107,3 +107,57 @@ def test_unknown_key(backend):
     with pytest.raises(BryceError):
         backend.key("ctrl+banana")
     assert backend.user32.events == []
+
+
+# -- window messages: menus, dialogs and window pictures ----------------------------
+class MessageStub:
+    def __init__(self):
+        self.sent = []
+
+    def SendMessageTimeoutW(self, window, message, wparam, lparam, flags, timeout, answer):
+        self.sent.append(("send", window, message, wparam, lparam))
+        return 1
+
+    def PostMessageW(self, window, message, wparam, lparam):
+        self.sent.append(("post", window, message, wparam, lparam))
+        return 1
+
+
+def test_menu_command_selects_the_submenu_then_runs_the_item():
+    backend = win32.Win32Backend.__new__(win32.Win32Backend)
+    backend.user32 = MessageStub()
+    backend._menu_window = lambda: 77
+    backend.run_menu({"path": "File/Render", "id": 19, "menu": 0x5000, "enabled": True})
+    assert backend.user32.sent == [
+        ("send", 77, 0x011F, (0x0080 << 16) | 19, 0x5000),   # WM_MENUSELECT
+        ("post", 77, 0x0111, 19, 0)]                          # WM_COMMAND, from a menu
+
+
+def test_pictures_come_only_from_bryce_windows():
+    from PIL import Image
+
+    backend = win32.Win32Backend.__new__(win32.Win32Backend)
+    main, popup = 1, 2
+    rects = {main: (100, 50, 900, 650), popup: (200, 100, 260, 140)}
+    colours = {main: (0, 0, 200), popup: (0, 200, 0)}
+    metrics = {76: 0, 77: 0, 78: 1000, 79: 700}
+
+    class Stub:
+        def GetSystemMetrics(self, index):
+            return metrics[index]
+
+        def IsIconic(self, hwnd):
+            return False
+
+    backend.user32 = Stub()
+    backend._find_window = lambda window_class=None: main
+    backend._windows = lambda visible_only=True: [popup, main]        # front first
+    backend._rect = lambda hwnd: rects[hwnd]
+    backend._print_window = lambda hwnd: Image.new(
+        "RGB", (rects[hwnd][2] - rects[hwnd][0], rects[hwnd][3] - rects[hwnd][1]),
+        colours[hwnd])
+    picture, corner = backend._bryce_picture()
+    assert corner == (0, 0)
+    assert picture.getpixel((10, 10)) == (0, 0, 0)          # the desktop is never seen
+    assert picture.getpixel((150, 60)) == (0, 0, 200)
+    assert picture.getpixel((210, 110)) == (0, 200, 0)      # pop-up drawn on top
