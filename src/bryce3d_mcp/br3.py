@@ -116,6 +116,40 @@ _TAG_CLASS = {
 _NEVER_LINKED = frozenset((
     _LIST, _ROOT, "CPresetDescr", "objpresetdesc", "matprevcimage", "objprevcimage",
     "skyprevcimage", "brycedocset"))
+# The document settings record ("brycedocset"): width and height twice, the picture's
+# frame (top, left, bottom, right), then the Render Options menu. Unlike most of the
+# file it is stored big-endian.
+_DOCUMENT_BYTES = 416
+_DOC_FRAME, _DOC_VIEW, _DOC_FLAGS, _DOC_REPORT = 16, 32, 56, 88
+_DOC_ANTIALIASING, _DOC_OPTIMISATION = 80, 84
+DOCUMENT_SIZES = {"default": (480, 360), "small": (320, 240), "standard": (640, 480),
+                  "super_16mm": (640, 384), "cinemascope": (640, 240), "photo": (768, 512)}
+ANTIALIASING = {"off": 0, "normal": 1, "fine_art": 2}
+OPTIMISATION = {"off": 0, "low": 1, "high": 2}
+RENDER_TYPES = {"normal": 0, "mask": 0x400, "distance": 0x800, "altitude": 0x1000}
+
+
+def _name_of(table: dict, value: int):
+    return next((name for name, number in table.items() if number == value), value)
+
+
+def _choice(what: str, name, table: dict) -> int:
+    if name not in table:
+        raise BryceError(f"{what} must be one of {', '.join(table)}")
+    return table[name]
+
+
+def _picture_size(size) -> tuple[int, int]:
+    if isinstance(size, str):
+        return _choice("size", size, DOCUMENT_SIZES)
+    if not (isinstance(size, (list, tuple)) and len(size) == 2
+            and all(isinstance(v, int) and not isinstance(v, bool) and 64 <= v <= 4096
+                    for v in size)):
+        raise BryceError("size must be [width, height], each 64 to 4096, or one of "
+                         + ", ".join(DOCUMENT_SIZES))
+    return size[0], size[1]
+
+
 _SLOT_CLASS = {280: _MATERIAL, 492: "Obj_ePosition", 496: "Obj_eOrient",
                500: "Obj_eScale", 504: "Obj_eShear", 508: "Obj_eOrigin"}
 _TRACK_SLOT = {name: slot for slot, name in _SLOT_CLASS.items() if slot >= 492}
@@ -1650,6 +1684,64 @@ class Br3:
         values = value if form in ("colour", "vector") else (value,)
         self._write(self._first(owner_class), offset, struct.pack(shape, *values))
 
+    # -- document and render settings ---------------------------------------------
+    def _document_record(self) -> tuple[int, bytes]:
+        """The entry holding the document settings, and its contents. Bryce copies
+        these 416 bytes straight into the document when it opens a scene."""
+        rows = self._rows.get("brycedocset")
+        if rows:
+            entry = struct.unpack_from(">I", rows[0], 8)[0]
+            data = self.file.read(entry)
+            if len(data) == _DOCUMENT_BYTES:
+                return entry, data
+        raise BryceError("this file has no document settings to read")
+
+    def document(self) -> dict:
+        _, data = self._document_record()
+        flags, = struct.unpack_from(">I", data, _DOC_FLAGS)
+        antialiasing, optimisation = struct.unpack_from(">2I", data, _DOC_ANTIALIASING)
+        kinds = [name for name, bit in RENDER_TYPES.items() if bit and flags & bit]
+        return {
+            "size": list(struct.unpack_from(">2I", data, 0)),
+            "antialiasing": _name_of(ANTIALIASING, antialiasing),
+            "optimisation": _name_of(OPTIMISATION, optimisation),
+            "render_type": kinds[0] if kinds else "normal",
+            "report_render_time": any(data[_DOC_REPORT:_DOC_REPORT + 4]),
+        }
+
+    def set_document(self, *, size=None, antialiasing=None, optimisation=None,
+                     render_type=None, report_render_time=None) -> dict:
+        """Change the picture size and the choices of Bryce's Render Options menu,
+        the way that menu changes them."""
+        entry, old = self._document_record()
+        data = bytearray(old)
+        flags, = struct.unpack_from(">I", data, _DOC_FLAGS)
+        if size is not None:
+            width, height = _picture_size(size)
+            struct.pack_into(">4I", data, 0, width, height, width, height)
+            struct.pack_into(">4I", data, _DOC_FRAME, 0, 0, height, width)
+            data[_DOC_VIEW:_DOC_FLAGS] = bytes(_DOC_FLAGS - _DOC_VIEW)
+        if antialiasing is not None:
+            value = _choice("antialiasing", antialiasing, ANTIALIASING)
+            struct.pack_into(">I", data, _DOC_ANTIALIASING, value)
+            flags = flags | 0x2000 if antialiasing == "normal" else flags & ~0x2000
+        if optimisation is not None:
+            value = _choice("optimisation", optimisation, OPTIMISATION)
+            struct.pack_into(">I", data, _DOC_OPTIMISATION, value)
+            flags |= 0x80
+        if render_type is not None:
+            bit = _choice("render_type", render_type, RENDER_TYPES)
+            for other in RENDER_TYPES.values():
+                flags &= ~other
+            flags |= bit
+        if report_render_time is not None:
+            if not isinstance(report_render_time, bool):
+                raise BryceError("report_render_time must be true or false")
+            struct.pack_into(">I", data, _DOC_REPORT, report_render_time)
+        struct.pack_into(">I", data, _DOC_FLAGS, flags)
+        self.file.replace(entry, bytes(data))
+        return self.document()
+
     def sun(self) -> dict:
         tracks = self._scene_settings("C3dSunLight", "SunL_e")
         out = {}
@@ -1759,6 +1851,8 @@ class Br3:
 
     def summary(self) -> dict:
         result = {"objects": self.objects(), "camera": self.camera(), "sun": self.sun()}
+        if self._rows.get("brycedocset"):
+            result["document"] = self.document()
         other = self.camera("perspective")
         if other != result["camera"]:
             result["camera_view"] = other   # differs until set_camera aligns the two

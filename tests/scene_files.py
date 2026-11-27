@@ -20,13 +20,16 @@ def cached(camera, offset, translation):
 class Builder:
     def __init__(self):
         self.classes: dict[str, list[tuple[int, bytes, str]]] = {}
+        self.seconds: dict[int, bytes] = {}
         self.next_key = 0x05000000
 
-    def record(self, class_name, payload, name="", key=None):
+    def record(self, class_name, payload, name="", key=None, second=b""):
         if key is None:
             self.next_key += 0x40
             key = self.next_key
         self.classes.setdefault(class_name, []).append((key, bytes(payload), name))
+        if second:
+            self.seconds[key] = second
         return key
 
     def track(self, class_name, values, size=240, offset=192, form="d"):
@@ -81,6 +84,13 @@ class Builder:
         root = struct.pack("<III", 1, 1, len(items)) + b"".join(
             tag.encode()[::-1] + struct.pack("<II", key, 0) for tag, key in items)
         self.record("C3dRootObjList", root)
+        settings = bytearray(416)
+        struct.pack_into(">8I", settings, 0, 480, 360, 480, 360, 0, 0, 360, 480)
+        struct.pack_into(">I", settings, 32, 16)
+        struct.pack_into(">I", settings, 56, 0x23BF)
+        struct.pack_into(">f", settings, 64, 15.0)
+        struct.pack_into(">3I", settings, 80, 1, 1, 1)
+        self.record("brycedocset", b"", second=bytes(settings))
         return self.pack(entries)
 
     def pack(self, entries=512):
@@ -89,7 +99,7 @@ class Builder:
             rows = []
             for key, payload, name in records:
                 payloads[entry] = payload
-                payloads[entry + 1] = b""
+                payloads[entry + 1] = self.seconds.get(key, b"")
                 rows.append((struct.pack(">III", key, entry, entry + 1)
                              + name.encode()).ljust(60, b"\0"))
                 entry += 2

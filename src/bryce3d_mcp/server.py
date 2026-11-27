@@ -507,7 +507,17 @@ def _write_scene(document: Br3, output_name: str) -> str:
     return target
 
 
-def _preview_result(document: Br3, info: dict, width: int = 480, height: int = 360) -> list:
+def _preview_height(document: Br3, width: int) -> int:
+    """The height giving a preview the shape of the scene's picture."""
+    try:
+        wide, tall = document.document()["size"]
+    except BryceError:
+        wide, tall = preview.DEFAULT_SIZE
+    return max(48, min(1200, round(width * tall / wide)))
+
+
+def _preview_result(document: Br3, info: dict, width: int = 480, height: int = 0) -> list:
+    height = height or _preview_height(document, width)
     picture, report = preview.render(document, width, height)
     info["in_preview"] = report
     return [json.dumps(info), _png(picture)]
@@ -735,10 +745,11 @@ def _contact_sheet(pictures, columns: int = 4, rows: int = 2):
 
 
 @tool
-def br3_preview(path: str, width: int = 640, height: int = 480) -> list:
+def br3_preview(path: str, width: int = 640, height: int = 0) -> list:
     """Draw an approximate picture of a scene without Bryce, with a report of where
     each object lands (in frame, out of frame, hidden). Shows shapes, flat colors,
-    the sun and ground shadows; not textures, clouds, reflections or lights."""
+    the sun and ground shadows; not textures, clouds, reflections or lights.
+    height 0 follows the shape of the scene's picture size."""
     return _preview_result(Br3.load(path), {"path": path, "approximate": True}, width, height)
 
 

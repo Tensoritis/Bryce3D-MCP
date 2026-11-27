@@ -70,6 +70,14 @@ OPERATIONS = {
                "Move or aim the render camera. heading 0 looks along +z, 90 along +x; "
                "pitch is positive upwards; bank tilts the picture (positive makes the "
                "horizon drop on the right); fov is in degrees across the picture's diagonal."),
+    "document": ((), ("size", "antialiasing", "optimisation", "render_type",
+                      "report_render_time"),
+                 "Picture size and render settings, saved in the scene. size is [width, "
+                 "height] or one of Bryce's sizes: default 480x360, small 320x240, "
+                 "standard 640x480, super_16mm 640x384, cinemascope 640x240, photo "
+                 "768x512. antialiasing off, normal or fine_art (slow); optimisation "
+                 "(spatial) off, low or high; render_type normal, mask, distance or "
+                 "altitude. Preview keeps its own size."),
     "sun": ((), ("azimuth", "altitude", "disc_color", "halo_color"),
             "Aim the sun. Bryce stores it relative to the camera: azimuth 0 is ahead of "
             "the camera, 90 to its right, 180 behind it."),
@@ -199,6 +207,8 @@ def _run(scene: Br3, op: str, fields: dict, sources: _Sources):
             fields.pop("name"), picture.load(path), fields.pop("channels", None),
             sources=(library, sources.donor("Tutorial.obp")),
             label=os.path.splitext(os.path.basename(path))[0], **fields)
+    if op == "document":
+        return {"document": scene.set_document(**fields)}
     if op == "sky_preset":
         found, source = sources.preset("skies", fields)
         scene.apply_sky_preset(source, found.key)
