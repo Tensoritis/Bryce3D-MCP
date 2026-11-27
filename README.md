@@ -202,10 +202,10 @@ changes when things happen, and the table above still decides the route.
   `insert_preset` and `"library": "Paths"`. A path can be moved, but not resized or turned.
 - **Fixed in 0.15.0:** the first path in Bryce's `Paths.obp` holds about two billion in
   the matrix Bryce draws a path through, where 1 belongs. Versions before 0.15.0 copied
-  it into every new path, and which very likely is why Bryce drew one of our check
-  scenes with very long upright lines. New paths and inserted path presets now get a clean matrix.
-  Scenes made earlier keep the bad value: build them again. The fix has not yet been
-  seen in Bryce.
+  it into every new path. That is very likely why Bryce drew one of our check scenes
+  with very long upright lines. New paths and inserted path presets now get a clean
+  matrix. Scenes made earlier keep the bad value: build them again. The fix has not yet
+  been seen in Bryce.
 - With `smooth` true (the default), many points are saved along an even curve through
   yours, which never loops back on itself.
 - With `smooth` false, exactly your points are saved and Bryce draws **its own curve**
